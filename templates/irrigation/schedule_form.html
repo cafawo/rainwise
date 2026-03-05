@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+
+{% block title %}Schedule Rule | Rainwise{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">{% if rule %}Edit{% else %}New{% endif %} Schedule Rule</h1>
+
+<div class="card">
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {{ form.as_p }}
+      <button class="btn btn-primary" type="submit">Save</button>
+      <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
+    </form>
+  </div>
+</div>
+{% endblock %}

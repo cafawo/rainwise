@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Charts | Rainwise{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">Irrigation Charts</h1>
+
+<div class="card">
+  <div class="card-body">
+    <div class="mb-3">
+      <label class="form-label" for="valveSelect">Valve</label>
+      <select class="form-select" id="valveSelect">
+        {% for valve in valves %}
+          <option value="{{ valve.id }}" {% if valve.id == selected_valve_id %}selected{% endif %}>
+            {{ valve.name }}
+          </option>
+        {% endfor %}
+      </select>
+    </div>
+    <canvas id="chart" height="120"></canvas>
+    {% if not valves %}
+      <p class="text-muted">Add valves to view chart data.</p>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    let chartInstance = null;
+
+    async function loadChart(valveId) {
+      const response = await fetch(`{% url 'chart_data' %}?valve_id=${valveId}`);
+      const payload = await response.json();
+
+      const ctx = document.getElementById("chart").getContext("2d");
+      if (chartInstance) {
+        chartInstance.destroy();
+      }
+
+      chartInstance = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels: payload.labels,
+          datasets: payload.datasets,
+        },
+        options: {
+          responsive: true,
+          scales: {
+            y: {
+              title: {
+                display: true,
+                text: "Minutes",
+              },
+            },
+          },
+        },
+      });
+    }
+
+    const select = document.getElementById("valveSelect");
+    if (select) {
+      select.addEventListener("change", (event) => loadChart(event.target.value));
+      if (select.value) {
+        loadChart(select.value);
+      }
+    }
+  </script>
+{% endblock %}

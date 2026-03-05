@@ -82,10 +82,10 @@ Repository-specific guidance for Codex agents working in this project.
 ## Documentation
 
 - Update `README.md` when behavior, APIs, configuration, or setup changes.
-- Keep dependency specifications in sync (`requirements.txt`).
+- Keep dependency specifications in sync (`requirements.txt`, 'environment.yml').
 - Update `.env.example` with all environment variables.
 
 ## Environment (development)
 
-- Local dev may use a Conda environment named `smartgarden`, but production is Docker.
+- Local dev may use a Conda environment named `rainwise`, but production is Docker.
 - Keep workflows Docker-first compatible, but do not require Docker for local development.

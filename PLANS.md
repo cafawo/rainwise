@@ -44,7 +44,7 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
 - Production topology (compose):
   - `web`: Django + gunicorn
   - `controller`: `python manage.py controller`
-  - optional `postgres`: only if user chooses Postgres
+  - use external Postgres if `POSTGRES_HOST` is provided
 
 No Redis/Celery for MVP.
 
@@ -71,7 +71,6 @@ Use an `apps/` folder for Django apps (future additions like smarthome integrati
   - `docker/` (entrypoint scripts)
   - `Dockerfile`
   - `docker-compose.yml`
-  - `docker-compose.postgres.yml` (optional)
   - `.env.example`
   - `README.md`
 
@@ -88,7 +87,6 @@ Keep minimal:
 - gunicorn (for Docker/prod)
 - whitenoise (static in production)
 - python-dotenv (dev convenience)
-- dj-database-url (parse DATABASE_URL)
 - psycopg[binary] (optional Postgres)
 - requests (Open-Meteo)
 - pyModbusTCP (Modbus TCP client)
@@ -108,13 +106,21 @@ Document in `.env.example` and `README.md`.
 - `DJANGO_TIME_ZONE` (default `Europe/Berlin`)
 
 ### Database selection (priority order)
-1) If `DATABASE_URL` is set: use it (recommended for production).
+1) If `POSTGRES_HOST` is set: use Postgres (requires `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`).
 2) Else if `SQLITE_PATH` is set: use SQLite at that path.
 3) Else: use Django default SQLite at `BASE_DIR / "db.sqlite3"`.
 
 Notes:
 - Local dev default is `db.sqlite3` in the repo (convenient).
 - In Docker/TrueNAS, using default path may lose data unless the path is on a mounted volume. Recommend setting `SQLITE_PATH=/data/db.sqlite3` and mounting `/data`, or use Postgres.
+
+### Postgres (external)
+- `POSTGRES_HOST`
+- `POSTGRES_PORT` (default `5432`)
+- `POSTGRES_DB`
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_SSLMODE` (optional)
 
 ### Superuser bootstrap (Docker convenience)
 - `DJANGO_SUPERUSER_USERNAME`
@@ -337,10 +343,8 @@ APIs (lightweight JSON):
 
 For production with SQLite:
 - recommend setting `SQLITE_PATH=/data/db.sqlite3` and mounting `/data`
-
-### docker-compose.postgres.yml (optional override)
-- add `postgres`
-- set `DATABASE_URL` for `web` and `controller`
+For production with external Postgres:
+- set `POSTGRES_HOST`, `POSTGRES_DB`, `POSTGRES_USER`, and `POSTGRES_PASSWORD`
 
 ---
 

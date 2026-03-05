@@ -1,0 +1,1 @@
+"""Rainwise Django project package."""

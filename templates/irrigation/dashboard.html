@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard | Rainwise{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">Dashboard</h1>
+
+<div class="card">
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table align-middle">
+        <thead>
+          <tr>
+            <th>Valve</th>
+            <th>Relay</th>
+            <th>Channel</th>
+            <th>Last Known</th>
+            <th>Last Polled</th>
+            <th>Running</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for valve in valves %}
+            <tr>
+              <td>{{ valve.name }}</td>
+              <td>{{ valve.relay_device.name }}</td>
+              <td>{{ valve.channel }}</td>
+              <td>
+                {% if valve.last_known_is_open %}
+                  <span class="badge bg-success">Open</span>
+                {% else %}
+                  <span class="badge bg-secondary">Closed</span>
+                {% endif %}
+              </td>
+              <td>{{ valve.last_polled_at|default:"-" }}</td>
+              <td>
+                {% if valve.id in running_valve_ids %}
+                  <span class="badge bg-primary">Running</span>
+                {% else %}
+                  <span class="badge bg-light text-dark">-</span>
+                {% endif %}
+              </td>
+              <td>
+                <form method="post" action="{% url 'valve_open' valve.id %}" class="d-inline">
+                  {% csrf_token %}
+                  <button class="btn btn-sm btn-success" type="submit">Open</button>
+                </form>
+                <form method="post" action="{% url 'valve_close' valve.id %}" class="d-inline">
+                  {% csrf_token %}
+                  <button class="btn btn-sm btn-danger" type="submit">Close</button>
+                </form>
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="7" class="text-muted">No valves configured yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
