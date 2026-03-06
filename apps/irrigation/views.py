@@ -27,12 +27,14 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         .order_by("-actual_start_at")
     )
     running_valve_ids = [run.valve_id for run in running_runs]
+    selected_valve_id = valves[0].id if valves else None
     return render(
         request,
         "irrigation/dashboard.html",
         {
             "valves": valves,
             "running_valve_ids": running_valve_ids,
+            "selected_valve_id": selected_valve_id,
         },
     )
 
@@ -139,6 +141,22 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
             "slot_max_time": slot_max_time,
         },
     )
+
+
+@login_required
+def logs_view(request: HttpRequest) -> HttpResponse:
+    runs = list(
+        IrrigationRun.objects.select_related("valve")
+        .order_by("-id")[:200]
+    )
+    for run in runs:
+        run.duration_minutes_display = "-"
+        if run.actual_start_at and run.actual_stop_at:
+            start = timezone.localtime(run.actual_start_at)
+            stop = timezone.localtime(run.actual_stop_at)
+            minutes = round((stop - start).total_seconds() / 60.0, 1)
+            run.duration_minutes_display = f"{minutes:g}"
+    return render(request, "irrigation/logs.html", {"runs": runs})
 
 
 @login_required
@@ -257,20 +275,6 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
         current_date += dt.timedelta(days=1)
 
     return JsonResponse(events, safe=False)
-
-
-@login_required
-def charts_view(request: HttpRequest) -> HttpResponse:
-    valves = Valve.objects.order_by("name")
-    selected_valve_id = valves[0].id if valves else None
-    return render(
-        request,
-        "irrigation/charts.html",
-        {
-            "valves": valves,
-            "selected_valve_id": selected_valve_id,
-        },
-    )
 
 
 @login_required

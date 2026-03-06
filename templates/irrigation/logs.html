@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Logs | Rainwise{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">Logs</h1>
+
+<div class="card">
+  <div class="card-body">
+    <p class="text-muted mb-3">Showing the 200 most recent runs.</p>
+    <div class="table-responsive">
+      <table class="table align-middle">
+        <thead>
+          <tr>
+            <th>Valve</th>
+            <th>Trigger</th>
+            <th>Status</th>
+            <th>Planned/Requested</th>
+            <th>Start</th>
+            <th>Stop</th>
+            <th>Duration (min)</th>
+            <th>Stop Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in runs %}
+            <tr>
+              <td>{{ run.valve.name }}</td>
+              <td>{{ run.get_trigger_display }}</td>
+              <td>{{ run.get_status_display }}</td>
+              <td>
+                {% if run.planned_start_at %}
+                  {{ run.planned_start_at }}
+                {% elif run.requested_start_at %}
+                  {{ run.requested_start_at }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ run.actual_start_at|default:"-" }}</td>
+              <td>{{ run.actual_stop_at|default:"-" }}</td>
+              <td>{{ run.duration_minutes_display }}</td>
+              <td>
+                {% if run.stop_reason %}
+                  {{ run.get_stop_reason_display }}
+                {% else %}
+                  -
+                {% endif %}
+                {% if run.error_message %}
+                  <div class="text-muted small">{{ run.error_message }}</div>
+                {% endif %}
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="8" class="text-muted">No irrigation runs yet.</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

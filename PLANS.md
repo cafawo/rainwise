@@ -23,7 +23,7 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
 - Weather:
   - fetch historical hourly data (temperature, precipitation, humidity if available) via Open-Meteo
   - store in DB for later use
-- Charts page:
+- Dashboard charts:
   - line chart of accumulated irrigation per valve per day (based on IrrigationRun)
 
 ### Explicitly out of scope (for MVP)
@@ -298,6 +298,7 @@ Once per day per site (tracked by WeatherImportLog):
 - Use Django auth.
 - Provide Bootstrap login template.
 - Require login for app pages.
+- Use Django messages for user feedback; render them with Bootstrap alerts (map error -> danger).
 
 ### Pages
 1) `/` Dashboard
@@ -314,9 +315,13 @@ Once per day per site (tracked by WeatherImportLog):
   - for DYNAMIC rules, display an “expected/optimal” label (random/estimate)
 - CRUD ScheduleRule via Bootstrap forms
 
-3) `/charts/`
+3) Charts (on Dashboard)
 - Chart.js line chart for accumulated irrigation minutes per valve per day
 - Provide a valve selector to keep charts readable
+
+4) `/logs/`
+- Table view of irrigation runs (most recent first)
+- Show valve, trigger, planned/start/stop times, duration, status, stop reason
 
 APIs (lightweight JSON):
 - `/api/calendar-events/`
@@ -358,7 +363,8 @@ Local:
 - Controller starts scheduled runs within the minute and stops them reliably.
 - Failsafe closure works for max runtime.
 - Weather import stores hourly data for yesterday.
-- Charts page displays accumulated irrigation by valve/day.
+- Dashboard charts display accumulated irrigation by valve/day.
+- Logs page shows recent irrigation runs.
 
 Docker-ready:
 - Dockerfile builds.

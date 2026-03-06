@@ -15,12 +15,22 @@
       <span class="navbar-toggler-icon"></span>
     </button>
     <div class="collapse navbar-collapse" id="navbarContent">
+      {% with request.resolver_match.url_name as current %}
       <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-        <li class="nav-item"><a class="nav-link" href="{% url 'dashboard' %}">Dashboard</a></li>
-        <li class="nav-item"><a class="nav-link" href="{% url 'schedule' %}">Schedule</a></li>
-        <li class="nav-item"><a class="nav-link" href="{% url 'charts' %}">Charts</a></li>
-        <li class="nav-item"><a class="nav-link" href="/admin/">Admin</a></li>
+        <li class="nav-item">
+          <a class="nav-link{% if current == 'dashboard' %} active{% endif %}" href="{% url 'dashboard' %}">Dashboard</a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link{% if current == 'schedule' or current == 'schedule_create' or current == 'schedule_edit' %} active{% endif %}" href="{% url 'schedule' %}">Schedule</a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link{% if current == 'logs' %} active{% endif %}" href="{% url 'logs' %}">Logs</a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link{% if request.path|slice:':7' == '/admin/' %} active{% endif %}" href="/admin/">Admin</a>
+        </li>
       </ul>
+      {% endwith %}
       <ul class="navbar-nav">
         <li class="nav-item"><a class="nav-link" href="{% url 'logout' %}">Logout</a></li>
       </ul>
@@ -32,7 +42,9 @@
   {% if messages %}
     <div class="mb-3">
       {% for message in messages %}
-        <div class="alert alert-{{ message.tags }}" role="alert">{{ message }}</div>
+        <div class="alert alert-{% if message.level_tag == 'error' %}danger{% else %}{{ message.level_tag }}{% endif %}" role="alert">
+          {{ message }}
+        </div>
       {% endfor %}
     </div>
   {% endif %}
