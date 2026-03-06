@@ -59,3 +59,8 @@ class IrrigationRunAdmin(admin.ModelAdmin):
         "stop_reason",
     )
     list_filter = ("status", "trigger", "stop_reason")
+
+
+@admin.register(models.CurveSettings)
+class CurveSettingsAdmin(admin.ModelAdmin):
+    list_display = ("site", "min_mm", "max_mm", "g", "m", "updated_at")

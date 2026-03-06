@@ -7,6 +7,13 @@ from django.core.validators import MaxValueValidator, MinValueValidator
 from django.core.exceptions import ValidationError
 from django.db import models
 
+from apps.irrigation.curves import (
+    DEFAULT_G,
+    DEFAULT_M,
+    DEFAULT_MAX_MM,
+    DEFAULT_MIN_MM,
+)
+
 
 class Site(models.Model):
     name = models.CharField(max_length=100)
@@ -23,6 +30,20 @@ class Site(models.Model):
 
     def __str__(self) -> str:
         return self.name
+
+
+class CurveSettings(models.Model):
+    site = models.OneToOneField(
+        Site, on_delete=models.CASCADE, related_name="curve_settings"
+    )
+    min_mm = models.FloatField(default=DEFAULT_MIN_MM)
+    max_mm = models.FloatField(default=DEFAULT_MAX_MM)
+    g = models.FloatField(default=DEFAULT_G)
+    m = models.FloatField(default=DEFAULT_M)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"Curve settings ({self.site.name})"
 
 
 def _env_int(name: str, default: int) -> int:

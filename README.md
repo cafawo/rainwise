@@ -12,7 +12,7 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 - Charts for accumulated irrigation per valve/day (grouped bars) on the Dashboard.
 - Dashboard chart overlays precipitation and temperature on separate axes.
 - Logs page with recent irrigation runs.
-- Curve page to visualize and tune the daily water requirement curve.
+- Curve page to visualize and tune the daily water requirement curve (saved per site).
 
 ## Local Development
 

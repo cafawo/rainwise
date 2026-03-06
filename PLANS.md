@@ -27,6 +27,7 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
   - chart showing known points, default curve, and user-parameterized curve
   - allow adjusting curve parameters (min/max/g/m) and reset to defaults
   - show 90th percentile temperature (last 24h) mapped onto the curve when weather data exists
+  - persist curve parameters per site
 - Dashboard charts:
   - grouped bars for accumulated irrigation minutes per valve per day (based on IrrigationRun)
 

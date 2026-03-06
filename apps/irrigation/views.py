@@ -33,7 +33,14 @@ from apps.irrigation.forms import (
     ScheduleNewForm,
     ScheduleRuleForm,
 )
-from apps.irrigation.models import IrrigationRun, Schedule, ScheduleRule, Site, Valve
+from apps.irrigation.models import (
+    CurveSettings,
+    IrrigationRun,
+    Schedule,
+    ScheduleRule,
+    Site,
+    Valve,
+)
 from apps.weather.models import WeatherObservation
 from apps.weather.services import ensure_recent_weather
 
@@ -88,19 +95,53 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         "g": DEFAULT_G,
         "m": DEFAULT_M,
     }
+    site = _get_active_site()
+    settings_obj = None
+    if site:
+        settings_obj, _ = CurveSettings.objects.get_or_create(
+            site=site, defaults=default_params
+        )
+        stored_params = {
+            "min_mm": settings_obj.min_mm,
+            "max_mm": settings_obj.max_mm,
+            "g": settings_obj.g,
+            "m": settings_obj.m,
+        }
+    else:
+        stored_params = default_params
+
     if request.method == "POST":
         if "reset_defaults" in request.POST:
             form = CurveForm(initial=default_params)
             user_params = default_params
+            if settings_obj:
+                settings_obj.min_mm = default_params["min_mm"]
+                settings_obj.max_mm = default_params["max_mm"]
+                settings_obj.g = default_params["g"]
+                settings_obj.m = default_params["m"]
+                settings_obj.save(
+                    update_fields=["min_mm", "max_mm", "g", "m", "updated_at"]
+                )
+                messages.success(request, "Curve reset to defaults.")
+            else:
+                messages.error(request, "No site configured to store curve settings.")
         else:
             form = CurveForm(request.POST)
             if form.is_valid():
                 user_params = form.cleaned_data
+                if site:
+                    CurveSettings.objects.update_or_create(
+                        site=site,
+                        defaults=user_params,
+                    )
+                    messages.success(request, "Curve saved.")
+                else:
+                    messages.error(request, "No site configured to store curve settings.")
             else:
-                user_params = default_params
+                user_params = stored_params
     else:
-        form = CurveForm(initial=default_params)
-        user_params = default_params
+        form = CurveForm(initial=stored_params)
+        user_params = stored_params
 
     default_curve = generate_curve_points(
         0,

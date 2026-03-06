@@ -9,6 +9,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from apps.irrigation.models import (
+    CurveSettings,
     IrrigationRun,
     RelayDevice,
     Schedule,
@@ -276,3 +277,21 @@ class CurveViewTests(TestCase):
         response = self.client.get(reverse("curve"))
         self.assertEqual(response.status_code, 200)
         self.assertIsNotNone(response.context["p90_point"])
+
+    def test_curve_saves_settings(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.post(
+            reverse("curve"),
+            {
+                "min_mm": "1.2",
+                "max_mm": "6.5",
+                "g": "0.2",
+                "m": "24.5",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        settings = CurveSettings.objects.get(site=self.site)
+        self.assertAlmostEqual(settings.min_mm, 1.2)
+        self.assertAlmostEqual(settings.max_mm, 6.5)
+        self.assertAlmostEqual(settings.g, 0.2)
+        self.assertAlmostEqual(settings.m, 24.5)
