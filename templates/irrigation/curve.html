@@ -58,12 +58,27 @@
 <div class="card">
   <div class="card-body">
     <p class="mb-3">
-      This curve estimates how much water a lawn needs per day based on recent
-      temperature. The shape follows the DIN-18035-2 guidance for turf irrigation,
-      which we model with a smooth sigmoid curve so values change gradually.
+      We model daily lawn water need from temperature using a smooth curve fit to
+      DIN-18035-2 guidance for turf: &gt;30&nbsp;°C -> &gt;5&nbsp;mm/day, 25-30&nbsp;°C -> 3-4&nbsp;mm/day,
+      20-25&nbsp;°C -> 2-3&nbsp;mm/day, 15-20&nbsp;°C -> &lt;2&nbsp;mm/day. These values refer to multi-hour
+      daily maximum temperatures and are moderated by humidity and air movement.
     </p>
     <p class="mb-3">
-      The parameters control the curve:
+      In practice, irrigation demand tracks evapotranspiration (ET), the combined
+      evaporation from soil and transpiration from plants. ET is driven mainly by
+      temperature, solar radiation, wind, and humidity, and is often estimated from
+      weather station data.
+    </p>
+    <p class="mb-3">
+      Soil texture matters because it controls water-holding capacity and infiltration
+      rate: sandy soils hold less water but infiltrate quickly, while finer soils hold
+      more water but infiltrate more slowly, increasing runoff risk.
+      Turf species also matter; typical daily water use ranges are ~3-8&nbsp;mm for
+      cool-season grasses and ~2-5&nbsp;mm for warm-season grasses under non-limiting
+      moisture conditions.
+    </p>
+    <p class="mb-3">
+      The parameters below control the curve:
     </p>
     <ul class="mb-3">
       <li><strong>Min (mm)</strong> sets the baseline water need at low temperatures.</li>
@@ -73,10 +88,9 @@
     </ul>
     <p class="mb-0">
       The red point marks the recent 90th-percentile temperature (last 24 hours)
-      mapped onto your custom curve. In practice, soil type, humidity, wind,
-      shade, and irrigation efficiency also affect how much water is required.
-      Those factors are not yet modeled here but will be incorporated as inputs
-      alongside weather data as the dynamic irrigation logic evolves.
+      mapped onto your custom curve. As dynamic irrigation evolves, we'll combine
+      this curve with weather inputs and site factors like soil, humidity, wind,
+      shading, and irrigation efficiency.
     </p>
   </div>
 </div>
