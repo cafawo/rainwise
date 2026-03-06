@@ -88,6 +88,26 @@
         chartInstance.destroy();
       }
 
+      const formatDayLabel = (value) => {
+        if (typeof value !== "string") {
+          return value;
+        }
+        const parts = value.split("-");
+        if (parts.length !== 3) {
+          return value;
+        }
+        const year = Number(parts[0]);
+        const month = Number(parts[1]);
+        const day = Number(parts[2]);
+        if (!year || !month || !day) {
+          return value;
+        }
+        const date = new Date(year, month - 1, day);
+        const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const weekday = weekdays[date.getDay()];
+        return `${weekday} ${month}/${day}`;
+      };
+
       chartInstance = new Chart(ctx, {
         type: "bar",
         data: {
@@ -96,6 +116,21 @@
         },
         options: {
           responsive: true,
+          plugins: {
+            legend: {
+              display: true,
+              labels: {
+                filter: (item, data) => {
+                  const dataset = data.datasets[item.datasetIndex];
+                  return dataset && dataset.showInLegend !== false;
+                },
+              },
+            },
+            tooltip: {
+              mode: "index",
+              intersect: false,
+            },
+          },
           scales: {
             y: {
               title: {
@@ -103,6 +138,16 @@
                 text: "Minutes",
               },
               beginAtZero: true,
+              stacked: true,
+            },
+            x: {
+              stacked: true,
+              ticks: {
+                callback: function (value) {
+                  const label = this.getLabelForValue(value);
+                  return formatDayLabel(label);
+                },
+              },
             },
             y_precip: {
               position: "right",

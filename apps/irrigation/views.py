@@ -8,7 +8,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView
-from django.db import transaction
+from django.db import models, transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -635,23 +635,37 @@ def chart_data(request: HttpRequest) -> JsonResponse:
         valve_totals = totals_by_valve.setdefault(run.valve_id, {})
         valve_totals[day] = valve_totals.get(day, 0.0) + duration_minutes
 
-    if days_set:
-        days = sorted(days_set)
-        min_day = days[0]
-        max_day = days[-1]
-    else:
-        latest_obs = (
-            WeatherObservation.objects.filter(site=site).order_by("-timestamp").first()
-        )
-        if latest_obs:
-            max_day = timezone.localtime(latest_obs.timestamp, tz).date()
-        else:
+    weather_bounds = WeatherObservation.objects.filter(site=site).aggregate(
+        earliest=models.Min("timestamp"),
+        latest=models.Max("timestamp"),
+    )
+    weather_min = (
+        timezone.localtime(weather_bounds["earliest"], tz).date()
+        if weather_bounds["earliest"]
+        else None
+    )
+    weather_max = (
+        timezone.localtime(weather_bounds["latest"], tz).date()
+        if weather_bounds["latest"]
+        else None
+    )
+
+    if days_set or weather_min or weather_max:
+        min_candidates = [day for day in [min(days_set) if days_set else None, weather_min] if day]
+        max_candidates = [day for day in [max(days_set) if days_set else None, weather_max] if day]
+        min_day = min(min_candidates) if min_candidates else None
+        max_day = max(max_candidates) if max_candidates else None
+        if min_day is None or max_day is None:
             max_day = timezone.localtime(timezone.now(), tz).date()
+            min_day = max_day - dt.timedelta(days=6)
+    else:
+        max_day = timezone.localtime(timezone.now(), tz).date()
         min_day = max_day - dt.timedelta(days=6)
-        days = [
-            min_day + dt.timedelta(days=offset)
-            for offset in range((max_day - min_day).days + 1)
-        ]
+
+    days = [
+        min_day + dt.timedelta(days=offset)
+        for offset in range((max_day - min_day).days + 1)
+    ]
 
     labels = [day.isoformat() for day in days]
 
@@ -709,6 +723,8 @@ def chart_data(request: HttpRequest) -> JsonResponse:
                 "label": f"{valve.name} (min)",
                 "data": valve_data,
                 "yAxisID": "y",
+                "stack": "irrigation",
+                "showInLegend": False,
                 "backgroundColor": _hex_to_rgba(color, 0.35),
                 "borderColor": color,
                 "borderWidth": 1,
@@ -726,6 +742,7 @@ def chart_data(request: HttpRequest) -> JsonResponse:
                 "borderColor": "#0d6efd",
                 "backgroundColor": "rgba(13,110,253,0.15)",
                 "tension": 0.2,
+                "showInLegend": True,
                 "order": 2,
             },
             {
@@ -736,6 +753,7 @@ def chart_data(request: HttpRequest) -> JsonResponse:
                 "borderColor": "#fd7e14",
                 "backgroundColor": "rgba(253,126,20,0.15)",
                 "tension": 0.2,
+                "showInLegend": True,
                 "order": 2,
             },
         ]
