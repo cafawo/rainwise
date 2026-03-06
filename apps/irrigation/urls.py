@@ -15,6 +15,7 @@ urlpatterns = [
     path("schedule/new-schedule/", views.schedule_new, name="schedule_new"),
     path("schedule/load/", views.schedule_load, name="schedule_load"),
     path("logs/", views.logs_view, name="logs"),
+    path("curve/", views.curve_view, name="curve"),
     path("api/calendar-events/", views.calendar_events, name="calendar_events"),
     path("api/chart-data/", views.chart_data, name="chart_data"),
     path("api/valve-status/", views.valve_status, name="valve_status"),

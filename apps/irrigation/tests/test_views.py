@@ -232,3 +232,47 @@ class ChartDataTests(TestCase):
         bar_by_label = {ds["label"]: ds["data"][0] for ds in bar_datasets}
         self.assertEqual(bar_by_label.get("Valve 1 (min)"), 10.0)
         self.assertEqual(bar_by_label.get("Valve 2 (min)"), 5.0)
+
+
+class CurveViewTests(TestCase):
+    def setUp(self) -> None:
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(
+            username="tester",
+            password="password",
+        )
+        self.site = Site.objects.create(name="Test Site", timezone="Europe/Berlin")
+
+    def test_curve_requires_login(self) -> None:
+        response = self.client.get(reverse("curve"))
+        self.assertEqual(response.status_code, 302)
+
+    def test_curve_renders(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("curve"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Curve")
+        self.assertContains(response, "Reset defaults")
+
+    def test_curve_includes_p90_point(self) -> None:
+        now = timezone.now()
+        WeatherObservation.objects.create(
+            site=self.site,
+            timestamp=now - dt.timedelta(hours=1),
+            temperature_c=10.0,
+        )
+        WeatherObservation.objects.create(
+            site=self.site,
+            timestamp=now - dt.timedelta(hours=2),
+            temperature_c=20.0,
+        )
+        WeatherObservation.objects.create(
+            site=self.site,
+            timestamp=now - dt.timedelta(hours=3),
+            temperature_c=30.0,
+        )
+
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("curve"))
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(response.context["p90_point"])

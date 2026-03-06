@@ -23,6 +23,10 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
 - Weather:
   - fetch historical hourly data (temperature, precipitation, humidity if available) via Open-Meteo
   - store in DB for later use
+- Curve:
+  - chart showing known points, default curve, and user-parameterized curve
+  - allow adjusting curve parameters (min/max/g/m) and reset to defaults
+  - show 90th percentile temperature (last 24h) mapped onto the curve when weather data exists
 - Dashboard charts:
   - grouped bars for accumulated irrigation minutes per valve per day (based on IrrigationRun)
 
@@ -335,6 +339,11 @@ Regular refresh per site:
 4) `/logs/`
 - Table view of irrigation runs (most recent first)
 - Show valve, trigger, planned/start/stop times, duration, status, stop reason
+
+5) `/curve/`
+- Chart of daily water requirement vs temperature
+- Show known reference points, default curve, and user-adjusted curve
+- Form to adjust min/max/g/m and reset defaults
 
 APIs (lightweight JSON):
 - `/api/calendar-events/`

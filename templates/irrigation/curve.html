@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+
+{% block title %}Curve | Rainwise{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">Curve</h1>
+
+<div class="row g-4">
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-body">
+        <canvas id="curveChart" height="150"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-body">
+        <h2 class="h5 mb-3">Parameters</h2>
+        <form method="post" novalidate>
+          {% csrf_token %}
+          {{ form.non_field_errors }}
+          <div class="mb-3">
+            <label class="form-label" for="{{ form.min_mm.id_for_label }}">Min (mm)</label>
+            {{ form.min_mm }}
+            {{ form.min_mm.errors }}
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="{{ form.max_mm.id_for_label }}">Max (mm)</label>
+            {{ form.max_mm }}
+            {{ form.max_mm.errors }}
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="{{ form.g.id_for_label }}">g</label>
+            {{ form.g }}
+            {{ form.g.errors }}
+          </div>
+          <div class="mb-3">
+            <label class="form-label" for="{{ form.m.id_for_label }}">m</label>
+            {{ form.m }}
+            {{ form.m.errors }}
+          </div>
+          <div class="d-flex flex-wrap gap-2">
+            <button class="btn btn-primary" type="submit">Update curve</button>
+            <button class="btn btn-outline-secondary" type="submit" name="reset_defaults" value="1">
+              Reset defaults
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  {{ known_points|json_script:"knownPoints" }}
+  {{ default_curve|json_script:"defaultCurve" }}
+  {{ user_curve|json_script:"userCurve" }}
+  {{ p90_point|json_script:"p90Point" }}
+  <script>
+    const knownPoints = JSON.parse(document.getElementById("knownPoints").textContent);
+    const defaultCurve = JSON.parse(document.getElementById("defaultCurve").textContent);
+    const userCurve = JSON.parse(document.getElementById("userCurve").textContent);
+    const p90Point = JSON.parse(document.getElementById("p90Point").textContent);
+
+    const ctx = document.getElementById("curveChart").getContext("2d");
+    const datasets = [
+      {
+        type: "scatter",
+        label: "DIN-18035-2",
+        data: knownPoints,
+        backgroundColor: "#212529",
+        borderColor: "#212529",
+        pointRadius: 4,
+        showLine: false,
+      },
+      {
+        type: "line",
+        label: "Default",
+        data: defaultCurve,
+        borderColor: "#6c757d",
+        borderDash: [6, 4],
+        pointRadius: 0,
+        tension: 0.2,
+      },
+      {
+        type: "line",
+        label: "Custom",
+        data: userCurve,
+        borderColor: "#0d6efd",
+        pointRadius: 0,
+        tension: 0.2,
+      },
+    ];
+
+    if (p90Point) {
+      datasets.push({
+        type: "scatter",
+        label: "Current C (q90 24h)",
+        data: [p90Point],
+        backgroundColor: "#dc3545",
+        borderColor: "#dc3545",
+        pointRadius: 0,
+        pointHoverRadius: 0,
+        pointHitRadius: 0,
+        showLine: false,
+      });
+    }
+
+    const currentCLinePlugin = {
+      id: "currentCLine",
+      beforeDatasetsDraw(chart) {
+        if (!p90Point) {
+          return;
+        }
+        const xScale = chart.scales.x;
+        const yScale = chart.scales.y;
+        if (!xScale || !yScale) {
+          return;
+        }
+        const x = xScale.getPixelForValue(p90Point.x);
+        const { ctx } = chart;
+        ctx.save();
+        ctx.strokeStyle = "#dc3545";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, yScale.top);
+        ctx.lineTo(x, yScale.bottom);
+        ctx.stroke();
+        ctx.restore();
+      },
+      afterDatasetsDraw(chart) {
+        if (!p90Point) {
+          return;
+        }
+        const xScale = chart.scales.x;
+        const yScale = chart.scales.y;
+        if (!xScale || !yScale) {
+          return;
+        }
+        const x = xScale.getPixelForValue(p90Point.x);
+        const y = yScale.getPixelForValue(p90Point.y);
+        const { ctx } = chart;
+        ctx.save();
+        ctx.fillStyle = "#dc3545";
+        ctx.beginPath();
+        ctx.arc(x, y, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      },
+    };
+
+    new Chart(ctx, {
+      type: "line",
+      data: {
+        datasets,
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: {
+            type: "linear",
+            title: {
+              display: true,
+              text: "Temperature (°C)",
+            },
+          },
+          y: {
+            title: {
+              display: true,
+              text: "Water required (mm/day)",
+            },
+            beginAtZero: true,
+          },
+        },
+      },
+      plugins: p90Point ? [currentCLinePlugin] : [],
+    });
+  </script>
+{% endblock %}

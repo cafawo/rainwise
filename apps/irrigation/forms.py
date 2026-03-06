@@ -161,3 +161,53 @@ class ScheduleLoadForm(forms.Form):
         schedules = kwargs.pop("schedules", Schedule.objects.none())
         super().__init__(*args, **kwargs)
         self.fields["schedule"].queryset = schedules
+
+
+class CurveForm(forms.Form):
+    min_mm = forms.FloatField(
+        label="Min (mm)",
+        initial=0.0,
+        widget=forms.NumberInput(
+            attrs={"class": "form-control", "placeholder": "e.g. 0", "step": "0.1"}
+        ),
+    )
+    max_mm = forms.FloatField(
+        label="Max (mm)",
+        initial=7.0,
+        widget=forms.NumberInput(
+            attrs={"class": "form-control", "placeholder": "e.g. 7", "step": "0.1"}
+        ),
+    )
+    g = forms.FloatField(
+        label="g",
+        initial=0.1852,
+        widget=forms.NumberInput(
+            attrs={"class": "form-control", "placeholder": "e.g. 0.1852", "step": "0.0001"}
+        ),
+    )
+    m = forms.FloatField(
+        label="m",
+        initial=25.6653,
+        widget=forms.NumberInput(
+            attrs={"class": "form-control", "placeholder": "e.g. 25.6653", "step": "0.0001"}
+        ),
+    )
+
+    def clean(self) -> dict:
+        cleaned = super().clean()
+        min_mm = cleaned.get("min_mm")
+        max_mm = cleaned.get("max_mm")
+        g = cleaned.get("g")
+        if min_mm is not None and min_mm < 0:
+            self.add_error("min_mm", "Min must be 0 or higher.")
+        if max_mm is not None and max_mm < 0:
+            self.add_error("max_mm", "Max must be 0 or higher.")
+        if (
+            min_mm is not None
+            and max_mm is not None
+            and max_mm < min_mm
+        ):
+            self.add_error("max_mm", "Max must be greater than or equal to min.")
+        if g is not None and g <= 0:
+            self.add_error("g", "g must be greater than 0.")
+        return cleaned

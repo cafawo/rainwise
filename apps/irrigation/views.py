@@ -16,7 +16,18 @@ from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.irrigation import services
+from apps.irrigation.curves import (
+    DEFAULT_G,
+    DEFAULT_M,
+    DEFAULT_MAX_MM,
+    DEFAULT_MIN_MM,
+    KNOWN_POINTS,
+    daily_water_required,
+    generate_curve_points,
+    percentile,
+)
 from apps.irrigation.forms import (
+    CurveForm,
     LoginForm,
     ScheduleLoadForm,
     ScheduleNewForm,
@@ -65,6 +76,87 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         {
             "valves": valves,
             "running_valve_ids": running_valve_ids,
+        },
+    )
+
+
+@login_required
+def curve_view(request: HttpRequest) -> HttpResponse:
+    default_params = {
+        "min_mm": DEFAULT_MIN_MM,
+        "max_mm": DEFAULT_MAX_MM,
+        "g": DEFAULT_G,
+        "m": DEFAULT_M,
+    }
+    if request.method == "POST":
+        if "reset_defaults" in request.POST:
+            form = CurveForm(initial=default_params)
+            user_params = default_params
+        else:
+            form = CurveForm(request.POST)
+            if form.is_valid():
+                user_params = form.cleaned_data
+            else:
+                user_params = default_params
+    else:
+        form = CurveForm(initial=default_params)
+        user_params = default_params
+
+    default_curve = generate_curve_points(
+        0,
+        40,
+        1,
+        min_mm=default_params["min_mm"],
+        max_mm=default_params["max_mm"],
+        g=default_params["g"],
+        m=default_params["m"],
+    )
+    user_curve = generate_curve_points(
+        0,
+        40,
+        1,
+        min_mm=user_params["min_mm"],
+        max_mm=user_params["max_mm"],
+        g=user_params["g"],
+        m=user_params["m"],
+    )
+
+    p90_point = None
+    site = _get_active_site()
+    if site:
+        cutoff = timezone.now() - dt.timedelta(hours=24)
+        temps = list(
+            WeatherObservation.objects.filter(
+                site=site,
+                timestamp__gte=cutoff,
+                temperature_c__isnull=False,
+            ).values_list("temperature_c", flat=True)
+        )
+        p90_temp = percentile(temps, 0.9)
+        if p90_temp is not None:
+            p90_point = {
+                "x": round(p90_temp, 2),
+                "y": round(
+                    daily_water_required(
+                        p90_temp,
+                        user_params["min_mm"],
+                        user_params["max_mm"],
+                        user_params["g"],
+                        user_params["m"],
+                    ),
+                    3,
+                ),
+            }
+
+    return render(
+        request,
+        "irrigation/curve.html",
+        {
+            "form": form,
+            "known_points": KNOWN_POINTS,
+            "default_curve": default_curve,
+            "user_curve": user_curve,
+            "p90_point": p90_point,
         },
     )
 

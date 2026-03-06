@@ -27,6 +27,9 @@
           <a class="nav-link{% if current == 'logs' %} active{% endif %}" href="{% url 'logs' %}">Logs</a>
         </li>
         <li class="nav-item">
+          <a class="nav-link{% if current == 'curve' %} active{% endif %}" href="{% url 'curve' %}">Curve</a>
+        </li>
+        <li class="nav-item">
           <a class="nav-link{% if request.path|slice:':7' == '/admin/' %} active{% endif %}" href="/admin/">Admin</a>
         </li>
       </ul>
