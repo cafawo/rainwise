@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rainwise</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="brand">Rainwise</div>
+      <nav class="nav">
+        <a href="#features">Features</a>
+        <a href="#screens">Screens</a>
+        <a href="#tech">Tech</a>
+      </nav>
+      <div class="hero-content">
+        <div>
+          <p class="eyebrow">Irrigation control, simplified</p>
+          <h1>Smart scheduling with a weather-ready core.</h1>
+          <p class="lead">
+            Rainwise is a lightweight Django app for managing valves, schedules,
+            and the science behind dynamic watering. Built for reliability,
+            low resource usage, and simple deployment.
+          </p>
+          <div class="hero-actions">
+            <span class="pill">Safe failsafe stops</span>
+            <span class="pill">Weekly schedule view</span>
+            <span class="pill">Curve tuning</span>
+          </div>
+        </div>
+        <div class="hero-panel">
+          <div class="panel-title">What it does</div>
+          <ul class="panel-list">
+            <li>Schedule watering by day and time</li>
+            <li>Keep valves safe with max-duration failsafes</li>
+            <li>Visualize daily irrigation and weather context</li>
+            <li>Calibrate an irrigation curve for dynamic control</li>
+          </ul>
+        </div>
+      </div>
+    </header>
+
+    <section id="features" class="section reveal">
+      <h2>Main features</h2>
+      <div class="feature-grid">
+        <div class="feature-card">
+          <h3>Scheduling that stays readable</h3>
+          <p>
+            A weekly calendar view makes it easy to see every rule, edit it with a
+            double-click, and keep the schedule simple and transparent.
+          </p>
+        </div>
+        <div class="feature-card">
+          <h3>Weather-aware foundations</h3>
+          <p>
+            Hourly weather data is stored for future optimization. The curve view
+            makes the irrigation model explicit, adjustable, and inspectable.
+          </p>
+        </div>
+        <div class="feature-card">
+          <h3>Safety-first operations</h3>
+          <p>
+            Every run is bounded by a hard stop. The controller watches for
+            unexpected open valves and closes them automatically.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section id="screens" class="section reveal">
+      <h2>Product screens</h2>
+      <div class="screen-grid">
+        <figure class="screen-card">
+          <img src="assets/schedule.png" alt="Schedule view" />
+          <figcaption>Weekly scheduling with quick edits and clear visibility.</figcaption>
+        </figure>
+        <figure class="screen-card">
+          <img src="assets/curve.png" alt="Curve view" />
+          <figcaption>Curve tuning with known reference points and live conditions.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="tech" class="section reveal">
+      <h2>Built for real deployments</h2>
+      <div class="tech-grid">
+        <div>
+          <p>
+            Rainwise is designed for small hardware, Docker, and TrueNAS SCALE.
+            It avoids heavy background workers, runs a single controller loop, and
+            keeps configuration straightforward.
+          </p>
+          <div class="tag-list">
+            <span>Modbus TCP</span>
+            <span>Django</span>
+            <span>SQLite or Postgres</span>
+            <span>Open-Meteo</span>
+          </div>
+        </div>
+        <div class="tech-card">
+          <h3>What comes next</h3>
+          <p>
+            Dynamic irrigation will combine curve parameters, weather history,
+            and site-specific factors like soil type, wind exposure, and irrigation
+            efficiency to compute optimal run times.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span>Rainwise</span>
+      <span>Simple, robust irrigation control.</span>
+    </footer>
+  </div>
+</body>
+</html>
