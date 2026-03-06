@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  web:
+    image: ghcr.io/cafawo/rainwise:latest
+    command: gunicorn rainwise.wsgi:application --bind 0.0.0.0:8000
+    environment:
+      DJANGO_SECRET_KEY: "change-me"
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: "rainwise.local,192.168.1.50"
+      DJANGO_TIME_ZONE: "Europe/Berlin"
+      RELAY_SIMULATOR: "false"
+      # Choose one database option (required):
+      # POSTGRES_HOST: "your-postgres-host"
+      # POSTGRES_PORT: "5432"
+      # POSTGRES_DB: "rainwise"
+      # POSTGRES_USER: "rainwise"
+      # POSTGRES_PASSWORD: "change-me"
+      # POSTGRES_SSLMODE: ""
+      # SQLITE_PATH: "/data/db.sqlite3"
+    ports:
+      - "8888:8000"
+    # Required if using SQLite:
+    # volumes:
+    #   - /mnt/pool/apps/rainwise/data:/data
+    restart: unless-stopped
+
+  controller:
+    image: ghcr.io/cafawo/rainwise:latest
+    command: python manage.py controller
+    environment:
+      DJANGO_SECRET_KEY: "change-me"
+      DJANGO_DEBUG: "false"
+      DJANGO_ALLOWED_HOSTS: "rainwise.local,192.168.1.50"
+      DJANGO_TIME_ZONE: "Europe/Berlin"
+      RELAY_SIMULATOR: "false"
+      # Choose one database option (required):
+      # POSTGRES_HOST: "your-postgres-host"
+      # POSTGRES_PORT: "5432"
+      # POSTGRES_DB: "rainwise"
+      # POSTGRES_USER: "rainwise"
+      # POSTGRES_PASSWORD: "change-me"
+      # POSTGRES_SSLMODE: ""
+      # SQLITE_PATH: "/data/db.sqlite3"
+    # Required if using SQLite:
+    # volumes:
+    #   - /mnt/pool/apps/rainwise/data:/data
+    restart: unless-stopped

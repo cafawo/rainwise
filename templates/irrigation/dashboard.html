@@ -3,6 +3,14 @@
 {% block title %}Valves | Rainwise{% endblock %}
 
 {% block content %}
+{% if show_default_sqlite_warning %}
+  <div class="alert alert-warning" role="alert">
+    Using the default SQLite database (<code>db.sqlite3</code>). This fallback is
+    intended for local/system tests and can lose data in containers. Set
+    <code>SQLITE_PATH=/data/db.sqlite3</code> with a mounted volume or configure
+    Postgres for production.
+  </div>
+{% endif %}
 <h1 class="h3 mb-3">Valves</h1>
 
 <div class="card">

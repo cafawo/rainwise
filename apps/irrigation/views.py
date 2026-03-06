@@ -68,6 +68,12 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({red},{green},{blue},{alpha})"
 
 
+def _using_default_sqlite() -> bool:
+    postgres_host = (getattr(settings, "POSTGRES_HOST", "") or "").strip()
+    sqlite_path = (getattr(settings, "SQLITE_PATH", "") or "").strip()
+    return not postgres_host and not sqlite_path
+
+
 @login_required
 def dashboard(request: HttpRequest) -> HttpResponse:
     valves = Valve.objects.select_related("relay_device").order_by("name")
@@ -83,6 +89,7 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         {
             "valves": valves,
             "running_valve_ids": running_valve_ids,
+            "show_default_sqlite_warning": _using_default_sqlite(),
         },
     )
 

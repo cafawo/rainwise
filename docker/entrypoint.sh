@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -z "${POSTGRES_HOST:-}" && -z "${SQLITE_PATH:-}" ]]; then
+  echo "Error: Set POSTGRES_HOST (with credentials) or SQLITE_PATH for Docker deployments." >&2
+  echo "The default SQLite fallback is intended for local dev without Docker." >&2
+  exit 1
+fi
+
 python manage.py migrate --noinput
 python manage.py collectstatic --noinput
 

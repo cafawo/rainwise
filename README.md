@@ -40,26 +40,74 @@ python manage.py runserver
 python manage.py controller
 ```
 
-## Docker (SQLite default)
+## Docker (Choose Postgres or SQLite)
+
+For Docker deployments, you must configure a database:
+- Postgres (recommended), or
+- SQLite with a mounted `/data` volume.
+
+The Docker entrypoint exits if neither `POSTGRES_HOST` nor `SQLITE_PATH` is set.
+
+Postgres example:
 
 ```bash
+# in .env
+POSTGRES_HOST=your-postgres-host
+POSTGRES_DB=rainwise
+POSTGRES_USER=rainwise
+POSTGRES_PASSWORD=change-me
+POSTGRES_PORT=5432
+
 docker compose up --build
 ```
 
-- `web` runs Gunicorn.
-- `controller` runs `python manage.py controller`.
-- SQLite data is stored under `./data` (mapped to `/data` inside containers). Set `SQLITE_PATH=/data/db.sqlite3` in `.env` to persist.
-
-## Docker (External Postgres)
-
-If you already have a Postgres server, set `POSTGRES_HOST`, `POSTGRES_DB`,
-`POSTGRES_USER`, and `POSTGRES_PASSWORD` in `.env` and run:
+SQLite example:
 
 ```bash
+# in .env
+SQLITE_PATH=/data/db.sqlite3
+
 docker compose up --build
 ```
+
+If using SQLite, add a volume mapping to `/data` in `docker-compose.yml`
+or `docker-compose.truenas.yml` so the database is persisted.
 
 Rainwise does not start or manage a Postgres container.
+
+## GitHub Container Registry (GHCR)
+
+Container images are built and published on tag pushes that match `v*`.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Images publish to `ghcr.io/cafawo/rainwise:<tag>` and are multi-arch
+(`linux/amd64` + `linux/arm64`). Packages are private by default in GHCR; make
+the package public or configure registry credentials in TrueNAS if needed.
+The most recent tag also updates `ghcr.io/cafawo/rainwise:latest`.
+
+## TrueNAS SCALE Apps (Docker)
+
+TrueNAS SCALE 24.10+ uses a Docker-based Apps system. If you want a single App
+that runs both containers (web + controller), use the Install via YAML flow and
+paste a Docker Compose file that includes both services.
+
+Option A: Install via YAML (single app, recommended)
+- Apps > Discover > Custom App > Install via YAML opens an advanced YAML editor
+  that accepts Docker Compose configuration.
+- Use `docker-compose.truenas.yml` as a starting point (template with placeholders).
+- Set environment variables per `.env.example`.
+- If using SQLite, mount a dataset to `/data` and set
+  `SQLITE_PATH=/data/db.sqlite3`.
+- Expose a host port (example: `8888`) mapped to container port `8000`.
+  The containers will not start unless Postgres or SQLite is configured.
+
+Option B: Custom App wizard (single image)
+- The guided wizard configures a single Docker image. If you need multiple
+  services in one app, use Install via YAML with a Compose file instead.
 
 ## Environment Variables
 
@@ -78,6 +126,9 @@ Database selection order:
 1. If `POSTGRES_HOST` is set, Postgres is used (with required credentials).
 2. Else if `SQLITE_PATH` is set, SQLite uses that path.
 3. Else Django uses the default `db.sqlite3` in the project root.
+
+The dashboard shows a warning when running on the default SQLite fallback so
+you can catch accidental non-persistent setups.
 
 Controller:
 

@@ -6,15 +6,17 @@ services:
     command: gunicorn rainwise.wsgi:application --bind 0.0.0.0:8000
     env_file: .env
     ports:
-      - "8000:8000"
-    volumes:
-      - ./data:/data
+      - "8888:8000"
+    # Uncomment if using SQLite:
+    # volumes:
+    #   - ./data:/data
     restart: unless-stopped
 
   controller:
     build: .
     command: python manage.py controller
     env_file: .env
-    volumes:
-      - ./data:/data
+    # Uncomment if using SQLite:
+    # volumes:
+    #   - ./data:/data
     restart: unless-stopped

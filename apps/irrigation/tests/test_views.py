@@ -4,7 +4,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
@@ -63,6 +63,28 @@ class LogsViewTests(TestCase):
         response = self.client.get(reverse("logs"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Logs")
+
+
+class DashboardViewTests(TestCase):
+    def setUp(self) -> None:
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(
+            username="tester",
+            password="password",
+        )
+
+    def test_dashboard_shows_default_sqlite_warning(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Using the default SQLite database")
+
+    @override_settings(SQLITE_PATH="/data/db.sqlite3")
+    def test_dashboard_hides_warning_with_sqlite_path(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Using the default SQLite database")
 
 
 class ScheduleNewViewTests(TestCase):

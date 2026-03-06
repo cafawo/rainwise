@@ -2,6 +2,18 @@
 
 Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigation system controlled by a Waveshare Modbus TCP Ethernet relay module (8-channel). Runs locally on macOS for development and is deployable to TrueNAS SCALE via Docker. MVP prioritizes simplicity, safety, and low resource usage.
 
+## Deployment prep (2026-03-06)
+
+- Add a `.dockerignore` to keep images small and avoid copying dev data into images.
+- Add a GitHub Actions workflow that builds and publishes GHCR images on tag pushes.
+- Build multi-arch images (`amd64` + `arm64`) to run on TrueNAS and Apple Silicon.
+- Also publish a `latest` tag on each release tag push.
+- Add a TrueNAS YAML template (`docker-compose.truenas.yml`) with placeholders.
+- Enforce database selection in Docker (must set Postgres or SQLite path).
+- Show a dashboard warning when running on the default SQLite fallback.
+- Update README with TrueNAS SCALE Apps deployment steps and GHCR usage.
+- Keep local development workflow unchanged.
+
 ## Scope (MVP)
 
 ### Must-have
