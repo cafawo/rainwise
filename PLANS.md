@@ -24,7 +24,7 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
   - fetch historical hourly data (temperature, precipitation, humidity if available) via Open-Meteo
   - store in DB for later use
 - Dashboard charts:
-  - line chart of accumulated irrigation per valve per day (based on IrrigationRun)
+  - grouped bars for accumulated irrigation minutes per valve per day (based on IrrigationRun)
 
 ### Explicitly out of scope (for MVP)
 - Group/parallel locking / resource constraints
@@ -328,9 +328,9 @@ Regular refresh per site:
   - Load switches the active schedule for the site (no data deletion).
 
 3) Charts (on Dashboard)
-- Chart.js chart for accumulated irrigation minutes per valve per day
-- Overlay precipitation and temperature (lines) on a secondary axis
-- Provide a valve selector to keep charts readable
+- Chart.js chart for accumulated irrigation minutes per valve per day (grouped bars across all valves)
+- Overlay precipitation and temperature as lines on separate right-side axes
+- Single combined chart (no valve selector)
 
 4) `/logs/`
 - Table view of irrigation runs (most recent first)

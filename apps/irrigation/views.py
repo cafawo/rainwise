@@ -23,6 +23,7 @@ from apps.irrigation.forms import (
     ScheduleRuleForm,
 )
 from apps.irrigation.models import IrrigationRun, Schedule, ScheduleRule, Site, Valve
+from apps.weather.models import WeatherObservation
 from apps.weather.services import ensure_recent_weather
 
 
@@ -41,6 +42,14 @@ def _ensure_active_schedule(site: Site) -> Schedule:
     return schedule
 
 
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    red = int(hex_color[0:2], 16)
+    green = int(hex_color[2:4], 16)
+    blue = int(hex_color[4:6], 16)
+    return f"rgba({red},{green},{blue},{alpha})"
+
+
 @login_required
 def dashboard(request: HttpRequest) -> HttpResponse:
     valves = Valve.objects.select_related("relay_device").order_by("name")
@@ -50,14 +59,12 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         .order_by("-actual_start_at")
     )
     running_valve_ids = [run.valve_id for run in running_runs]
-    selected_valve_id = valves[0].id if valves else None
     return render(
         request,
         "irrigation/dashboard.html",
         {
             "valves": valves,
             "running_valve_ids": running_valve_ids,
-            "selected_valve_id": selected_valve_id,
         },
     )
 
@@ -461,58 +468,87 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
 @require_GET
 def chart_data(request: HttpRequest) -> JsonResponse:
     valve_id = request.GET.get("valve_id")
-    if not valve_id:
-        return JsonResponse({"error": "valve_id is required"}, status=400)
+    valves = Valve.objects.select_related("relay_device", "relay_device__site").order_by(
+        "name"
+    )
+    if valve_id:
+        valves = valves.filter(pk=valve_id)
+    valves_list = list(valves)
+    if not valves_list:
+        return JsonResponse({"labels": [], "datasets": []})
 
-    valve = get_object_or_404(Valve, pk=valve_id)
-    tz = ZoneInfo(valve.relay_device.site.timezone or settings.TIME_ZONE)
+    site = _get_active_site() or valves_list[0].relay_device.site
+    tz = ZoneInfo(site.timezone or settings.TIME_ZONE)
 
     runs = (
         IrrigationRun.objects.filter(
-            valve=valve,
+            valve__in=valves_list,
             status=IrrigationRun.STATUS_FINISHED,
             actual_start_at__isnull=False,
             actual_stop_at__isnull=False,
         )
         .order_by("actual_start_at")
-        .only("actual_start_at", "actual_stop_at")
+        .only("valve_id", "actual_start_at", "actual_stop_at")
     )
 
-    totals: dict[dt.date, float] = {}
+    totals_by_valve: dict[int, dict[dt.date, float]] = {
+        valve.id: {} for valve in valves_list
+    }
+    days_set: set[dt.date] = set()
+
     for run in runs:
         start = timezone.localtime(run.actual_start_at, tz)
         stop = timezone.localtime(run.actual_stop_at, tz)
         duration_minutes = max(0.0, (stop - start).total_seconds() / 60.0)
         day = start.date()
-        totals[day] = totals.get(day, 0.0) + duration_minutes
+        days_set.add(day)
+        valve_totals = totals_by_valve.setdefault(run.valve_id, {})
+        valve_totals[day] = valve_totals.get(day, 0.0) + duration_minutes
 
-    days = sorted(totals.keys())
+    if days_set:
+        days = sorted(days_set)
+        min_day = days[0]
+        max_day = days[-1]
+    else:
+        latest_obs = (
+            WeatherObservation.objects.filter(site=site).order_by("-timestamp").first()
+        )
+        if latest_obs:
+            max_day = timezone.localtime(latest_obs.timestamp, tz).date()
+        else:
+            max_day = timezone.localtime(timezone.now(), tz).date()
+        min_day = max_day - dt.timedelta(days=6)
+        days = [
+            min_day + dt.timedelta(days=offset)
+            for offset in range((max_day - min_day).days + 1)
+        ]
+
     labels = [day.isoformat() for day in days]
-    data = [round(totals[day], 2) for day in days]
 
     precip_by_day: dict[dt.date, float] = {}
+    precip_count_by_day: dict[dt.date, int] = {}
     temp_sum_by_day: dict[dt.date, float] = {}
     temp_count_by_day: dict[dt.date, int] = {}
 
-    if days:
-        min_day = days[0]
-        max_day = days[-1]
-        observations = (
-            valve.relay_device.site.weatherobservation_set.filter(
-                timestamp__date__range=(min_day, max_day)
-            )
-            .only("timestamp", "temperature_c", "precipitation_mm")
-        )
-        for obs in observations:
-            day = timezone.localtime(obs.timestamp, tz).date()
-            if obs.precipitation_mm is not None:
-                precip_by_day[day] = precip_by_day.get(day, 0.0) + obs.precipitation_mm
-            if obs.temperature_c is not None:
-                temp_sum_by_day[day] = temp_sum_by_day.get(day, 0.0) + obs.temperature_c
-                temp_count_by_day[day] = temp_count_by_day.get(day, 0) + 1
+    start_dt = dt.datetime.combine(min_day, dt.time.min).replace(tzinfo=tz)
+    end_dt = dt.datetime.combine(max_day + dt.timedelta(days=1), dt.time.min).replace(
+        tzinfo=tz
+    )
+    observations = WeatherObservation.objects.filter(
+        site=site, timestamp__gte=start_dt, timestamp__lt=end_dt
+    ).only("timestamp", "temperature_c", "precipitation_mm")
+    for obs in observations:
+        day = timezone.localtime(obs.timestamp, tz).date()
+        if obs.precipitation_mm is not None:
+            precip_by_day[day] = precip_by_day.get(day, 0.0) + obs.precipitation_mm
+            precip_count_by_day[day] = precip_count_by_day.get(day, 0) + 1
+        if obs.temperature_c is not None:
+            temp_sum_by_day[day] = temp_sum_by_day.get(day, 0.0) + obs.temperature_c
+            temp_count_by_day[day] = temp_count_by_day.get(day, 0) + 1
 
     precip_series = [
-        round(precip_by_day.get(day, 0.0), 2) if days else None for day in days
+        round(precip_by_day[day], 2) if day in precip_count_by_day else None
+        for day in days
     ]
     temp_series = [
         round(temp_sum_by_day[day] / temp_count_by_day[day], 2)
@@ -521,36 +557,61 @@ def chart_data(request: HttpRequest) -> JsonResponse:
         for day in days
     ]
 
-    payload = {
-        "labels": labels,
-        "datasets": [
+    bar_colors = [
+        "#198754",
+        "#0dcaf0",
+        "#6f42c1",
+        "#ffc107",
+        "#dc3545",
+        "#6610f2",
+        "#20c997",
+        "#6c757d",
+    ]
+    datasets: list[dict] = []
+    for idx, valve in enumerate(valves_list):
+        color = bar_colors[idx % len(bar_colors)]
+        valve_data = [
+            round(totals_by_valve.get(valve.id, {}).get(day, 0.0), 2) for day in days
+        ]
+        datasets.append(
             {
                 "type": "bar",
                 "label": f"{valve.name} (min)",
-                "data": data,
+                "data": valve_data,
                 "yAxisID": "y",
-            },
+                "backgroundColor": _hex_to_rgba(color, 0.35),
+                "borderColor": color,
+                "borderWidth": 1,
+                "order": 1,
+            }
+        )
+
+    datasets.extend(
+        [
             {
                 "type": "line",
                 "label": "Precip (mm)",
                 "data": precip_series,
-                "yAxisID": "y1",
+                "yAxisID": "y_precip",
                 "borderColor": "#0d6efd",
-                "backgroundColor": "rgba(13,110,253,0.2)",
+                "backgroundColor": "rgba(13,110,253,0.15)",
                 "tension": 0.2,
+                "order": 2,
             },
             {
                 "type": "line",
                 "label": "Temp (°C)",
                 "data": temp_series,
-                "yAxisID": "y1",
+                "yAxisID": "y_temp",
                 "borderColor": "#fd7e14",
-                "backgroundColor": "rgba(253,126,20,0.2)",
+                "backgroundColor": "rgba(253,126,20,0.15)",
                 "tension": 0.2,
-            }
-        ],
-    }
-    return JsonResponse(payload)
+                "order": 2,
+            },
+        ]
+    )
+
+    return JsonResponse({"labels": labels, "datasets": datasets})
 
 
 @login_required

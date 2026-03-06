@@ -9,8 +9,8 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 - Multiple schedules with an active schedule switch.
 - Controller loop that enforces planned stops and hard failsafe stops.
 - Weather import (Open-Meteo) stored as hourly observations.
-- Charts for accumulated irrigation per valve/day (on the Dashboard).
-- Dashboard chart overlays precipitation and temperature.
+- Charts for accumulated irrigation per valve/day (grouped bars) on the Dashboard.
+- Dashboard chart overlays precipitation and temperature on separate axes.
 - Logs page with recent irrigation runs.
 
 ## Local Development

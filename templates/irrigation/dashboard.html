@@ -66,16 +66,6 @@
 <h2 class="h4 mt-4 mb-3">Charts</h2>
 <div class="card">
   <div class="card-body">
-    <div class="mb-3">
-      <label class="form-label" for="valveSelect">Valve</label>
-      <select class="form-select" id="valveSelect">
-        {% for valve in valves %}
-          <option value="{{ valve.id }}" {% if valve.id == selected_valve_id %}selected{% endif %}>
-            {{ valve.name }}
-          </option>
-        {% endfor %}
-      </select>
-    </div>
     <canvas id="chart" height="120"></canvas>
     {% if not valves %}
       <p class="text-muted">Add valves to view chart data.</p>
@@ -89,8 +79,8 @@
   <script>
     let chartInstance = null;
 
-    async function loadChart(valveId) {
-      const response = await fetch(`{% url 'chart_data' %}?valve_id=${valveId}`);
+    async function loadChart() {
+      const response = await fetch(`{% url 'chart_data' %}`);
       const payload = await response.json();
 
       const ctx = document.getElementById("chart").getContext("2d");
@@ -114,11 +104,22 @@
               },
               beginAtZero: true,
             },
-            y1: {
+            y_precip: {
               position: "right",
               title: {
                 display: true,
-                text: "Weather (mm / °C)",
+                text: "Precip (mm)",
+              },
+              grid: {
+                drawOnChartArea: false,
+              },
+            },
+            y_temp: {
+              position: "right",
+              offset: true,
+              title: {
+                display: true,
+                text: "Temp (°C)",
               },
               grid: {
                 drawOnChartArea: false,
@@ -129,12 +130,6 @@
       });
     }
 
-    const select = document.getElementById("valveSelect");
-    if (select) {
-      select.addEventListener("change", (event) => loadChart(event.target.value));
-      if (select.value) {
-        loadChart(select.value);
-      }
-    }
+    loadChart();
   </script>
 {% endblock %}
