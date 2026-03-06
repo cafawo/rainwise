@@ -103,6 +103,7 @@
         <button class="btn btn-primary" type="submit">Save</button>
         <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
         {% if rule %}
+          <a class="btn btn-outline-primary" href="{% url 'schedule_copy' rule.id %}">Make copy</a>
           <button class="btn btn-outline-success" type="submit" form="runRuleForm">Run now</button>
           <button class="btn btn-outline-danger" type="submit" form="deleteRuleForm">Delete rule</button>
         {% endif %}

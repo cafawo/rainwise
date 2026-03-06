@@ -231,6 +231,39 @@ def schedule_edit(request: HttpRequest, rule_id: int) -> HttpResponse:
 
 
 @login_required
+def schedule_copy(request: HttpRequest, rule_id: int) -> HttpResponse:
+    rule = get_object_or_404(ScheduleRule, pk=rule_id)
+    site = rule.schedule.site
+    if request.method == "POST":
+        form = ScheduleRuleForm(request.POST, site=site)
+        if form.is_valid():
+            new_rule = form.save(commit=False)
+            new_rule.schedule = rule.schedule
+            new_rule.save()
+            messages.success(request, "Schedule rule copied.")
+            return redirect("schedule")
+    else:
+        selected_days = [
+            str(idx)
+            for idx in range(7)
+            if rule.days_of_week_mask & (1 << idx)
+        ]
+        form = ScheduleRuleForm(
+            site=site,
+            initial={
+                "valve": rule.valve_id,
+                "enabled": rule.enabled,
+                "days_of_week": selected_days,
+                "start_time": rule.start_time,
+                "mode": rule.mode,
+                "max_duration_seconds": rule.max_duration_seconds,
+                "note": rule.note,
+            },
+        )
+    return render(request, "irrigation/schedule_form.html", {"form": form})
+
+
+@login_required
 @require_POST
 def schedule_delete(request: HttpRequest, rule_id: int) -> HttpResponse:
     rule = get_object_or_404(ScheduleRule, pk=rule_id)

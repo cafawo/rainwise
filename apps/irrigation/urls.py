@@ -9,6 +9,7 @@ urlpatterns = [
     path("schedule/", views.schedule_view, name="schedule"),
     path("schedule/new/", views.schedule_create, name="schedule_create"),
     path("schedule/<int:rule_id>/edit/", views.schedule_edit, name="schedule_edit"),
+    path("schedule/<int:rule_id>/copy/", views.schedule_copy, name="schedule_copy"),
     path("schedule/<int:rule_id>/delete/", views.schedule_delete, name="schedule_delete"),
     path("schedule/<int:rule_id>/run/", views.trigger_run_now, name="schedule_run"),
     path("schedule/new-schedule/", views.schedule_new, name="schedule_new"),

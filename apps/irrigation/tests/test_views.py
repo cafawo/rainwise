@@ -85,7 +85,7 @@ class ScheduleNewViewTests(TestCase):
         self.site.active_schedule = self.schedule
         self.site.save(update_fields=["active_schedule"])
 
-        ScheduleRule.objects.create(
+        self.rule = ScheduleRule.objects.create(
             schedule=self.schedule,
             valve=self.valve,
             enabled=True,
@@ -113,4 +113,23 @@ class ScheduleNewViewTests(TestCase):
         self.assertEqual(
             ScheduleRule.objects.filter(schedule=new_schedule).count(),
             ScheduleRule.objects.filter(schedule=self.schedule).count(),
+        )
+
+    def test_copy_rule_creates_new_rule(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.post(
+            reverse("schedule_copy", args=[self.rule.id]),
+            {
+                "valve": self.valve.id,
+                "enabled": "on",
+                "days_of_week": ["0"],
+                "start_time": "06:30",
+                "mode": ScheduleRule.MODE_FIXED,
+                "max_duration_seconds": "600",
+                "note": "Copy",
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            ScheduleRule.objects.filter(schedule=self.schedule).count(), 2
         )
