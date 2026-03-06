@@ -53,6 +53,33 @@
     </div>
   </div>
 </div>
+
+<h2 class="h4 mt-4 mb-3">The science behind</h2>
+<div class="card">
+  <div class="card-body">
+    <p class="mb-3">
+      This curve estimates how much water a lawn needs per day based on recent
+      temperature. The shape follows the DIN-18035-2 guidance for turf irrigation,
+      which we model with a smooth sigmoid curve so values change gradually.
+    </p>
+    <p class="mb-3">
+      The parameters control the curve:
+    </p>
+    <ul class="mb-3">
+      <li><strong>Min (mm)</strong> sets the baseline water need at low temperatures.</li>
+      <li><strong>Max (mm)</strong> sets the upper bound at high temperatures.</li>
+      <li><strong>g</strong> controls how quickly the curve rises.</li>
+      <li><strong>m</strong> shifts the midpoint (temperature where the curve bends).</li>
+    </ul>
+    <p class="mb-0">
+      The red point marks the recent 90th-percentile temperature (last 24 hours)
+      mapped onto your custom curve. In practice, soil type, humidity, wind,
+      shade, and irrigation efficiency also affect how much water is required.
+      Those factors are not yet modeled here but will be incorporated as inputs
+      alongside weather data as the dynamic irrigation logic evolves.
+    </p>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
