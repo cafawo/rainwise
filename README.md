@@ -116,6 +116,10 @@ Use the Django admin to create or edit:
 3. `Valve` entries mapped to relay channels.
 4. `ScheduleRule` entries for weekly scheduling.
 
+`Valve.is_active_high` (checkbox in admin) controls coil polarity:
+- Checked: coil ON means valve OPEN.
+- Unchecked: coil ON means valve CLOSED (use this if the relay is inverted).
+
 ## Safety Notes
 
 - All valve openings have a planned stop and a hard max stop.
