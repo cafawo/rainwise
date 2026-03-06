@@ -33,7 +33,6 @@ class ControllerScheduleTests(TestCase):
             days_of_week_mask=1 << now.weekday(),
             start_time=start_time,
             mode=ScheduleRule.MODE_FIXED,
-            fixed_duration_seconds=300,
             max_duration_seconds=600,
         )
 

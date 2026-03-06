@@ -37,7 +37,6 @@ class ScheduleRuleForm(forms.ModelForm):
             "days_of_week",
             "start_time",
             "mode",
-            "fixed_duration_seconds",
             "max_duration_seconds",
             "note",
         ]
@@ -62,9 +61,6 @@ class ScheduleRuleForm(forms.ModelForm):
         )
         self.fields["start_time"].help_text = "Local time."
         self.fields["mode"].widget.attrs.update({"class": "form-select"})
-        self.fields["fixed_duration_seconds"].widget.attrs.update(
-            {"class": "form-control", "placeholder": "e.g. 1800 (=30 minutes)"}
-        )
         self.fields["max_duration_seconds"].widget.attrs.update(
             {"class": "form-control", "placeholder": "e.g. 1800 (=30 minutes)"}
         )
@@ -73,9 +69,8 @@ class ScheduleRuleForm(forms.ModelForm):
         )
         self.fields["days_of_week"].help_text = "Select at least one day."
         self.fields["mode"].help_text = (
-            "Fixed uses the exact duration. Dynamic picks a random duration up to max."
+            "Fixed uses the max duration. Dynamic picks a random duration up to max."
         )
-        self.fields["fixed_duration_seconds"].help_text = "Required for Fixed mode."
         self.fields["max_duration_seconds"].help_text = "Hard stop for any run."
 
     def clean(self) -> dict:

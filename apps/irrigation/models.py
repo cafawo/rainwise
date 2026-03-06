@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 
 from django.conf import settings
-from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
@@ -86,18 +85,10 @@ class ScheduleRule(models.Model):
     days_of_week_mask = models.PositiveIntegerField(default=0)
     start_time = models.TimeField()
     mode = models.CharField(max_length=10, choices=MODE_CHOICES)
-    fixed_duration_seconds = models.PositiveIntegerField(null=True, blank=True)
     max_duration_seconds = models.PositiveIntegerField(
         validators=[MinValueValidator(60)]
     )
     note = models.CharField(max_length=255, blank=True)
-
-    def clean(self) -> None:
-        super().clean()
-        if self.mode == self.MODE_FIXED and not self.fixed_duration_seconds:
-            raise ValidationError("Fixed duration is required for FIXED mode.")
-        if self.mode == self.MODE_DYNAMIC and self.fixed_duration_seconds:
-            raise ValidationError("Fixed duration should be empty for DYNAMIC mode.")
 
     def uses_weekday(self, weekday: int) -> bool:
         return bool(self.days_of_week_mask & (1 << weekday))

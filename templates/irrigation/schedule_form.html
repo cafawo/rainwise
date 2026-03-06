@@ -72,17 +72,6 @@
       </div>
 
       <div class="mb-3">
-        <label class="form-label" for="{{ form.fixed_duration_seconds.id_for_label }}">Fixed duration (seconds)</label>
-        {{ form.fixed_duration_seconds }}
-        {% if form.fixed_duration_seconds.help_text %}
-          <div class="form-text">{{ form.fixed_duration_seconds.help_text }}</div>
-        {% endif %}
-        {% if form.fixed_duration_seconds.errors %}
-          <div class="text-danger small">{{ form.fixed_duration_seconds.errors }}</div>
-        {% endif %}
-      </div>
-
-      <div class="mb-3">
         <label class="form-label" for="{{ form.max_duration_seconds.id_for_label }}">Max duration (seconds)</label>
         {{ form.max_duration_seconds }}
         {% if form.max_duration_seconds.help_text %}

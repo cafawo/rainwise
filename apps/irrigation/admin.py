@@ -35,7 +35,6 @@ class ScheduleRuleAdmin(admin.ModelAdmin):
         "enabled",
         "start_time",
         "mode",
-        "fixed_duration_seconds",
         "max_duration_seconds",
     )
     list_filter = ("enabled", "mode")

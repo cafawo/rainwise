@@ -127,7 +127,7 @@ class Command(BaseCommand):
                 continue
 
             if rule.mode == ScheduleRule.MODE_FIXED:
-                optimal_duration = rule.fixed_duration_seconds or rule.max_duration_seconds
+                optimal_duration = rule.max_duration_seconds
             else:
                 max_duration = max(60, rule.max_duration_seconds)
                 optimal_duration = random.randint(60, max_duration)

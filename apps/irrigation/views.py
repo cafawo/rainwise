@@ -235,7 +235,7 @@ class RainwiseLoginView(LoginView):
 
 def _rule_title(rule: ScheduleRule) -> str:
     if rule.mode == ScheduleRule.MODE_FIXED:
-        minutes = int((rule.fixed_duration_seconds or 0) / 60)
+        minutes = int(rule.max_duration_seconds / 60)
         return f"{rule.valve.name} (Fixed {minutes}m)"
     minutes = int(rule.max_duration_seconds / 60)
     return f"{rule.valve.name} (Dynamic max {minutes}m)"
@@ -355,7 +355,7 @@ def valve_status(request: HttpRequest) -> JsonResponse:
 def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
     rule = get_object_or_404(ScheduleRule, pk=rule_id)
     now = timezone.now()
-    optimal_duration = rule.fixed_duration_seconds
+    optimal_duration = rule.max_duration_seconds
     if rule.mode == ScheduleRule.MODE_DYNAMIC:
         optimal_duration = random.randint(60, rule.max_duration_seconds)
 

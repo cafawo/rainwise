@@ -11,7 +11,7 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
   - manual override open/close
 - Scheduling:
   - weekly rules per valve: day-of-week + start time
-  - mode: FIXED (fixed duration) or DYNAMIC (random optimal duration, bounded by max)
+  - mode: FIXED (runs max duration) or DYNAMIC (random optimal duration, bounded by max)
   - calendar week view (Bootstrap + FullCalendar)
   - schedule by **max duration** (no parallel/group locking in MVP; user ensures no overlap by placing jobs after prior max windows)
 - Logging:
@@ -182,7 +182,6 @@ Weekly plan.
 - `days_of_week_mask` (int bitmask)
 - `start_time` (TimeField)
 - `mode` (`FIXED` / `DYNAMIC`)
-- `fixed_duration_seconds` (nullable; required for FIXED)
 - `max_duration_seconds` (required; used for both modes)
 - `note` (optional)
 
@@ -261,7 +260,7 @@ Steps each loop:
   - idempotency guard:
     - if an IrrigationRun exists for (valve, planned_start_at, trigger=SCHEDULED), skip
   - compute `optimal_duration_seconds`:
-    - FIXED: fixed duration
+    - FIXED: max duration
     - DYNAMIC: random in `[min_seconds, max_duration_seconds]` (use min_seconds=60)
   - attempt open:
     - on success: status RUNNING + set `actual_start_at`
