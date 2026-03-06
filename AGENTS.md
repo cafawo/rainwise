@@ -75,6 +75,7 @@ Repository-specific guidance for Codex agents working in this project.
 
 - Add or update tests when changes affect behavior or logic.
 - Prefer small, focused Django tests.
+- Always run the relevant test suite after changes. If tests cannot be run, explain why and what would be run in a normal environment.
 - If tests cannot be added within scope:
   - Explain why.
   - Suggest concrete next steps for test coverage.
@@ -89,3 +90,4 @@ Repository-specific guidance for Codex agents working in this project.
 
 - Local dev may use a Conda environment named `rainwise`, but production is Docker.
 - Keep workflows Docker-first compatible, but do not require Docker for local development.
+- Run project commands inside the `rainwise` environment.

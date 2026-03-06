@@ -179,6 +179,7 @@ Unique constraint: `(relay_device, channel)`.
 ### `Schedule`
 - `site` (FK)
 - `name`
+- `description` (optional)
 - `created_at`
 
 ### `ScheduleRule`
@@ -320,8 +321,8 @@ Once per day per site (tracked by WeatherImportLog):
   - event length = max duration
   - for DYNAMIC rules, display an “expected/optimal” label (random/estimate)
 - CRUD ScheduleRule via Bootstrap forms
-- Save/Load schedule:
-  - Save creates a new schedule or overwrites an existing one from selected rules.
+- New/Load schedule:
+  - New creates a schedule and can copy rules from the active schedule.
   - Load switches the active schedule for the site (no data deletion).
 
 3) Charts (on Dashboard)
@@ -374,7 +375,7 @@ Local:
 - Weather import stores hourly data for yesterday.
 - Dashboard charts display accumulated irrigation by valve/day.
 - Logs page shows recent irrigation runs.
-- Schedule save/load switches the active schedule and updates the calendar.
+- New/load schedule switches the active schedule and updates the calendar.
 
 Docker-ready:
 - Dockerfile builds.

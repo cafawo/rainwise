@@ -7,7 +7,14 @@ from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
 
-from apps.irrigation.models import IrrigationRun, RelayDevice, Site, Valve
+from apps.irrigation.models import (
+    IrrigationRun,
+    RelayDevice,
+    Schedule,
+    ScheduleRule,
+    Site,
+    Valve,
+)
 
 
 class LogsViewTests(TestCase):
@@ -53,3 +60,57 @@ class LogsViewTests(TestCase):
         response = self.client.get(reverse("logs"))
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Logs")
+
+
+class ScheduleNewViewTests(TestCase):
+    def setUp(self) -> None:
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(
+            username="tester",
+            password="password",
+        )
+
+        self.site = Site.objects.create(name="Test Site")
+        relay = RelayDevice.objects.create(
+            site=self.site,
+            name="Relay",
+            host="127.0.0.1",
+        )
+        self.valve = Valve.objects.create(
+            relay_device=relay,
+            channel=1,
+            name="Valve 1",
+        )
+        self.schedule = Schedule.objects.create(site=self.site, name="Default")
+        self.site.active_schedule = self.schedule
+        self.site.save(update_fields=["active_schedule"])
+
+        ScheduleRule.objects.create(
+            schedule=self.schedule,
+            valve=self.valve,
+            enabled=True,
+            days_of_week_mask=1,
+            start_time=dt.time(6, 30),
+            mode=ScheduleRule.MODE_FIXED,
+            max_duration_seconds=600,
+        )
+
+    def test_new_schedule_requires_login(self) -> None:
+        response = self.client.get(reverse("schedule_new"))
+        self.assertEqual(response.status_code, 302)
+
+    def test_new_schedule_can_copy_rules(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.post(
+            reverse("schedule_new"),
+            {"name": "Summer", "copy_current": "on"},
+        )
+        self.assertEqual(response.status_code, 302)
+
+        new_schedule = Schedule.objects.get(name="Summer")
+        self.site.refresh_from_db()
+        self.assertEqual(self.site.active_schedule_id, new_schedule.id)
+        self.assertEqual(
+            ScheduleRule.objects.filter(schedule=new_schedule).count(),
+            ScheduleRule.objects.filter(schedule=self.schedule).count(),
+        )

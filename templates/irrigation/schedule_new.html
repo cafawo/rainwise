@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}New Schedule | Rainwise{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">New Schedule</h1>
+
+{% if active_schedule %}
+  <p class="text-muted">Active schedule: {{ active_schedule.name }}</p>
+{% endif %}
+
+<div class="card">
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {% if form.non_field_errors %}
+        <div class="alert alert-danger" role="alert">
+          {{ form.non_field_errors }}
+        </div>
+      {% endif %}
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.name.id_for_label }}">Schedule name</label>
+        {{ form.name }}
+        {% if form.name.errors %}
+          <div class="text-danger small">{{ form.name.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.description.id_for_label }}">Description</label>
+        {{ form.description }}
+        {% if form.description.errors %}
+          <div class="text-danger small">{{ form.description.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="form-check mb-3">
+        {{ form.copy_current }}
+        <label class="form-check-label" for="{{ form.copy_current.id_for_label }}">
+          Copy rules from the active schedule
+        </label>
+      </div>
+
+      <div class="d-flex flex-wrap gap-2">
+        <button class="btn btn-primary" type="submit">Create schedule</button>
+        <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

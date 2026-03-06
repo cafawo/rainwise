@@ -43,7 +43,7 @@ class ScheduleRuleAdmin(admin.ModelAdmin):
 
 @admin.register(models.Schedule)
 class ScheduleAdmin(admin.ModelAdmin):
-    list_display = ("name", "site", "created_at")
+    list_display = ("name", "site", "created_at", "description")
     list_filter = ("site",)
 
 

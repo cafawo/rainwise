@@ -81,6 +81,7 @@ class Valve(models.Model):
 class Schedule(models.Model):
     site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="schedules")
     name = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -195,8 +196,8 @@ class IrrigationRun(models.Model):
 
     class Meta:
         indexes = [
-            models.Index(fields=["status"]),
-            models.Index(fields=["planned_start_at"]),
+            models.Index(fields=["status"], name="irrigation__status_idx"),
+            models.Index(fields=["planned_start_at"], name="irrigation__planned_idx"),
         ]
 
     def __str__(self) -> str:

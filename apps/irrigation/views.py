@@ -19,8 +19,8 @@ from apps.irrigation import services
 from apps.irrigation.forms import (
     LoginForm,
     ScheduleLoadForm,
+    ScheduleNewForm,
     ScheduleRuleForm,
-    ScheduleSaveForm,
 )
 from apps.irrigation.models import IrrigationRun, Schedule, ScheduleRule, Site, Valve
 
@@ -240,67 +240,60 @@ def schedule_delete(request: HttpRequest, rule_id: int) -> HttpResponse:
 
 
 @login_required
-def schedule_save(request: HttpRequest) -> HttpResponse:
+def schedule_new(request: HttpRequest) -> HttpResponse:
     site = _get_active_site()
     if not site:
-        messages.warning(request, "Create a site in the admin to save schedules.")
+        messages.warning(request, "Create a site in the admin to add schedules.")
         return redirect("schedule")
 
     active_schedule = _ensure_active_schedule(site)
     schedules = Schedule.objects.filter(site=site).order_by("name")
-    rules = (
-        ScheduleRule.objects.filter(schedule=active_schedule)
-        .select_related("valve")
-        .order_by("valve__name", "start_time")
-    )
 
     if request.method == "POST":
-        form = ScheduleSaveForm(request.POST, schedules=schedules, rules=rules)
+        form = ScheduleNewForm(request.POST, schedules=schedules)
         if form.is_valid():
-            overwrite = form.cleaned_data["overwrite_schedule"]
             name = form.cleaned_data["name"]
-            selected_ids = [int(value) for value in form.cleaned_data["rule_ids"]]
-            selected_rules = list(rules.filter(id__in=selected_ids))
-            rule_payloads = [
-                ScheduleRule(
-                    schedule=None,
-                    valve=rule.valve,
-                    enabled=rule.enabled,
-                    days_of_week_mask=rule.days_of_week_mask,
-                    start_time=rule.start_time,
-                    mode=rule.mode,
-                    max_duration_seconds=rule.max_duration_seconds,
-                    note=rule.note,
-                )
-                for rule in selected_rules
-            ]
+            description = form.cleaned_data.get("description", "")
+            copy_current = form.cleaned_data["copy_current"]
 
             with transaction.atomic():
-                if overwrite:
-                    if name:
-                        overwrite.name = name
-                        overwrite.save(update_fields=["name"])
-                    ScheduleRule.objects.filter(schedule=overwrite).delete()
-                    target = overwrite
-                else:
-                    target = Schedule.objects.create(site=site, name=name)
-                for payload in rule_payloads:
-                    payload.schedule = target
-                ScheduleRule.objects.bulk_create(rule_payloads)
+                new_schedule = Schedule.objects.create(
+                    site=site, name=name, description=description
+                )
+                if copy_current:
+                    existing_rules = list(
+                        ScheduleRule.objects.filter(schedule=active_schedule)
+                        .select_related("valve")
+                        .order_by("id")
+                    )
+                    cloned_rules = [
+                        ScheduleRule(
+                            schedule=new_schedule,
+                            valve=rule.valve,
+                            enabled=rule.enabled,
+                            days_of_week_mask=rule.days_of_week_mask,
+                            start_time=rule.start_time,
+                            mode=rule.mode,
+                            max_duration_seconds=rule.max_duration_seconds,
+                            note=rule.note,
+                        )
+                        for rule in existing_rules
+                    ]
+                    if cloned_rules:
+                        ScheduleRule.objects.bulk_create(cloned_rules)
 
-            messages.success(request, "Schedule saved.")
+                site.active_schedule = new_schedule
+                site.save(update_fields=["active_schedule"])
+
+            messages.success(request, "Schedule created.")
             return redirect("schedule")
     else:
-        form = ScheduleSaveForm(schedules=schedules, rules=rules)
+        form = ScheduleNewForm(schedules=schedules)
 
     return render(
         request,
-        "irrigation/schedule_save.html",
-        {
-            "form": form,
-            "active_schedule": active_schedule,
-            "rules": rules,
-        },
+        "irrigation/schedule_new.html",
+        {"form": form, "active_schedule": active_schedule},
     )
 
 

@@ -1,21 +1,22 @@
 {% extends "base.html" %}
 
-{% block title %}Schedule | Rainwise{% endblock %}
+{% block title %}
+  {% if active_schedule %}Schedule ({{ active_schedule.name }}){% else %}Schedule{% endif %} | Rainwise
+{% endblock %}
 
 {% block head %}
   <link href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.11/index.global.min.css" rel="stylesheet" />
 {% endblock %}
 
 {% block content %}
-<h1 class="h3 mb-3">Schedule</h1>
+<h1 class="h3 mb-3">
+  {% if active_schedule %}Schedule ({{ active_schedule.name }}){% else %}Schedule{% endif %}
+</h1>
 
 <div class="mb-3 d-flex flex-wrap gap-2 align-items-center">
   <a class="btn btn-primary" href="{% url 'schedule_create' %}">New rule</a>
-  <a class="btn btn-outline-primary" href="{% url 'schedule_save' %}">Save schedule</a>
+  <a class="btn btn-outline-primary" href="{% url 'schedule_new' %}">New schedule</a>
   <a class="btn btn-outline-secondary" href="{% url 'schedule_load' %}">Load schedule</a>
-  {% if active_schedule %}
-    <span class="text-muted">Active schedule: {{ active_schedule.name }}</span>
-  {% endif %}
   <span class="text-muted">Tip: double-click a rule to edit it.</span>
 </div>
 
