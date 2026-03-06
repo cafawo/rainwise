@@ -10,6 +10,10 @@ services:
       DJANGO_ALLOWED_HOSTS: "rainwise.local,192.168.1.50"
       DJANGO_TIME_ZONE: "Europe/Berlin"
       RELAY_SIMULATOR: "false"
+      # Optional: auto-create/update a Django superuser on container start
+      # DJANGO_SUPERUSER_USERNAME: "admin"
+      # DJANGO_SUPERUSER_PASSWORD: "change-me"
+      # DJANGO_SUPERUSER_EMAIL: "admin@example.com"
       # Choose one database option (required):
       # POSTGRES_HOST: "your-postgres-host"
       # POSTGRES_PORT: "5432"
@@ -34,6 +38,10 @@ services:
       DJANGO_ALLOWED_HOSTS: "rainwise.local,192.168.1.50"
       DJANGO_TIME_ZONE: "Europe/Berlin"
       RELAY_SIMULATOR: "false"
+      # Optional: auto-create/update a Django superuser on container start
+      # DJANGO_SUPERUSER_USERNAME: "admin"
+      # DJANGO_SUPERUSER_PASSWORD: "change-me"
+      # DJANGO_SUPERUSER_EMAIL: "admin@example.com"
       # Choose one database option (required):
       # POSTGRES_HOST: "your-postgres-host"
       # POSTGRES_PORT: "5432"
