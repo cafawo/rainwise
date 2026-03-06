@@ -10,6 +10,7 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 - Controller loop that enforces planned stops and hard failsafe stops.
 - Weather import (Open-Meteo) stored as hourly observations.
 - Charts for accumulated irrigation per valve/day (on the Dashboard).
+- Dashboard chart overlays precipitation and temperature.
 - Logs page with recent irrigation runs.
 
 ## Local Development
@@ -81,7 +82,9 @@ Controller:
 
 - `CONTROLLER_INTERVAL_SECONDS` (default `60`)
 - `RELAY_POLL_INTERVAL_SECONDS` (default `60`)
-- `WEATHER_FETCH_HOUR_LOCAL` (default `2`)
+- `WEATHER_REFRESH_HOURS` (default `6`)
+- `WEATHER_LOOKBACK_DAYS` (default `2`)
+- `WEATHER_RETRY_MINUTES` (default `60`)
 
 Modbus:
 

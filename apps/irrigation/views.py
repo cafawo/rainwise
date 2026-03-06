@@ -23,6 +23,7 @@ from apps.irrigation.forms import (
     ScheduleRuleForm,
 )
 from apps.irrigation.models import IrrigationRun, Schedule, ScheduleRule, Site, Valve
+from apps.weather.services import ensure_recent_weather
 
 
 def _get_active_site() -> Site | None:
@@ -485,15 +486,67 @@ def chart_data(request: HttpRequest) -> JsonResponse:
         day = start.date()
         totals[day] = totals.get(day, 0.0) + duration_minutes
 
-    labels = [day.isoformat() for day in sorted(totals.keys())]
-    data = [round(totals[day], 2) for day in sorted(totals.keys())]
+    days = sorted(totals.keys())
+    labels = [day.isoformat() for day in days]
+    data = [round(totals[day], 2) for day in days]
+
+    precip_by_day: dict[dt.date, float] = {}
+    temp_sum_by_day: dict[dt.date, float] = {}
+    temp_count_by_day: dict[dt.date, int] = {}
+
+    if days:
+        min_day = days[0]
+        max_day = days[-1]
+        observations = (
+            valve.relay_device.site.weatherobservation_set.filter(
+                timestamp__date__range=(min_day, max_day)
+            )
+            .only("timestamp", "temperature_c", "precipitation_mm")
+        )
+        for obs in observations:
+            day = timezone.localtime(obs.timestamp, tz).date()
+            if obs.precipitation_mm is not None:
+                precip_by_day[day] = precip_by_day.get(day, 0.0) + obs.precipitation_mm
+            if obs.temperature_c is not None:
+                temp_sum_by_day[day] = temp_sum_by_day.get(day, 0.0) + obs.temperature_c
+                temp_count_by_day[day] = temp_count_by_day.get(day, 0) + 1
+
+    precip_series = [
+        round(precip_by_day.get(day, 0.0), 2) if days else None for day in days
+    ]
+    temp_series = [
+        round(temp_sum_by_day[day] / temp_count_by_day[day], 2)
+        if day in temp_count_by_day
+        else None
+        for day in days
+    ]
 
     payload = {
         "labels": labels,
         "datasets": [
             {
-                "label": valve.name,
+                "type": "bar",
+                "label": f"{valve.name} (min)",
                 "data": data,
+                "yAxisID": "y",
+            },
+            {
+                "type": "line",
+                "label": "Precip (mm)",
+                "data": precip_series,
+                "yAxisID": "y1",
+                "borderColor": "#0d6efd",
+                "backgroundColor": "rgba(13,110,253,0.2)",
+                "tension": 0.2,
+            },
+            {
+                "type": "line",
+                "label": "Temp (°C)",
+                "data": temp_series,
+                "yAxisID": "y1",
+                "borderColor": "#fd7e14",
+                "backgroundColor": "rgba(253,126,20,0.2)",
+                "tension": 0.2,
             }
         ],
     }
@@ -531,6 +584,10 @@ def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
     now = timezone.now()
     optimal_duration = rule.max_duration_seconds
     if rule.mode == ScheduleRule.MODE_DYNAMIC:
+        ensure_recent_weather(
+            rule.valve.relay_device.site,
+            now=now,
+        )
         optimal_duration = random.randint(60, rule.max_duration_seconds)
 
     run = IrrigationRun.objects.create(

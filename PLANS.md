@@ -132,7 +132,9 @@ If username/password are provided, create/update the superuser on startup (Docke
 ### Controller (low resource defaults)
 - `CONTROLLER_INTERVAL_SECONDS` (default **60**)
 - `RELAY_POLL_INTERVAL_SECONDS` (default **60**)
-- `WEATHER_FETCH_HOUR_LOCAL` (default `2`)
+- `WEATHER_REFRESH_HOURS` (default `6`)
+- `WEATHER_LOOKBACK_DAYS` (default `2`)
+- `WEATHER_RETRY_MINUTES` (default `60`)
 
 ### Site/Weather location
 - `DEFAULT_SITE_NAME` (default `Home`)
@@ -269,7 +271,7 @@ Steps each loop:
     - if an IrrigationRun exists for (valve, planned_start_at, trigger=SCHEDULED), skip
   - compute `optimal_duration_seconds`:
     - FIXED: max duration
-    - DYNAMIC: random in `[min_seconds, max_duration_seconds]` (use min_seconds=60)
+    - DYNAMIC: refresh recent weather (best-effort) then random in `[min_seconds, max_duration_seconds]` (use min_seconds=60)
   - attempt open:
     - on success: status RUNNING + set `actual_start_at`
     - on failure: status FAILED + record error
@@ -293,8 +295,8 @@ If a valve appears open but:
 => close valve and create a FAILSAFE/RECOVERY IrrigationRun entry (minimal but auditable).
 
 5) **Weather import**
-Once per day per site (tracked by WeatherImportLog):
-- fetch yesterday’s hourly values from Open-Meteo
+Regular refresh per site:
+- fetch recent hourly values (lookback window) from Open-Meteo
 - upsert observations
 
 ---
@@ -326,7 +328,8 @@ Once per day per site (tracked by WeatherImportLog):
   - Load switches the active schedule for the site (no data deletion).
 
 3) Charts (on Dashboard)
-- Chart.js line chart for accumulated irrigation minutes per valve per day
+- Chart.js chart for accumulated irrigation minutes per valve per day
+- Overlay precipitation and temperature (lines) on a secondary axis
 - Provide a valve selector to keep charts readable
 
 4) `/logs/`
@@ -372,7 +375,7 @@ Local:
 - ScheduleRule CRUD works; calendar renders.
 - Controller starts scheduled runs within the minute and stops them reliably.
 - Failsafe closure works for max runtime.
-- Weather import stores hourly data for yesterday.
+- Weather import stores recent hourly data.
 - Dashboard charts display accumulated irrigation by valve/day.
 - Logs page shows recent irrigation runs.
 - New/load schedule switches the active schedule and updates the calendar.

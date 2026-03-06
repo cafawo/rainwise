@@ -21,8 +21,7 @@ from apps.irrigation.models import (
     Site,
     Valve,
 )
-from apps.weather.models import WeatherImportLog
-from apps.weather.services import import_yesterday_weather
+from apps.weather.services import ensure_recent_weather
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,9 @@ def _env_int(name: str, default: int) -> int:
 
 CONTROLLER_INTERVAL_SECONDS = _env_int("CONTROLLER_INTERVAL_SECONDS", 60)
 RELAY_POLL_INTERVAL_SECONDS = _env_int("RELAY_POLL_INTERVAL_SECONDS", 60)
-WEATHER_FETCH_HOUR_LOCAL = _env_int("WEATHER_FETCH_HOUR_LOCAL", 2)
+WEATHER_REFRESH_HOURS = _env_int("WEATHER_REFRESH_HOURS", 6)
+WEATHER_LOOKBACK_DAYS = _env_int("WEATHER_LOOKBACK_DAYS", 2)
+WEATHER_RETRY_MINUTES = _env_int("WEATHER_RETRY_MINUTES", 60)
 
 
 class Command(BaseCommand):
@@ -63,7 +64,7 @@ class Command(BaseCommand):
                 self._start_due_runs(loop_started)
                 self._stop_running_runs(loop_started)
                 self._watchdog_close(loop_started)
-                self._import_weather(loop_started)
+                self._refresh_weather(loop_started)
             except Exception:  # noqa: BLE001 - controller must keep running
                 logger.exception("Controller loop failed")
 
@@ -124,6 +125,8 @@ class Command(BaseCommand):
             )
         )
 
+        refreshed_sites: set[int] = set()
+
         for rule in rules:
             site = rule.valve.relay_device.site
             tz_name = site.timezone or settings.TIME_ZONE
@@ -148,11 +151,20 @@ class Command(BaseCommand):
             ).exists():
                 continue
 
-            if rule.mode == ScheduleRule.MODE_FIXED:
-                optimal_duration = rule.max_duration_seconds
-            else:
+            if rule.mode == ScheduleRule.MODE_DYNAMIC:
+                if site.id not in refreshed_sites:
+                    ensure_recent_weather(
+                        site,
+                        now=now,
+                        max_age_hours=WEATHER_REFRESH_HOURS,
+                        lookback_days=WEATHER_LOOKBACK_DAYS,
+                        min_retry_minutes=WEATHER_RETRY_MINUTES,
+                    )
+                    refreshed_sites.add(site.id)
                 max_duration = max(60, rule.max_duration_seconds)
                 optimal_duration = random.randint(60, max_duration)
+            else:
+                optimal_duration = rule.max_duration_seconds
 
             run = IrrigationRun.objects.create(
                 valve=rule.valve,
@@ -267,28 +279,15 @@ class Command(BaseCommand):
                 error_message=error_message,
             )
 
-    def _import_weather(self, now: dt.datetime) -> None:
+    def _refresh_weather(self, now: dt.datetime) -> None:
         for site in Site.objects.all():
-            tz = ZoneInfo(site.timezone or settings.TIME_ZONE)
-            local_now = timezone.localtime(now, tz)
-            if local_now.hour < WEATHER_FETCH_HOUR_LOCAL:
-                continue
-            target_date = local_now.date() - dt.timedelta(days=1)
-            if WeatherImportLog.objects.filter(site=site, date=target_date).exists():
-                continue
-
-            try:
-                import_yesterday_weather(site, target_date)
-                WeatherImportLog.objects.create(
-                    site=site, date=target_date, status=WeatherImportLog.STATUS_SUCCESS
-                )
-            except Exception as exc:  # noqa: BLE001 - weather failures should not stop loop
-                WeatherImportLog.objects.create(
-                    site=site,
-                    date=target_date,
-                    status=WeatherImportLog.STATUS_FAILED,
-                    error_message=str(exc),
-                )
+            ensure_recent_weather(
+                site,
+                now=now,
+                max_age_hours=WEATHER_REFRESH_HOURS,
+                lookback_days=WEATHER_LOOKBACK_DAYS,
+                min_retry_minutes=WEATHER_RETRY_MINUTES,
+            )
 
     def _ensure_default_site(self) -> None:
         if Site.objects.exists():

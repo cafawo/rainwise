@@ -99,7 +99,7 @@
       }
 
       chartInstance = new Chart(ctx, {
-        type: "line",
+        type: "bar",
         data: {
           labels: payload.labels,
           datasets: payload.datasets,
@@ -111,6 +111,17 @@
               title: {
                 display: true,
                 text: "Minutes",
+              },
+              beginAtZero: true,
+            },
+            y1: {
+              position: "right",
+              title: {
+                display: true,
+                text: "Weather (mm / °C)",
+              },
+              grid: {
+                drawOnChartArea: false,
               },
             },
           },
