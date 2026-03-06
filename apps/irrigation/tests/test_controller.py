@@ -58,3 +58,48 @@ class ControllerScheduleTests(TestCase):
         assert run is not None
         self.assertEqual(run.trigger, IrrigationRun.TRIGGER_SCHEDULED)
         self.assertEqual(run.status, IrrigationRun.STATUS_RUNNING)
+
+    def test_fixed_run_stops_as_completed(self) -> None:
+        now = timezone.now().astimezone(dt.timezone.utc)
+        run = IrrigationRun.objects.create(
+            valve=self.valve,
+            trigger=IrrigationRun.TRIGGER_MANUAL,
+            requested_start_at=now - dt.timedelta(seconds=61),
+            planned_start_at=None,
+            actual_start_at=now - dt.timedelta(seconds=61),
+            optimal_duration_seconds=60,
+            max_duration_seconds=60,
+            status=IrrigationRun.STATUS_RUNNING,
+        )
+
+        command = Command()
+        with mock.patch("apps.irrigation.services.close_valve"):
+            closed = command._stop_running_runs(now)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, IrrigationRun.STATUS_FINISHED)
+        self.assertEqual(run.stop_reason, IrrigationRun.STOP_COMPLETED)
+        self.assertIn(self.valve.id, closed)
+
+    def test_watchdog_skips_recently_closed(self) -> None:
+        now = timezone.now().astimezone(dt.timezone.utc)
+        run = IrrigationRun.objects.create(
+            valve=self.valve,
+            trigger=IrrigationRun.TRIGGER_MANUAL,
+            requested_start_at=now - dt.timedelta(seconds=61),
+            planned_start_at=None,
+            actual_start_at=now - dt.timedelta(seconds=61),
+            optimal_duration_seconds=60,
+            max_duration_seconds=60,
+            status=IrrigationRun.STATUS_RUNNING,
+        )
+        self.valve.last_known_is_open = True
+        self.valve.save(update_fields=["last_known_is_open"])
+
+        command = Command()
+        with mock.patch("apps.irrigation.services.close_valve") as close_valve:
+            closed = command._stop_running_runs(now)
+            command._watchdog_close(now, closed)
+
+        self.assertEqual(IrrigationRun.objects.count(), 1)
+        close_valve.assert_called_once_with(self.valve)

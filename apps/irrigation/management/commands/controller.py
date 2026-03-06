@@ -36,8 +36,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-CONTROLLER_INTERVAL_SECONDS = _env_int("CONTROLLER_INTERVAL_SECONDS", 60)
-RELAY_POLL_INTERVAL_SECONDS = _env_int("RELAY_POLL_INTERVAL_SECONDS", 60)
+CONTROLLER_INTERVAL_SECONDS = _env_int("CONTROLLER_INTERVAL_SECONDS", 30)
+RELAY_POLL_INTERVAL_SECONDS = _env_int("RELAY_POLL_INTERVAL_SECONDS", 30)
 WEATHER_REFRESH_HOURS = _env_int("WEATHER_REFRESH_HOURS", 6)
 WEATHER_LOOKBACK_DAYS = _env_int("WEATHER_LOOKBACK_DAYS", 2)
 WEATHER_RETRY_MINUTES = _env_int("WEATHER_RETRY_MINUTES", 60)
@@ -62,8 +62,8 @@ class Command(BaseCommand):
                     last_poll_at = loop_started
 
                 self._start_due_runs(loop_started)
-                self._stop_running_runs(loop_started)
-                self._watchdog_close(loop_started)
+                recently_closed = self._stop_running_runs(loop_started)
+                self._watchdog_close(loop_started, recently_closed)
                 self._refresh_weather(loop_started)
             except Exception:  # noqa: BLE001 - controller must keep running
                 logger.exception("Controller loop failed")
@@ -190,8 +190,9 @@ class Command(BaseCommand):
             run.actual_start_at = now
             run.save(update_fields=["status", "actual_start_at"])
 
-    def _stop_running_runs(self, now: dt.datetime) -> None:
+    def _stop_running_runs(self, now: dt.datetime) -> set[int]:
         runs = IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
+        recently_closed: set[int] = set()
         for run in runs.select_related("valve"):
             if not run.actual_start_at:
                 continue
@@ -205,15 +206,22 @@ class Command(BaseCommand):
                     seconds=run.optimal_duration_seconds
                 )
 
+            if optimal_stop and optimal_stop == max_stop and now >= optimal_stop:
+                if self._close_run(run, now, IrrigationRun.STOP_COMPLETED):
+                    recently_closed.add(run.valve_id)
+                continue
             if now >= max_stop:
-                self._close_run(run, now, IrrigationRun.STOP_FAILSAFE)
+                if self._close_run(run, now, IrrigationRun.STOP_FAILSAFE):
+                    recently_closed.add(run.valve_id)
                 continue
             if optimal_stop and now >= optimal_stop:
-                self._close_run(run, now, IrrigationRun.STOP_COMPLETED)
+                if self._close_run(run, now, IrrigationRun.STOP_COMPLETED):
+                    recently_closed.add(run.valve_id)
+        return recently_closed
 
     def _close_run(
         self, run: IrrigationRun, now: dt.datetime, reason: str
-    ) -> None:
+    ) -> bool:
         try:
             services.close_valve(run.valve)
         except Exception as exc:  # noqa: BLE001 - capture hardware errors
@@ -221,14 +229,15 @@ class Command(BaseCommand):
             run.stop_reason = IrrigationRun.STOP_ERROR
             run.error_message = str(exc)
             run.save(update_fields=["status", "stop_reason", "error_message"])
-            return
+            return False
 
         run.status = IrrigationRun.STATUS_FINISHED
         run.stop_reason = reason
         run.actual_stop_at = now
         run.save(update_fields=["status", "stop_reason", "actual_stop_at"])
+        return True
 
-    def _watchdog_close(self, now: dt.datetime) -> None:
+    def _watchdog_close(self, now: dt.datetime, recently_closed: set[int]) -> None:
         running = {
             run.valve_id: run
             for run in IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
@@ -236,6 +245,8 @@ class Command(BaseCommand):
         open_valves = Valve.objects.filter(last_known_is_open=True)
 
         for valve in open_valves:
+            if valve.id in recently_closed:
+                continue
             run = running.get(valve.id)
             if run and run.actual_start_at:
                 max_stop = run.actual_start_at + dt.timedelta(

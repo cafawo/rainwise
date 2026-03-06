@@ -54,8 +54,8 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
 No Redis/Celery for MVP.
 
 ### Resource constraints (non-negotiable)
-- Default controller cadence: **60 seconds**
-- Default relay polling cadence: **60 seconds**
+- Default controller cadence: **30 seconds**
+- Default relay polling cadence: **30 seconds**
 - Avoid unnecessary DB writes; only write valve status if changed.
 - Use short network timeouts to avoid hanging (Modbus + weather).
 
@@ -135,8 +135,8 @@ Notes:
 If username/password are provided, create/update the superuser on startup (Docker entrypoint). For local dev, user may create it manually.
 
 ### Controller (low resource defaults)
-- `CONTROLLER_INTERVAL_SECONDS` (default **60**)
-- `RELAY_POLL_INTERVAL_SECONDS` (default **60**)
+- `CONTROLLER_INTERVAL_SECONDS` (default **30**)
+- `RELAY_POLL_INTERVAL_SECONDS` (default **30**)
 - `WEATHER_REFRESH_HOURS` (default `6`)
 - `WEATHER_LOOKBACK_DAYS` (default `2`)
 - `WEATHER_RETRY_MINUTES` (default `60`)
@@ -257,13 +257,13 @@ Rules:
 
 Implement `python manage.py controller` under `apps/irrigation/management/commands/controller.py`.
 
-Loop every `CONTROLLER_INTERVAL_SECONDS` (default 60):
+Loop every `CONTROLLER_INTERVAL_SECONDS` (default 30):
 - Sleep (no busy wait).
 - `django.db.close_old_connections()` each loop.
 
 Steps each loop:
 
-1) **Poll relay state** (every RELAY_POLL_INTERVAL_SECONDS; default 60)
+1) **Poll relay state** (every RELAY_POLL_INTERVAL_SECONDS; default 30)
 - For valves due to poll:
   - read coil state (best-effort)
   - update `Valve.last_known_is_open` only if changed
@@ -380,7 +380,7 @@ For production with external Postgres:
 
 Local:
 - `python manage.py runserver` works with default SQLite (`db.sqlite3`).
-- `python manage.py controller` runs (60s loop) and is stable.
+- `python manage.py controller` runs (30s loop) and is stable.
 - Superuser creation documented; manual open/close works; runs logged.
 - ScheduleRule CRUD works; calendar renders.
 - Controller starts scheduled runs within the minute and stops them reliably.
