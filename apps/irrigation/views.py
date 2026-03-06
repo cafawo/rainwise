@@ -116,9 +116,9 @@ def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
 @login_required
 def schedule_view(request: HttpRequest) -> HttpResponse:
     rule_list = list(
-        ScheduleRule.objects.filter(enabled=True)
-        .only("start_time", "max_duration_seconds")
-        .order_by("start_time")
+        ScheduleRule.objects.only("start_time", "max_duration_seconds").order_by(
+            "start_time"
+        )
     )
     slot_min_time = None
     slot_max_time = None
@@ -249,7 +249,7 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
     if not start or not end:
         return JsonResponse({"error": "Invalid date range."}, status=400)
 
-    rules = ScheduleRule.objects.filter(enabled=True).select_related(
+    rules = ScheduleRule.objects.select_related(
         "valve",
         "valve__relay_device",
         "valve__relay_device__site",
@@ -269,14 +269,21 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
                 continue
             start_dt = dt.datetime.combine(current_date, rule.start_time).replace(tzinfo=tz)
             end_dt = start_dt + dt.timedelta(seconds=rule.max_duration_seconds)
-            events.append(
-                {
-                    "title": _rule_title(rule),
-                    "start": start_dt.isoformat(),
-                    "end": end_dt.isoformat(),
-                    "edit_url": reverse("schedule_edit", args=[rule.id]),
-                }
-            )
+            event = {
+                "title": _rule_title(rule),
+                "start": start_dt.isoformat(),
+                "end": end_dt.isoformat(),
+                "edit_url": reverse("schedule_edit", args=[rule.id]),
+            }
+            if not rule.enabled:
+                event.update(
+                    {
+                        "backgroundColor": "#e9ecef",
+                        "borderColor": "#ced4da",
+                        "textColor": "#6c757d",
+                    }
+                )
+            events.append(event)
         current_date += dt.timedelta(days=1)
 
     return JsonResponse(events, safe=False)
