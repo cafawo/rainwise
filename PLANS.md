@@ -154,6 +154,7 @@ If username/password are provided, create/update the superuser on startup (Docke
 - `name`
 - `latitude`, `longitude`
 - `timezone` (default Europe/Berlin)
+- `active_schedule` (FK to current Schedule)
 
 ### `RelayDevice`
 - `site` (FK)
@@ -175,8 +176,14 @@ If username/password are provided, create/update the superuser on startup (Docke
 
 Unique constraint: `(relay_device, channel)`.
 
+### `Schedule`
+- `site` (FK)
+- `name`
+- `created_at`
+
 ### `ScheduleRule`
 Weekly plan.
+- `schedule` (FK)
 - `valve` (FK)
 - `enabled` (bool)
 - `days_of_week_mask` (int bitmask)
@@ -313,6 +320,9 @@ Once per day per site (tracked by WeatherImportLog):
   - event length = max duration
   - for DYNAMIC rules, display an “expected/optimal” label (random/estimate)
 - CRUD ScheduleRule via Bootstrap forms
+- Save/Load schedule:
+  - Save creates a new schedule or overwrites an existing one from selected rules.
+  - Load switches the active schedule for the site (no data deletion).
 
 3) Charts (on Dashboard)
 - Chart.js line chart for accumulated irrigation minutes per valve per day
@@ -364,6 +374,7 @@ Local:
 - Weather import stores hourly data for yesterday.
 - Dashboard charts display accumulated irrigation by valve/day.
 - Logs page shows recent irrigation runs.
+- Schedule save/load switches the active schedule and updates the calendar.
 
 Docker-ready:
 - Dockerfile builds.

@@ -9,9 +9,14 @@
 {% block content %}
 <h1 class="h3 mb-3">Schedule</h1>
 
-<div class="mb-3">
+<div class="mb-3 d-flex flex-wrap gap-2 align-items-center">
   <a class="btn btn-primary" href="{% url 'schedule_create' %}">New rule</a>
-  <span class="text-muted ms-2">Tip: double-click a rule to edit it.</span>
+  <a class="btn btn-outline-primary" href="{% url 'schedule_save' %}">Save schedule</a>
+  <a class="btn btn-outline-secondary" href="{% url 'schedule_load' %}">Load schedule</a>
+  {% if active_schedule %}
+    <span class="text-muted">Active schedule: {{ active_schedule.name }}</span>
+  {% endif %}
+  <span class="text-muted">Tip: double-click a rule to edit it.</span>
 </div>
 
 <div class="card mb-4">

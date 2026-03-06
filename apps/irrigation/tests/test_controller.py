@@ -7,7 +7,14 @@ from django.test import TestCase
 from django.utils import timezone
 
 from apps.irrigation.management.commands.controller import Command
-from apps.irrigation.models import IrrigationRun, RelayDevice, ScheduleRule, Site, Valve
+from apps.irrigation.models import (
+    IrrigationRun,
+    RelayDevice,
+    Schedule,
+    ScheduleRule,
+    Site,
+    Valve,
+)
 
 
 class ControllerScheduleTests(TestCase):
@@ -16,6 +23,9 @@ class ControllerScheduleTests(TestCase):
         self.device = RelayDevice.objects.create(
             site=self.site, name="Relay", host="127.0.0.1"
         )
+        self.schedule = Schedule.objects.create(site=self.site, name="Default")
+        self.site.active_schedule = self.schedule
+        self.site.save(update_fields=["active_schedule"])
         self.valve = Valve.objects.create(
             relay_device=self.device,
             channel=1,
@@ -28,6 +38,7 @@ class ControllerScheduleTests(TestCase):
         start_time = now.time().replace(second=0, microsecond=0)
 
         ScheduleRule.objects.create(
+            schedule=self.schedule,
             valve=self.valve,
             enabled=True,
             days_of_week_mask=1 << now.weekday(),

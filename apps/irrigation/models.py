@@ -4,6 +4,7 @@ import os
 
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -12,6 +13,13 @@ class Site(models.Model):
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
     timezone = models.CharField(max_length=64, default=settings.TIME_ZONE)
+    active_schedule = models.ForeignKey(
+        "Schedule",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="active_sites",
+    )
 
     def __str__(self) -> str:
         return self.name
@@ -70,6 +78,23 @@ class Valve(models.Model):
         return f"{self.name} (Ch {self.channel})"
 
 
+class Schedule(models.Model):
+    site = models.ForeignKey(Site, on_delete=models.CASCADE, related_name="schedules")
+    name = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "name"], name="unique_schedule_name"
+            )
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.site.name})"
+
+
 class ScheduleRule(models.Model):
     MODE_FIXED = "FIXED"
     MODE_DYNAMIC = "DYNAMIC"
@@ -80,6 +105,9 @@ class ScheduleRule(models.Model):
     ]
     DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+    schedule = models.ForeignKey(
+        Schedule, on_delete=models.CASCADE, related_name="rules"
+    )
     valve = models.ForeignKey(Valve, on_delete=models.CASCADE)
     enabled = models.BooleanField(default=True)
     days_of_week_mask = models.PositiveIntegerField(default=0)
@@ -89,6 +117,15 @@ class ScheduleRule(models.Model):
         validators=[MinValueValidator(60)]
     )
     note = models.CharField(max_length=255, blank=True)
+
+    def clean(self) -> None:
+        super().clean()
+        if self.schedule_id and self.valve_id:
+            valve_site_id = self.valve.relay_device.site_id
+            if self.schedule.site_id != valve_site_id:
+                raise ValidationError(
+                    "Schedule and valve must belong to the same site."
+                )
 
     def uses_weekday(self, weekday: int) -> bool:
         return bool(self.days_of_week_mask & (1 << weekday))

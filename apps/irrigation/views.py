@@ -8,6 +8,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView
+from django.db import transaction
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -15,8 +16,28 @@ from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.irrigation import services
-from apps.irrigation.forms import LoginForm, ScheduleRuleForm
-from apps.irrigation.models import IrrigationRun, ScheduleRule, Valve
+from apps.irrigation.forms import (
+    LoginForm,
+    ScheduleLoadForm,
+    ScheduleRuleForm,
+    ScheduleSaveForm,
+)
+from apps.irrigation.models import IrrigationRun, Schedule, ScheduleRule, Site, Valve
+
+
+def _get_active_site() -> Site | None:
+    return Site.objects.order_by("id").first()
+
+
+def _ensure_active_schedule(site: Site) -> Schedule:
+    if site.active_schedule_id:
+        return site.active_schedule
+    schedule = Schedule.objects.filter(site=site).order_by("id").first()
+    if schedule is None:
+        schedule = Schedule.objects.create(site=site, name="Default")
+    site.active_schedule = schedule
+    site.save(update_fields=["active_schedule"])
+    return schedule
 
 
 @login_required
@@ -115,10 +136,17 @@ def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
 
 @login_required
 def schedule_view(request: HttpRequest) -> HttpResponse:
+    site = _get_active_site()
+    if not site:
+        messages.warning(request, "Create a site in the admin to use schedules.")
+        return redirect("dashboard")
+
+    active_schedule = _ensure_active_schedule(site)
+    schedules = Schedule.objects.filter(site=site).order_by("name")
     rule_list = list(
-        ScheduleRule.objects.only("start_time", "max_duration_seconds").order_by(
-            "start_time"
-        )
+        ScheduleRule.objects.filter(schedule=active_schedule)
+        .only("start_time", "max_duration_seconds")
+        .order_by("start_time")
     )
     slot_min_time = None
     slot_max_time = None
@@ -138,6 +166,8 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
         request,
         "irrigation/schedule.html",
         {
+            "active_schedule": active_schedule,
+            "schedules": schedules,
             "slot_min_time": slot_min_time,
             "slot_max_time": slot_max_time,
         },
@@ -162,28 +192,37 @@ def logs_view(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def schedule_create(request: HttpRequest) -> HttpResponse:
+    site = _get_active_site()
+    if not site:
+        messages.warning(request, "Create a site in the admin to add schedule rules.")
+        return redirect("dashboard")
+    active_schedule = _ensure_active_schedule(site)
+
     if request.method == "POST":
-        form = ScheduleRuleForm(request.POST)
+        form = ScheduleRuleForm(request.POST, site=site)
         if form.is_valid():
-            form.save()
+            rule = form.save(commit=False)
+            rule.schedule = active_schedule
+            rule.save()
             messages.success(request, "Schedule rule created.")
             return redirect("schedule")
     else:
-        form = ScheduleRuleForm()
+        form = ScheduleRuleForm(site=site)
     return render(request, "irrigation/schedule_form.html", {"form": form})
 
 
 @login_required
 def schedule_edit(request: HttpRequest, rule_id: int) -> HttpResponse:
     rule = get_object_or_404(ScheduleRule, pk=rule_id)
+    site = rule.schedule.site
     if request.method == "POST":
-        form = ScheduleRuleForm(request.POST, instance=rule)
+        form = ScheduleRuleForm(request.POST, instance=rule, site=site)
         if form.is_valid():
             form.save()
             messages.success(request, "Schedule rule updated.")
             return redirect("schedule")
     else:
-        form = ScheduleRuleForm(instance=rule)
+        form = ScheduleRuleForm(instance=rule, site=site)
     return render(
         request,
         "irrigation/schedule_form.html",
@@ -198,6 +237,103 @@ def schedule_delete(request: HttpRequest, rule_id: int) -> HttpResponse:
     rule.delete()
     messages.success(request, "Schedule rule deleted.")
     return redirect("schedule")
+
+
+@login_required
+def schedule_save(request: HttpRequest) -> HttpResponse:
+    site = _get_active_site()
+    if not site:
+        messages.warning(request, "Create a site in the admin to save schedules.")
+        return redirect("schedule")
+
+    active_schedule = _ensure_active_schedule(site)
+    schedules = Schedule.objects.filter(site=site).order_by("name")
+    rules = (
+        ScheduleRule.objects.filter(schedule=active_schedule)
+        .select_related("valve")
+        .order_by("valve__name", "start_time")
+    )
+
+    if request.method == "POST":
+        form = ScheduleSaveForm(request.POST, schedules=schedules, rules=rules)
+        if form.is_valid():
+            overwrite = form.cleaned_data["overwrite_schedule"]
+            name = form.cleaned_data["name"]
+            selected_ids = [int(value) for value in form.cleaned_data["rule_ids"]]
+            selected_rules = list(rules.filter(id__in=selected_ids))
+            rule_payloads = [
+                ScheduleRule(
+                    schedule=None,
+                    valve=rule.valve,
+                    enabled=rule.enabled,
+                    days_of_week_mask=rule.days_of_week_mask,
+                    start_time=rule.start_time,
+                    mode=rule.mode,
+                    max_duration_seconds=rule.max_duration_seconds,
+                    note=rule.note,
+                )
+                for rule in selected_rules
+            ]
+
+            with transaction.atomic():
+                if overwrite:
+                    if name:
+                        overwrite.name = name
+                        overwrite.save(update_fields=["name"])
+                    ScheduleRule.objects.filter(schedule=overwrite).delete()
+                    target = overwrite
+                else:
+                    target = Schedule.objects.create(site=site, name=name)
+                for payload in rule_payloads:
+                    payload.schedule = target
+                ScheduleRule.objects.bulk_create(rule_payloads)
+
+            messages.success(request, "Schedule saved.")
+            return redirect("schedule")
+    else:
+        form = ScheduleSaveForm(schedules=schedules, rules=rules)
+
+    return render(
+        request,
+        "irrigation/schedule_save.html",
+        {
+            "form": form,
+            "active_schedule": active_schedule,
+            "rules": rules,
+        },
+    )
+
+
+@login_required
+def schedule_load(request: HttpRequest) -> HttpResponse:
+    site = _get_active_site()
+    if not site:
+        messages.warning(request, "Create a site in the admin to load schedules.")
+        return redirect("schedule")
+
+    schedules = Schedule.objects.filter(site=site).order_by("name")
+    if not schedules.exists():
+        messages.warning(request, "Create a schedule before loading.")
+        return redirect("schedule")
+
+    if request.method == "POST":
+        form = ScheduleLoadForm(request.POST, schedules=schedules)
+        if form.is_valid():
+            schedule = form.cleaned_data["schedule"]
+            site.active_schedule = schedule
+            site.save(update_fields=["active_schedule"])
+            messages.success(request, f"Loaded schedule: {schedule.name}.")
+            return redirect("schedule")
+    else:
+        form = ScheduleLoadForm(
+            schedules=schedules, initial={"schedule": site.active_schedule_id}
+        )
+
+    return render(
+        request,
+        "irrigation/schedule_load.html",
+        {"form": form, "active_schedule": site.active_schedule},
+    )
 
 
 def _parse_iso_datetime(raw: str | None) -> dt.datetime | None:
@@ -249,7 +385,12 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
     if not start or not end:
         return JsonResponse({"error": "Invalid date range."}, status=400)
 
-    rules = ScheduleRule.objects.select_related(
+    site = _get_active_site()
+    if not site:
+        return JsonResponse([], safe=False)
+    active_schedule = _ensure_active_schedule(site)
+
+    rules = ScheduleRule.objects.filter(schedule=active_schedule).select_related(
         "valve",
         "valve__relay_device",
         "valve__relay_device__site",

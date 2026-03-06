@@ -13,7 +13,14 @@ from django.db import close_old_connections
 from django.utils import timezone
 
 from apps.irrigation import services
-from apps.irrigation.models import IrrigationRun, RelayDevice, ScheduleRule, Site, Valve
+from apps.irrigation.models import (
+    IrrigationRun,
+    RelayDevice,
+    Schedule,
+    ScheduleRule,
+    Site,
+    Valve,
+)
 from apps.weather.models import WeatherImportLog
 from apps.weather.services import import_yesterday_weather
 
@@ -41,6 +48,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options) -> None:
         last_poll_at: dt.datetime | None = None
         self._ensure_default_site()
+        self._ensure_default_schedules()
 
         while True:
             loop_started = timezone.now()
@@ -97,9 +105,23 @@ class Command(BaseCommand):
                 )
 
     def _start_due_runs(self, now: dt.datetime) -> None:
+        active_schedule_ids = list(
+            Site.objects.exclude(active_schedule__isnull=True).values_list(
+                "active_schedule_id", flat=True
+            )
+        )
+        if not active_schedule_ids:
+            return
+
         rules = (
-            ScheduleRule.objects.filter(enabled=True)
-            .select_related("valve", "valve__relay_device", "valve__relay_device__site")
+            ScheduleRule.objects.filter(
+                enabled=True, schedule_id__in=active_schedule_ids
+            )
+            .select_related(
+                "valve",
+                "valve__relay_device",
+                "valve__relay_device__site",
+            )
         )
 
         for rule in rules:
@@ -289,3 +311,15 @@ class Command(BaseCommand):
                 logger.warning("DEFAULT_SITE_LON is not a float: %s", lon)
 
         Site.objects.create(**kwargs)
+
+    def _ensure_default_schedules(self) -> None:
+        for site in Site.objects.all():
+            if site.active_schedule_id:
+                continue
+            schedule = (
+                Schedule.objects.filter(site=site).order_by("id").first()
+            )
+            if schedule is None:
+                schedule = Schedule.objects.create(site=site, name="Default")
+            site.active_schedule = schedule
+            site.save(update_fields=["active_schedule"])

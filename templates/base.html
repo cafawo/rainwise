@@ -21,7 +21,7 @@
           <a class="nav-link{% if current == 'dashboard' %} active{% endif %}" href="{% url 'dashboard' %}">Dashboard</a>
         </li>
         <li class="nav-item">
-          <a class="nav-link{% if current == 'schedule' or current == 'schedule_create' or current == 'schedule_edit' %} active{% endif %}" href="{% url 'schedule' %}">Schedule</a>
+          <a class="nav-link{% if current == 'schedule' or current == 'schedule_create' or current == 'schedule_edit' or current == 'schedule_save' or current == 'schedule_load' %} active{% endif %}" href="{% url 'schedule' %}">Schedule</a>
         </li>
         <li class="nav-item">
           <a class="nav-link{% if current == 'logs' %} active{% endif %}" href="{% url 'logs' %}">Logs</a>

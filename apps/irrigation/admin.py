@@ -5,7 +5,7 @@ from apps.irrigation import models
 
 @admin.register(models.Site)
 class SiteAdmin(admin.ModelAdmin):
-    list_display = ("name", "timezone", "latitude", "longitude")
+    list_display = ("name", "timezone", "latitude", "longitude", "active_schedule")
 
 
 @admin.register(models.RelayDevice)
@@ -31,13 +31,20 @@ class ValveAdmin(admin.ModelAdmin):
 @admin.register(models.ScheduleRule)
 class ScheduleRuleAdmin(admin.ModelAdmin):
     list_display = (
+        "schedule",
         "valve",
         "enabled",
         "start_time",
         "mode",
         "max_duration_seconds",
     )
-    list_filter = ("enabled", "mode")
+    list_filter = ("enabled", "mode", "schedule")
+
+
+@admin.register(models.Schedule)
+class ScheduleAdmin(admin.ModelAdmin):
+    list_display = ("name", "site", "created_at")
+    list_filter = ("site",)
 
 
 @admin.register(models.IrrigationRun)
