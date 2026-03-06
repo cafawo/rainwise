@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.contrib.auth.views import LoginView
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -14,7 +15,7 @@ from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.irrigation import services
-from apps.irrigation.forms import ScheduleRuleForm
+from apps.irrigation.forms import LoginForm, ScheduleRuleForm
 from apps.irrigation.models import IrrigationRun, ScheduleRule, Valve
 
 
@@ -226,6 +227,10 @@ def _seconds_to_time_str(seconds: int) -> str:
     minutes = (seconds % 3600) // 60
     secs = seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class RainwiseLoginView(LoginView):
+    authentication_form = LoginForm
 
 
 def _rule_title(rule: ScheduleRule) -> str:

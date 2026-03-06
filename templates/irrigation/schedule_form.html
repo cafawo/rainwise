@@ -9,21 +9,117 @@
   <div class="card-body">
     <form method="post">
       {% csrf_token %}
-      {{ form.as_p }}
-      <button class="btn btn-primary" type="submit">Save</button>
-      <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
+      {% if form.non_field_errors %}
+        <div class="alert alert-danger" role="alert">
+          {{ form.non_field_errors }}
+        </div>
+      {% endif %}
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.valve.id_for_label }}">Valve</label>
+        {{ form.valve }}
+        {% if form.valve.errors %}
+          <div class="text-danger small">{{ form.valve.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="form-check mb-3">
+        {{ form.enabled }}
+        <label class="form-check-label" for="{{ form.enabled.id_for_label }}">Enabled</label>
+        {% if form.enabled.errors %}
+          <div class="text-danger small">{{ form.enabled.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label">Days of week</label>
+        <div>
+          {% for checkbox in form.days_of_week %}
+            <div class="form-check">
+              {{ checkbox.tag }}
+              <label class="form-check-label" for="{{ checkbox.id_for_label }}">{{ checkbox.choice_label }}</label>
+            </div>
+          {% endfor %}
+        </div>
+        {% if form.days_of_week.help_text %}
+          <div class="form-text">{{ form.days_of_week.help_text }}</div>
+        {% endif %}
+        {% if form.days_of_week.errors %}
+          <div class="text-danger small">{{ form.days_of_week.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.start_time.id_for_label }}">Start time</label>
+        {{ form.start_time }}
+        {% if form.start_time.help_text %}
+          <div class="form-text">{{ form.start_time.help_text }}</div>
+        {% endif %}
+        {% if form.start_time.errors %}
+          <div class="text-danger small">{{ form.start_time.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.mode.id_for_label }}">Mode</label>
+        {{ form.mode }}
+        {% if form.mode.help_text %}
+          <div class="form-text">{{ form.mode.help_text }}</div>
+        {% endif %}
+        {% if form.mode.errors %}
+          <div class="text-danger small">{{ form.mode.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.fixed_duration_seconds.id_for_label }}">Fixed duration (seconds)</label>
+        {{ form.fixed_duration_seconds }}
+        {% if form.fixed_duration_seconds.help_text %}
+          <div class="form-text">{{ form.fixed_duration_seconds.help_text }}</div>
+        {% endif %}
+        {% if form.fixed_duration_seconds.errors %}
+          <div class="text-danger small">{{ form.fixed_duration_seconds.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.max_duration_seconds.id_for_label }}">Max duration (seconds)</label>
+        {{ form.max_duration_seconds }}
+        {% if form.max_duration_seconds.help_text %}
+          <div class="form-text">{{ form.max_duration_seconds.help_text }}</div>
+        {% endif %}
+        {% if form.max_duration_seconds.errors %}
+          <div class="text-danger small">{{ form.max_duration_seconds.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="mb-3">
+        <label class="form-label" for="{{ form.note.id_for_label }}">Note</label>
+        {{ form.note }}
+        {% if form.note.help_text %}
+          <div class="form-text">{{ form.note.help_text }}</div>
+        {% endif %}
+        {% if form.note.errors %}
+          <div class="text-danger small">{{ form.note.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="d-flex flex-wrap gap-2">
+        <button class="btn btn-primary" type="submit">Save</button>
+        <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
+        {% if rule %}
+          <button class="btn btn-outline-success" type="submit" form="runRuleForm">Run now</button>
+          <button class="btn btn-outline-danger" type="submit" form="deleteRuleForm">Delete rule</button>
+        {% endif %}
+      </div>
     </form>
 
     {% if rule %}
-      <hr class="my-4" />
-      <h2 class="h6 mb-3">Actions</h2>
-      <form method="post" action="{% url 'schedule_run' rule.id %}" class="d-inline">
+      <form id="runRuleForm" method="post" action="{% url 'schedule_run' rule.id %}" class="d-none">
         {% csrf_token %}
-        <button class="btn btn-outline-success" type="submit">Run now</button>
       </form>
-      <form method="post" action="{% url 'schedule_delete' rule.id %}" class="d-inline">
+      <form id="deleteRuleForm" method="post" action="{% url 'schedule_delete' rule.id %}" class="d-none">
         {% csrf_token %}
-        <button class="btn btn-outline-danger" type="submit">Delete rule</button>
       </form>
     {% endif %}
   </div>

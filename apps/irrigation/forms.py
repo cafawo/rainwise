@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from django import forms
+from django.contrib.auth.forms import AuthenticationForm
 
 from apps.irrigation.models import ScheduleRule
 
@@ -53,6 +54,29 @@ class ScheduleRuleForm(forms.ModelForm):
                 if self.instance.days_of_week_mask & (1 << idx)
             ]
             self.fields["days_of_week"].initial = selected
+        self.fields["valve"].widget.attrs.update({"class": "form-select"})
+        self.fields["enabled"].widget.attrs.update({"class": "form-check-input"})
+        self.fields["days_of_week"].widget.attrs.update({"class": "form-check-input"})
+        self.fields["start_time"].widget.attrs.update(
+            {"class": "form-control", "placeholder": "e.g. 06:30"}
+        )
+        self.fields["start_time"].help_text = "Local time."
+        self.fields["mode"].widget.attrs.update({"class": "form-select"})
+        self.fields["fixed_duration_seconds"].widget.attrs.update(
+            {"class": "form-control", "placeholder": "e.g. 1800 (=30 minutes)"}
+        )
+        self.fields["max_duration_seconds"].widget.attrs.update(
+            {"class": "form-control", "placeholder": "e.g. 1800 (=30 minutes)"}
+        )
+        self.fields["note"].widget.attrs.update(
+            {"class": "form-control", "placeholder": "e.g. Front lawn morning"}
+        )
+        self.fields["days_of_week"].help_text = "Select at least one day."
+        self.fields["mode"].help_text = (
+            "Fixed uses the exact duration. Dynamic picks a random duration up to max."
+        )
+        self.fields["fixed_duration_seconds"].help_text = "Required for Fixed mode."
+        self.fields["max_duration_seconds"].help_text = "Hard stop for any run."
 
     def clean(self) -> dict:
         cleaned = super().clean()
@@ -69,3 +93,22 @@ class ScheduleRuleForm(forms.ModelForm):
         if commit:
             instance.save()
         return instance
+
+
+class LoginForm(AuthenticationForm):
+    def __init__(self, request=None, *args, **kwargs) -> None:
+        super().__init__(request, *args, **kwargs)
+        self.fields["username"].widget.attrs.update(
+            {
+                "class": "form-control",
+                "placeholder": "e.g. admin",
+                "autocomplete": "username",
+            }
+        )
+        self.fields["password"].widget.attrs.update(
+            {
+                "class": "form-control",
+                "placeholder": "Your password",
+                "autocomplete": "current-password",
+            }
+        )
