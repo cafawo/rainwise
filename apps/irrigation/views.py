@@ -96,31 +96,28 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         "m": DEFAULT_M,
     }
     site = _get_active_site()
-    settings_obj = None
-    if site:
-        settings_obj, _ = CurveSettings.objects.get_or_create(
-            site=site, defaults=default_params
-        )
-        stored_params = {
+    settings_obj = (
+        CurveSettings.objects.filter(site=site).first() if site else None
+    )
+    stored_params = (
+        {
             "min_mm": settings_obj.min_mm,
             "max_mm": settings_obj.max_mm,
             "g": settings_obj.g,
             "m": settings_obj.m,
         }
-    else:
-        stored_params = default_params
+        if settings_obj
+        else default_params
+    )
 
     if request.method == "POST":
         if "reset_defaults" in request.POST:
             form = CurveForm(initial=default_params)
             user_params = default_params
-            if settings_obj:
-                settings_obj.min_mm = default_params["min_mm"]
-                settings_obj.max_mm = default_params["max_mm"]
-                settings_obj.g = default_params["g"]
-                settings_obj.m = default_params["m"]
-                settings_obj.save(
-                    update_fields=["min_mm", "max_mm", "g", "m", "updated_at"]
+            if site:
+                CurveSettings.objects.update_or_create(
+                    site=site,
+                    defaults=default_params,
                 )
                 messages.success(request, "Curve reset to defaults.")
             else:

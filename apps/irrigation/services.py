@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 
-from django.db import transaction
 from django.utils import timezone
 
 from apps.irrigation.models import RelayDevice, Valve
@@ -92,7 +91,6 @@ def _read_coils(client, start: int, count: int) -> list[bool]:
     return []
 
 
-@transaction.atomic
 def open_valve(valve: Valve) -> None:
     if SIMULATOR:
         _set_simulated_state(valve, True)
@@ -103,7 +101,6 @@ def open_valve(valve: Valve) -> None:
     _write_coil(client, valve.channel - 1, coil_value)
 
 
-@transaction.atomic
 def close_valve(valve: Valve) -> None:
     if SIMULATOR:
         _set_simulated_state(valve, False)
@@ -114,7 +111,6 @@ def close_valve(valve: Valve) -> None:
     _write_coil(client, valve.channel - 1, coil_value)
 
 
-@transaction.atomic
 def read_valve_state(valve: Valve) -> bool:
     if SIMULATOR:
         return valve.last_known_is_open
@@ -125,7 +121,6 @@ def read_valve_state(valve: Valve) -> bool:
     return is_open
 
 
-@transaction.atomic
 def read_device_states(device: RelayDevice) -> list[bool]:
     if SIMULATOR:
         states = [False] * 8
