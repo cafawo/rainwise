@@ -9,6 +9,7 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 
@@ -111,8 +112,33 @@ def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
 
 @login_required
 def schedule_view(request: HttpRequest) -> HttpResponse:
-    rules = ScheduleRule.objects.select_related("valve").order_by("valve__name")
-    return render(request, "irrigation/schedule.html", {"rules": rules})
+    rule_list = list(
+        ScheduleRule.objects.filter(enabled=True)
+        .only("start_time", "max_duration_seconds")
+        .order_by("start_time")
+    )
+    slot_min_time = None
+    slot_max_time = None
+
+    if rule_list:
+        min_start_seconds = min(
+            _time_to_seconds(rule.start_time) for rule in rule_list
+        )
+        max_end_seconds = max(
+            _time_to_seconds(rule.start_time) + rule.max_duration_seconds
+            for rule in rule_list
+        )
+        slot_min_time = _seconds_to_time_str(_floor_to_hour(min_start_seconds))
+        slot_max_time = _seconds_to_time_str(_ceil_to_hour(max_end_seconds))
+
+    return render(
+        request,
+        "irrigation/schedule.html",
+        {
+            "slot_min_time": slot_min_time,
+            "slot_max_time": slot_max_time,
+        },
+    )
 
 
 @login_required
@@ -165,6 +191,25 @@ def _parse_iso_datetime(raw: str | None) -> dt.datetime | None:
         return None
 
 
+def _time_to_seconds(value: dt.time) -> int:
+    return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def _floor_to_hour(seconds: int) -> int:
+    return (seconds // 3600) * 3600
+
+
+def _ceil_to_hour(seconds: int) -> int:
+    return ((seconds + 3599) // 3600) * 3600
+
+
+def _seconds_to_time_str(seconds: int) -> str:
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 def _rule_title(rule: ScheduleRule) -> str:
     if rule.mode == ScheduleRule.MODE_FIXED:
         minutes = int((rule.fixed_duration_seconds or 0) / 60)
@@ -206,6 +251,7 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
                     "title": _rule_title(rule),
                     "start": start_dt.isoformat(),
                     "end": end_dt.isoformat(),
+                    "edit_url": reverse("schedule_edit", args=[rule.id]),
                 }
             )
         current_date += dt.timedelta(days=1)

@@ -13,6 +13,19 @@
       <button class="btn btn-primary" type="submit">Save</button>
       <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
     </form>
+
+    {% if rule %}
+      <hr class="my-4" />
+      <h2 class="h6 mb-3">Actions</h2>
+      <form method="post" action="{% url 'schedule_run' rule.id %}" class="d-inline">
+        {% csrf_token %}
+        <button class="btn btn-outline-success" type="submit">Run now</button>
+      </form>
+      <form method="post" action="{% url 'schedule_delete' rule.id %}" class="d-inline">
+        {% csrf_token %}
+        <button class="btn btn-outline-danger" type="submit">Delete rule</button>
+      </form>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

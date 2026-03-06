@@ -18,59 +18,6 @@
     <div id="calendar"></div>
   </div>
 </div>
-
-<div class="card">
-  <div class="card-body">
-    <div class="table-responsive">
-      <table class="table align-middle">
-        <thead>
-          <tr>
-            <th>Valve</th>
-            <th>Days</th>
-            <th>Start</th>
-            <th>Mode</th>
-            <th>Duration</th>
-            <th>Max</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for rule in rules %}
-            <tr>
-              <td>{{ rule.valve.name }}</td>
-              <td>{{ rule.days_display }}</td>
-              <td>{{ rule.start_time }}</td>
-              <td>{{ rule.get_mode_display }}</td>
-              <td>
-                {% if rule.mode == "FIXED" %}
-                  {{ rule.fixed_duration_seconds|default:"-" }}s
-                {% else %}
-                  Dynamic
-                {% endif %}
-              </td>
-              <td>{{ rule.max_duration_seconds }}s</td>
-              <td>
-                <a class="btn btn-sm btn-outline-primary" href="{% url 'schedule_edit' rule.id %}">Edit</a>
-                <form method="post" action="{% url 'schedule_delete' rule.id %}" class="d-inline">
-                  {% csrf_token %}
-                  <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
-                </form>
-                <form method="post" action="{% url 'schedule_run' rule.id %}" class="d-inline">
-                  {% csrf_token %}
-                  <button class="btn btn-sm btn-outline-success" type="submit">Run now</button>
-                </form>
-              </td>
-            </tr>
-          {% empty %}
-            <tr>
-              <td colspan="7" class="text-muted">No schedule rules yet.</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-</div>
 {% endblock %}
 
 {% block scripts %}
@@ -78,12 +25,27 @@
   <script>
     document.addEventListener("DOMContentLoaded", function () {
       const calendarEl = document.getElementById("calendar");
-      const calendar = new FullCalendar.Calendar(calendarEl, {
+      const config = {
         initialView: "timeGridWeek",
-        height: 650,
+        height: "auto",
         nowIndicator: true,
         events: "{% url 'calendar_events' %}",
-      });
+        eventDidMount: function (info) {
+          info.el.addEventListener("dblclick", function () {
+            const editUrl = info.event.extendedProps.edit_url;
+            if (editUrl) {
+              window.location.href = editUrl;
+            }
+          });
+        },
+      };
+      {% if slot_min_time %}
+      config.slotMinTime = "{{ slot_min_time }}";
+      {% endif %}
+      {% if slot_max_time %}
+      config.slotMaxTime = "{{ slot_max_time }}";
+      {% endif %}
+      const calendar = new FullCalendar.Calendar(calendarEl, config);
       calendar.render();
     });
   </script>
