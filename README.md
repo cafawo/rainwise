@@ -135,7 +135,7 @@ Controller:
 - `CONTROLLER_INTERVAL_SECONDS` (default `30`)
 - `RELAY_POLL_INTERVAL_SECONDS` (default `30`)
 - `WEATHER_REFRESH_HOURS` (default `6`)
-- `WEATHER_LOOKBACK_DAYS` (default `2`)
+- `WEATHER_LOOKBACK_DAYS` (default `30`)
 - `WEATHER_RETRY_MINUTES` (default `60`)
 
 Modbus:
