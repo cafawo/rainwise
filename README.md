@@ -157,7 +157,7 @@ Superuser bootstrap (Docker entrypoint):
 On controller startup, if no `Site` exists, Rainwise will create one using:
 
 - `DEFAULT_SITE_NAME` (fallback: `Home`)
-- `DEFAULT_SITE_LAT` / `DEFAULT_SITE_LON` (optional)
+- `DEFAULT_SITE_LAT` / `DEFAULT_SITE_LON` (default: `50.1109` / `8.6821`)
 - `DJANGO_TIME_ZONE`
 
 Use the Django admin to create or edit:

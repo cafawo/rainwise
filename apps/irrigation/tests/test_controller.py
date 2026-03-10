@@ -103,3 +103,23 @@ class ControllerScheduleTests(TestCase):
 
         self.assertEqual(IrrigationRun.objects.count(), 1)
         close_valve.assert_called_once_with(self.valve)
+
+    def test_ensure_default_site_uses_default_coordinates(self) -> None:
+        Site.objects.all().delete()
+
+        command = Command()
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "DEFAULT_SITE_NAME": "",
+                "DEFAULT_SITE_LAT": "",
+                "DEFAULT_SITE_LON": "",
+            },
+            clear=False,
+        ):
+            command._ensure_default_site()
+
+        site = Site.objects.get()
+        self.assertEqual(site.name, "Home")
+        self.assertEqual(site.latitude, 50.1109)
+        self.assertEqual(site.longitude, 8.6821)

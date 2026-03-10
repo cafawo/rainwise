@@ -36,11 +36,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("%s is not a float: %s", name, raw)
+        return default
+
+
 CONTROLLER_INTERVAL_SECONDS = _env_int("CONTROLLER_INTERVAL_SECONDS", 30)
 RELAY_POLL_INTERVAL_SECONDS = _env_int("RELAY_POLL_INTERVAL_SECONDS", 30)
 WEATHER_REFRESH_HOURS = _env_int("WEATHER_REFRESH_HOURS", 6)
 WEATHER_LOOKBACK_DAYS = _env_int("WEATHER_LOOKBACK_DAYS", 2)
 WEATHER_RETRY_MINUTES = _env_int("WEATHER_RETRY_MINUTES", 60)
+DEFAULT_SITE_LAT = 50.1109
+DEFAULT_SITE_LON = 8.6821
 
 
 class Command(BaseCommand):
@@ -304,23 +317,12 @@ class Command(BaseCommand):
         if Site.objects.exists():
             return
 
-        name = os.environ.get("DEFAULT_SITE_NAME", "Home")
-        lat = os.environ.get("DEFAULT_SITE_LAT")
-        lon = os.environ.get("DEFAULT_SITE_LON")
-
-        kwargs = {"name": name, "timezone": settings.TIME_ZONE}
-        if lat:
-            try:
-                kwargs["latitude"] = float(lat)
-            except ValueError:
-                logger.warning("DEFAULT_SITE_LAT is not a float: %s", lat)
-        if lon:
-            try:
-                kwargs["longitude"] = float(lon)
-            except ValueError:
-                logger.warning("DEFAULT_SITE_LON is not a float: %s", lon)
-
-        Site.objects.create(**kwargs)
+        Site.objects.create(
+            name=os.environ.get("DEFAULT_SITE_NAME") or "Home",
+            latitude=_env_float("DEFAULT_SITE_LAT", DEFAULT_SITE_LAT),
+            longitude=_env_float("DEFAULT_SITE_LON", DEFAULT_SITE_LON),
+            timezone=settings.TIME_ZONE,
+        )
 
     def _ensure_default_schedules(self) -> None:
         for site in Site.objects.all():
