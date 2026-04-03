@@ -50,17 +50,19 @@ def import_weather_range(
     precipitation = hourly.get("precipitation", [])
     humidity = hourly.get("relative_humidity_2m") or hourly.get("relativehumidity_2m") or []
 
-    observations: list[WeatherObservation] = []
+    # Postgres rejects a single ON CONFLICT batch when the payload repeats a unique key.
+    observations_by_timestamp: dict[dt.datetime, WeatherObservation] = {}
     for idx, timestamp in enumerate(times):
-        observations.append(
-            WeatherObservation(
-                site=site,
-                timestamp=_parse_timestamp(timestamp, tz),
-                temperature_c=temperatures[idx] if idx < len(temperatures) else None,
-                precipitation_mm=precipitation[idx] if idx < len(precipitation) else None,
-                humidity_percent=humidity[idx] if idx < len(humidity) else None,
-            )
+        parsed_timestamp = _parse_timestamp(timestamp, tz)
+        observations_by_timestamp[parsed_timestamp] = WeatherObservation(
+            site=site,
+            timestamp=parsed_timestamp,
+            temperature_c=temperatures[idx] if idx < len(temperatures) else None,
+            precipitation_mm=precipitation[idx] if idx < len(precipitation) else None,
+            humidity_percent=humidity[idx] if idx < len(humidity) else None,
         )
+
+    observations = list(observations_by_timestamp.values())
 
     if observations:
         WeatherObservation.objects.bulk_create(

@@ -34,6 +34,33 @@ class WeatherImportTests(TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(WeatherObservation.objects.count(), 2)
 
+    def test_import_yesterday_weather_deduplicates_duplicate_timestamps(self) -> None:
+        site = Site.objects.create(
+            name="Home", latitude=52.5, longitude=13.4, timezone="UTC"
+        )
+        payload = {
+            "hourly": {
+                "time": ["2024-01-01T00:00", "2024-01-01T00:00"],
+                "temperature_2m": [1.0, 2.0],
+                "precipitation": [0.1, 0.2],
+                "relative_humidity_2m": [80, 81],
+            }
+        }
+
+        response = mock.Mock()
+        response.json.return_value = payload
+        response.raise_for_status.return_value = None
+
+        with mock.patch("apps.weather.services.requests.get", return_value=response):
+            count = import_yesterday_weather(site, target_date=dt.date(2024, 1, 1))
+
+        self.assertEqual(count, 1)
+        self.assertEqual(WeatherObservation.objects.count(), 1)
+        observation = WeatherObservation.objects.get(site=site)
+        self.assertEqual(observation.temperature_c, 2.0)
+        self.assertEqual(observation.precipitation_mm, 0.2)
+        self.assertEqual(observation.humidity_percent, 81)
+
     def test_ensure_recent_weather_throttles_when_recent(self) -> None:
         site = Site.objects.create(
             name="Home", latitude=52.5, longitude=13.4, timezone="UTC"
