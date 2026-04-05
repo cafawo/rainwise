@@ -13,6 +13,7 @@ from apps.irrigation.curves import (
     DEFAULT_MAX_MM,
     DEFAULT_MIN_MM,
 )
+from apps.irrigation.timezones import is_valid_timezone_name
 
 
 class Site(models.Model):
@@ -27,6 +28,13 @@ class Site(models.Model):
         on_delete=models.SET_NULL,
         related_name="active_sites",
     )
+
+    def clean(self) -> None:
+        super().clean()
+        timezone_name = (self.timezone or "").strip()
+        if not is_valid_timezone_name(timezone_name):
+            raise ValidationError({"timezone": "Select a valid IANA timezone."})
+        self.timezone = timezone_name
 
     def __str__(self) -> str:
         return self.name

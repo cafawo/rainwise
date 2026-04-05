@@ -1,10 +1,21 @@
+from django import forms
 from django.contrib import admin
 
 from apps.irrigation import models
+from apps.irrigation.timezones import site_timezone_choices
+
+
+class SiteAdminForm(forms.ModelForm):
+    timezone = forms.ChoiceField(choices=site_timezone_choices())
+
+    class Meta:
+        model = models.Site
+        fields = "__all__"
 
 
 @admin.register(models.Site)
 class SiteAdmin(admin.ModelAdmin):
+    form = SiteAdminForm
     list_display = ("name", "timezone", "latitude", "longitude", "active_schedule")
 
 

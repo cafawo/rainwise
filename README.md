@@ -164,6 +164,7 @@ Timestamp policy:
 - instant-based timestamps are stored in UTC in the database
 - client-facing pages and schedule/calendar views use the site timezone
 - schedule rule `start_time` is interpreted as local site time
+- site timezone values use standard IANA names such as `Europe/Berlin` or `UTC`
 
 Use the Django admin to create or edit:
 
