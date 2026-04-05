@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime as dt
 from unittest import mock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from apps.irrigation.management.commands.controller import Command
@@ -124,3 +124,22 @@ class ControllerScheduleTests(TestCase):
         self.assertEqual(site.latitude, 50.1109)
         self.assertEqual(site.longitude, 8.6821)
         self.assertEqual(site.timezone, "Europe/Berlin")
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_ensure_default_site_uses_current_settings_timezone(self) -> None:
+        Site.objects.all().delete()
+
+        command = Command()
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "DEFAULT_SITE_NAME": "",
+                "DEFAULT_SITE_LAT": "",
+                "DEFAULT_SITE_LON": "",
+            },
+            clear=False,
+        ):
+            command._ensure_default_site()
+
+        site = Site.objects.get()
+        self.assertEqual(site.timezone, "UTC")

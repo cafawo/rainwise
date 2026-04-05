@@ -781,7 +781,7 @@ def valve_status(request: HttpRequest) -> JsonResponse:
                 "id": valve.id,
                 "name": valve.name,
                 "is_open": valve.last_known_is_open,
-                "last_polled_at": valve.last_polled_at.isoformat()
+                "last_polled_at": timezone.localtime(valve.last_polled_at).isoformat()
                 if valve.last_polled_at
                 else None,
                 "is_running": valve.id in running,

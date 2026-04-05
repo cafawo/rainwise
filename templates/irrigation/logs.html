@@ -30,15 +30,27 @@
               <td>{{ run.get_status_display }}</td>
               <td>
                 {% if run.planned_start_at %}
-                  {{ run.planned_start_at }}
+                  {{ run.planned_start_at|date:"Y-m-d H:i:s T" }}
                 {% elif run.requested_start_at %}
-                  {{ run.requested_start_at }}
+                  {{ run.requested_start_at|date:"Y-m-d H:i:s T" }}
                 {% else %}
                   -
                 {% endif %}
               </td>
-              <td>{{ run.actual_start_at|default:"-" }}</td>
-              <td>{{ run.actual_stop_at|default:"-" }}</td>
+              <td>
+                {% if run.actual_start_at %}
+                  {{ run.actual_start_at|date:"Y-m-d H:i:s T" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>
+                {% if run.actual_stop_at %}
+                  {{ run.actual_stop_at|date:"Y-m-d H:i:s T" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
               <td>{{ run.duration_minutes_display }}</td>
               <td>
                 {% if run.stop_reason %}

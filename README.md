@@ -158,7 +158,12 @@ On controller startup, if no `Site` exists, Rainwise will create one using:
 
 - `DEFAULT_SITE_NAME` (fallback: `Home`)
 - `DEFAULT_SITE_LAT` / `DEFAULT_SITE_LON` (default: `50.1109` / `8.6821`)
-- site timezone `Europe/Berlin`
+- site timezone from `DJANGO_TIME_ZONE`
+
+Timestamp policy:
+- instant-based timestamps are stored in UTC in the database
+- client-facing pages and schedule/calendar views use the site timezone
+- schedule rule `start_time` is interpreted as local site time
 
 Use the Django admin to create or edit:
 

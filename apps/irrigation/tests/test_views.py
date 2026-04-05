@@ -28,9 +28,9 @@ class LogsViewTests(TestCase):
             password="password",
         )
 
-        site = Site.objects.create(name="Test Site")
+        self.site = Site.objects.create(name="Test Site", timezone="Europe/Berlin")
         relay = RelayDevice.objects.create(
-            site=site,
+            site=self.site,
             name="Relay",
             host="127.0.0.1",
         )
@@ -64,6 +64,28 @@ class LogsViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Logs")
 
+    @override_settings(TIME_ZONE="UTC")
+    def test_logs_render_site_local_time(self) -> None:
+        start = dt.datetime(2026, 1, 15, 12, 0, tzinfo=dt.timezone.utc)
+        stop = start + dt.timedelta(minutes=5)
+        IrrigationRun.objects.create(
+            valve=self.valve,
+            trigger=IrrigationRun.TRIGGER_MANUAL,
+            requested_start_at=start,
+            actual_start_at=start,
+            actual_stop_at=stop,
+            optimal_duration_seconds=300,
+            max_duration_seconds=600,
+            status=IrrigationRun.STATUS_FINISHED,
+            stop_reason=IrrigationRun.STOP_COMPLETED,
+        )
+
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("logs"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "2026-01-15 13:00:00 CET")
+        self.assertContains(response, "2026-01-15 13:05:00 CET")
+
 
 class DashboardViewTests(TestCase):
     def setUp(self) -> None:
@@ -71,6 +93,17 @@ class DashboardViewTests(TestCase):
         self.user = user_model.objects.create_user(
             username="tester",
             password="password",
+        )
+        self.site = Site.objects.create(name="Test Site", timezone="Europe/Berlin")
+        relay = RelayDevice.objects.create(
+            site=self.site,
+            name="Relay",
+            host="127.0.0.1",
+        )
+        self.valve = Valve.objects.create(
+            relay_device=relay,
+            channel=1,
+            name="Valve 1",
         )
 
     def test_dashboard_shows_default_sqlite_warning(self) -> None:
@@ -85,6 +118,31 @@ class DashboardViewTests(TestCase):
         response = self.client.get(reverse("dashboard"))
         self.assertEqual(response.status_code, 200)
         self.assertNotContains(response, "Using the default SQLite database")
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_dashboard_renders_site_local_last_polled_time(self) -> None:
+        self.valve.last_polled_at = dt.datetime(
+            2026, 1, 15, 12, 0, tzinfo=dt.timezone.utc
+        )
+        self.valve.save(update_fields=["last_polled_at"])
+
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "2026-01-15 13:00:00 CET")
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_valve_status_returns_site_local_iso_timestamp(self) -> None:
+        self.valve.last_polled_at = dt.datetime(
+            2026, 1, 15, 12, 0, tzinfo=dt.timezone.utc
+        )
+        self.valve.save(update_fields=["last_polled_at"])
+
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("valve_status"))
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload[0]["last_polled_at"], "2026-01-15T13:00:00+01:00")
 
 
 class ScheduleNewViewTests(TestCase):

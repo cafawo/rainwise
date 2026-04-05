@@ -41,7 +41,13 @@
                   <span class="badge bg-secondary">Closed</span>
                 {% endif %}
               </td>
-              <td>{{ valve.last_polled_at|default:"-" }}</td>
+              <td>
+                {% if valve.last_polled_at %}
+                  {{ valve.last_polled_at|date:"Y-m-d H:i:s T" }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
               <td>
                 {% if valve.id in running_valve_ids %}
                   <span class="badge bg-primary">Running</span>

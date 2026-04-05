@@ -54,7 +54,6 @@ WEATHER_LOOKBACK_DAYS = _env_int("WEATHER_LOOKBACK_DAYS", 30)
 WEATHER_RETRY_MINUTES = _env_int("WEATHER_RETRY_MINUTES", 60)
 DEFAULT_SITE_LAT = 50.1109
 DEFAULT_SITE_LON = 8.6821
-DEFAULT_SITE_TIMEZONE = "Europe/Berlin"
 
 
 class Command(BaseCommand):
@@ -322,7 +321,7 @@ class Command(BaseCommand):
             name=os.environ.get("DEFAULT_SITE_NAME") or "Home",
             latitude=_env_float("DEFAULT_SITE_LAT", DEFAULT_SITE_LAT),
             longitude=_env_float("DEFAULT_SITE_LON", DEFAULT_SITE_LON),
-            timezone=DEFAULT_SITE_TIMEZONE,
+            timezone=settings.TIME_ZONE,
         )
 
     def _ensure_default_schedules(self) -> None:
