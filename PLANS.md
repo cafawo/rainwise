@@ -163,6 +163,7 @@ If username/password are provided, create/update the superuser on startup (Docke
 - Use the site timezone for client-facing display, calendar rendering, and local-date logic.
 - Keep wall-clock schedule rules (`start_time`) as local site time.
 - Site timezone selection should use validated IANA timezone names.
+- The UI should operate on one explicit active site at a time.
 - default generated site timezone `Europe/Berlin`
 
 ### Modbus

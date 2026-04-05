@@ -13,6 +13,7 @@ from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_POST
 
 from apps.irrigation import services
@@ -41,12 +42,13 @@ from apps.irrigation.models import (
     Site,
     Valve,
 )
+from apps.irrigation.site_context import store_active_site
 from apps.weather.models import WeatherObservation
 from apps.weather.services import ensure_recent_weather
 
 
-def _get_active_site() -> Site | None:
-    return Site.objects.order_by("id").first()
+def _get_active_site(request: HttpRequest) -> Site | None:
+    return getattr(request, "active_site", None)
 
 
 def _ensure_active_schedule(site: Site) -> Schedule:
@@ -76,11 +78,23 @@ def _using_default_sqlite() -> bool:
 
 @login_required
 def dashboard(request: HttpRequest) -> HttpResponse:
-    valves = Valve.objects.select_related("relay_device").order_by("name")
+    site = _get_active_site(request)
+    valves = (
+        Valve.objects.filter(relay_device__site=site)
+        .select_related("relay_device")
+        .order_by("name")
+        if site
+        else Valve.objects.none()
+    )
     running_runs = (
-        IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
+        IrrigationRun.objects.filter(
+            status=IrrigationRun.STATUS_RUNNING,
+            valve__relay_device__site=site,
+        )
         .select_related("valve")
         .order_by("-actual_start_at")
+        if site
+        else IrrigationRun.objects.none()
     )
     running_valve_ids = [run.valve_id for run in running_runs]
     return render(
@@ -102,7 +116,7 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         "g": DEFAULT_G,
         "m": DEFAULT_M,
     }
-    site = _get_active_site()
+    site = _get_active_site(request)
     settings_obj = (
         CurveSettings.objects.filter(site=site).first() if site else None
     )
@@ -167,7 +181,7 @@ def curve_view(request: HttpRequest) -> HttpResponse:
     )
 
     p90_point = None
-    site = _get_active_site()
+    site = _get_active_site(request)
     if site:
         cutoff = timezone.now() - dt.timedelta(hours=24)
         temps = list(
@@ -209,7 +223,11 @@ def curve_view(request: HttpRequest) -> HttpResponse:
 @login_required
 @require_POST
 def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
-    valve = get_object_or_404(Valve, pk=valve_id)
+    site = _get_active_site(request)
+    if not site:
+        messages.warning(request, "Create a site in the admin before opening valves.")
+        return redirect("dashboard")
+    valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
     if IrrigationRun.objects.filter(
         valve=valve, status=IrrigationRun.STATUS_RUNNING
     ).exists():
@@ -251,7 +269,11 @@ def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
 @login_required
 @require_POST
 def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
-    valve = get_object_or_404(Valve, pk=valve_id)
+    site = _get_active_site(request)
+    if not site:
+        messages.warning(request, "Create a site in the admin before closing valves.")
+        return redirect("dashboard")
+    valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
     now = timezone.now()
     run = (
         IrrigationRun.objects.filter(valve=valve, status=IrrigationRun.STATUS_RUNNING)
@@ -281,7 +303,7 @@ def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
 
 @login_required
 def schedule_view(request: HttpRequest) -> HttpResponse:
-    site = _get_active_site()
+    site = _get_active_site(request)
     if not site:
         messages.warning(request, "Create a site in the admin to use schedules.")
         return redirect("dashboard")
@@ -322,9 +344,13 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def logs_view(request: HttpRequest) -> HttpResponse:
+    site = _get_active_site(request)
     runs = list(
-        IrrigationRun.objects.select_related("valve")
+        IrrigationRun.objects.filter(valve__relay_device__site=site)
+        .select_related("valve")
         .order_by("-id")[:200]
+        if site
+        else []
     )
     for run in runs:
         run.duration_minutes_display = "-"
@@ -338,7 +364,7 @@ def logs_view(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def schedule_create(request: HttpRequest) -> HttpResponse:
-    site = _get_active_site()
+    site = _get_active_site(request)
     if not site:
         messages.warning(request, "Create a site in the admin to add schedule rules.")
         return redirect("dashboard")
@@ -359,8 +385,11 @@ def schedule_create(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def schedule_edit(request: HttpRequest, rule_id: int) -> HttpResponse:
-    rule = get_object_or_404(ScheduleRule, pk=rule_id)
-    site = rule.schedule.site
+    site = _get_active_site(request)
+    if not site:
+        messages.warning(request, "Create a site in the admin to edit schedule rules.")
+        return redirect("schedule")
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
     if request.method == "POST":
         form = ScheduleRuleForm(request.POST, instance=rule, site=site)
         if form.is_valid():
@@ -378,8 +407,11 @@ def schedule_edit(request: HttpRequest, rule_id: int) -> HttpResponse:
 
 @login_required
 def schedule_copy(request: HttpRequest, rule_id: int) -> HttpResponse:
-    rule = get_object_or_404(ScheduleRule, pk=rule_id)
-    site = rule.schedule.site
+    site = _get_active_site(request)
+    if not site:
+        messages.warning(request, "Create a site in the admin to copy schedule rules.")
+        return redirect("schedule")
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
     if request.method == "POST":
         form = ScheduleRuleForm(request.POST, site=site)
         if form.is_valid():
@@ -412,7 +444,11 @@ def schedule_copy(request: HttpRequest, rule_id: int) -> HttpResponse:
 @login_required
 @require_POST
 def schedule_delete(request: HttpRequest, rule_id: int) -> HttpResponse:
-    rule = get_object_or_404(ScheduleRule, pk=rule_id)
+    site = _get_active_site(request)
+    if not site:
+        messages.warning(request, "Create a site in the admin to delete schedule rules.")
+        return redirect("schedule")
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
     rule.delete()
     messages.success(request, "Schedule rule deleted.")
     return redirect("schedule")
@@ -420,7 +456,7 @@ def schedule_delete(request: HttpRequest, rule_id: int) -> HttpResponse:
 
 @login_required
 def schedule_new(request: HttpRequest) -> HttpResponse:
-    site = _get_active_site()
+    site = _get_active_site(request)
     if not site:
         messages.warning(request, "Create a site in the admin to add schedules.")
         return redirect("schedule")
@@ -478,7 +514,7 @@ def schedule_new(request: HttpRequest) -> HttpResponse:
 
 @login_required
 def schedule_load(request: HttpRequest) -> HttpResponse:
-    site = _get_active_site()
+    site = _get_active_site(request)
     if not site:
         messages.warning(request, "Create a site in the admin to load schedules.")
         return redirect("schedule")
@@ -553,7 +589,7 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
     if not start or not end:
         return JsonResponse({"error": "Invalid date range."}, status=400)
 
-    site = _get_active_site()
+    site = _get_active_site(request)
     if not site:
         return JsonResponse([], safe=False)
     active_schedule = _ensure_active_schedule(site)
@@ -601,17 +637,19 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
 @login_required
 @require_GET
 def chart_data(request: HttpRequest) -> JsonResponse:
+    site = _get_active_site(request)
+    if not site:
+        return JsonResponse({"labels": [], "datasets": []})
     valve_id = request.GET.get("valve_id")
-    valves = Valve.objects.select_related("relay_device", "relay_device__site").order_by(
-        "name"
-    )
+    valves = Valve.objects.filter(relay_device__site=site).select_related(
+        "relay_device", "relay_device__site"
+    ).order_by("name")
     if valve_id:
         valves = valves.filter(pk=valve_id)
     valves_list = list(valves)
     if not valves_list:
         return JsonResponse({"labels": [], "datasets": []})
 
-    site = _get_active_site() or valves_list[0].relay_device.site
     tz = ZoneInfo(site.timezone or settings.TIME_ZONE)
 
     runs = (
@@ -769,10 +807,20 @@ def chart_data(request: HttpRequest) -> JsonResponse:
 @login_required
 @require_GET
 def valve_status(request: HttpRequest) -> JsonResponse:
-    valves = Valve.objects.select_related("relay_device").order_by("name")
+    site = _get_active_site(request)
+    valves = (
+        Valve.objects.filter(relay_device__site=site)
+        .select_related("relay_device")
+        .order_by("name")
+        if site
+        else Valve.objects.none()
+    )
     running = {
         run.valve_id
-        for run in IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
+        for run in IrrigationRun.objects.filter(
+            status=IrrigationRun.STATUS_RUNNING,
+            valve__relay_device__site=site,
+        )
     }
     payload = []
     for valve in valves:
@@ -793,7 +841,11 @@ def valve_status(request: HttpRequest) -> JsonResponse:
 @login_required
 @require_POST
 def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
-    rule = get_object_or_404(ScheduleRule, pk=rule_id)
+    site = _get_active_site(request)
+    if not site:
+        messages.warning(request, "Create a site in the admin before starting runs.")
+        return redirect("schedule")
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
     now = timezone.now()
     optimal_duration = rule.max_duration_seconds
     if rule.mode == ScheduleRule.MODE_DYNAMIC:
@@ -829,3 +881,19 @@ def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
     run.save(update_fields=["status", "actual_start_at"])
     messages.success(request, "Run started.")
     return redirect("schedule")
+
+
+@login_required
+@require_POST
+def select_site(request: HttpRequest) -> HttpResponse:
+    site = get_object_or_404(Site, pk=request.POST.get("site_id"))
+    store_active_site(request, site)
+
+    redirect_to = request.POST.get("next") or reverse("dashboard")
+    if not url_has_allowed_host_and_scheme(
+        redirect_to,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        redirect_to = reverse("dashboard")
+    return redirect(redirect_to)

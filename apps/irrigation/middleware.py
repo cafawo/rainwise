@@ -1,26 +1,16 @@
 from __future__ import annotations
 
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-
-from django.conf import settings
 from django.db.utils import OperationalError, ProgrammingError
 from django.utils import timezone
 
-from apps.irrigation.models import Site
+from apps.irrigation.site_context import active_site_timezone, resolve_active_site
 
 
-def _active_site_timezone() -> ZoneInfo:
+def _resolve_request_site(request):
     try:
-        tz_name = (
-            Site.objects.order_by("id").values_list("timezone", flat=True).first()
-            or settings.TIME_ZONE
-        )
+        return resolve_active_site(request)
     except (OperationalError, ProgrammingError):
-        tz_name = settings.TIME_ZONE
-    try:
-        return ZoneInfo(tz_name)
-    except ZoneInfoNotFoundError:
-        return ZoneInfo(settings.TIME_ZONE)
+        return None
 
 
 class ActiveSiteTimezoneMiddleware:
@@ -28,7 +18,8 @@ class ActiveSiteTimezoneMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        timezone.activate(_active_site_timezone())
+        request.active_site = _resolve_request_site(request)
+        timezone.activate(active_site_timezone(request.active_site))
         try:
             return self.get_response(request)
         finally:

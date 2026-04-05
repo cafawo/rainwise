@@ -165,6 +165,7 @@ Timestamp policy:
 - client-facing pages and schedule/calendar views use the site timezone
 - schedule rule `start_time` is interpreted as local site time
 - site timezone values use standard IANA names such as `Europe/Berlin` or `UTC`
+- if multiple sites exist, the UI uses one selected active site at a time via the site switcher
 
 Use the Django admin to create or edit:
 

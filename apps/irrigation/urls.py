@@ -4,6 +4,7 @@ from apps.irrigation import views
 
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
+    path("site/select/", views.select_site, name="site_select"),
     path("valve/<int:valve_id>/open/", views.open_valve_view, name="valve_open"),
     path("valve/<int:valve_id>/close/", views.close_valve_view, name="valve_close"),
     path("schedule/", views.schedule_view, name="schedule"),

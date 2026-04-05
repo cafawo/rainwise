@@ -145,6 +145,85 @@ class DashboardViewTests(TestCase):
         self.assertEqual(payload[0]["last_polled_at"], "2026-01-15T13:00:00+01:00")
 
 
+class ActiveSiteSelectionTests(TestCase):
+    def setUp(self) -> None:
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(
+            username="tester",
+            password="password",
+        )
+        self.site_1 = Site.objects.create(name="Berlin Site", timezone="Europe/Berlin")
+        relay_1 = RelayDevice.objects.create(
+            site=self.site_1,
+            name="Relay 1",
+            host="127.0.0.1",
+        )
+        self.valve_1 = Valve.objects.create(
+            relay_device=relay_1,
+            channel=1,
+            name="Valve Berlin",
+        )
+
+        self.site_2 = Site.objects.create(name="UTC Site", timezone="UTC")
+        relay_2 = RelayDevice.objects.create(
+            site=self.site_2,
+            name="Relay 2",
+            host="127.0.0.2",
+        )
+        self.valve_2 = Valve.objects.create(
+            relay_device=relay_2,
+            channel=1,
+            name="Valve UTC",
+        )
+
+    def test_dashboard_defaults_to_first_site_and_switcher_changes_site(self) -> None:
+        self.client.login(username="tester", password="password")
+
+        response = self.client.get(reverse("dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Valve Berlin")
+        self.assertNotContains(response, "Valve UTC")
+        self.assertContains(response, "Berlin Site")
+        self.assertContains(response, "UTC Site")
+
+        response = self.client.post(
+            reverse("site_select"),
+            {"site_id": self.site_2.id, "next": reverse("dashboard")},
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Valve UTC")
+        self.assertNotContains(response, "Valve Berlin")
+        self.assertEqual(
+            self.client.session.get("active_site_id"),
+            self.site_2.id,
+        )
+
+    def test_schedule_uses_selected_site_timezone(self) -> None:
+        self.client.login(username="tester", password="password")
+        self.client.post(
+            reverse("site_select"),
+            {"site_id": self.site_2.id, "next": reverse("schedule")},
+        )
+
+        response = self.client.get(reverse("schedule"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'timeZone: "UTC"')
+
+    def test_valve_status_only_returns_selected_site_valves(self) -> None:
+        self.client.login(username="tester", password="password")
+        self.client.post(
+            reverse("site_select"),
+            {"site_id": self.site_2.id, "next": reverse("dashboard")},
+        )
+
+        response = self.client.get(reverse("valve_status"))
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["name"], "Valve UTC")
+
+
 class ScheduleNewViewTests(TestCase):
     def setUp(self) -> None:
         user_model = get_user_model()
