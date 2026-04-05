@@ -7,7 +7,21 @@ from django.test import TestCase
 
 from apps.irrigation.models import Site
 from apps.weather.models import WeatherObservation
-from apps.weather.services import ensure_recent_weather, import_yesterday_weather
+from apps.weather.services import (
+    ensure_recent_weather,
+    import_weather_range,
+    import_yesterday_weather,
+)
+
+
+def _utc_timestamp(
+    year: int, month: int, day: int, hour: int, minute: int = 0
+) -> int:
+    return int(
+        dt.datetime(
+            year, month, day, hour, minute, tzinfo=dt.timezone.utc
+        ).timestamp()
+    )
 
 
 class WeatherImportTests(TestCase):
@@ -17,7 +31,10 @@ class WeatherImportTests(TestCase):
         )
         payload = {
             "hourly": {
-                "time": ["2024-01-01T00:00", "2024-01-01T01:00"],
+                "time": [
+                    _utc_timestamp(2024, 1, 1, 0),
+                    _utc_timestamp(2024, 1, 1, 1),
+                ],
                 "temperature_2m": [1.0, 2.0],
                 "precipitation": [0.1, 0.0],
                 "relative_humidity_2m": [80, 81],
@@ -34,16 +51,21 @@ class WeatherImportTests(TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(WeatherObservation.objects.count(), 2)
 
-    def test_import_yesterday_weather_deduplicates_duplicate_timestamps(self) -> None:
+    def test_import_weather_range_uses_unixtime_on_dst_boundary(self) -> None:
         site = Site.objects.create(
-            name="Home", latitude=52.5, longitude=13.4, timezone="UTC"
+            name="Home", latitude=52.5, longitude=13.4, timezone="Europe/Berlin"
         )
         payload = {
             "hourly": {
-                "time": ["2024-01-01T00:00", "2024-01-01T00:00"],
-                "temperature_2m": [1.0, 2.0],
-                "precipitation": [0.1, 0.2],
-                "relative_humidity_2m": [80, 81],
+                "time": [
+                    _utc_timestamp(2026, 3, 28, 22),
+                    _utc_timestamp(2026, 3, 28, 23),
+                    _utc_timestamp(2026, 3, 29, 0),
+                    _utc_timestamp(2026, 3, 29, 1),
+                ],
+                "temperature_2m": [5.0, 4.9, 4.7, 4.6],
+                "precipitation": [0.0, 0.0, 0.1, 0.2],
+                "relative_humidity_2m": [80, 81, 82, 83],
             }
         }
 
@@ -51,15 +73,32 @@ class WeatherImportTests(TestCase):
         response.json.return_value = payload
         response.raise_for_status.return_value = None
 
-        with mock.patch("apps.weather.services.requests.get", return_value=response):
-            count = import_yesterday_weather(site, target_date=dt.date(2024, 1, 1))
+        with mock.patch(
+            "apps.weather.services.requests.get", return_value=response
+        ) as mocked_get:
+            count = import_weather_range(
+                site,
+                start_date=dt.date(2026, 3, 29),
+                end_date=dt.date(2026, 3, 29),
+            )
 
-        self.assertEqual(count, 1)
-        self.assertEqual(WeatherObservation.objects.count(), 1)
-        observation = WeatherObservation.objects.get(site=site)
-        self.assertEqual(observation.temperature_c, 2.0)
-        self.assertEqual(observation.precipitation_mm, 0.2)
-        self.assertEqual(observation.humidity_percent, 81)
+        self.assertEqual(count, 4)
+        self.assertEqual(WeatherObservation.objects.count(), 4)
+        timestamps = list(
+            WeatherObservation.objects.filter(site=site)
+            .order_by("timestamp")
+            .values_list("timestamp", flat=True)
+        )
+        self.assertEqual(
+            timestamps,
+            [
+                dt.datetime(2026, 3, 28, 22, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 3, 28, 23, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 3, 29, 0, 0, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 3, 29, 1, 0, tzinfo=dt.timezone.utc),
+            ],
+        )
+        self.assertEqual(mocked_get.call_args.kwargs["params"]["timeformat"], "unixtime")
 
     def test_ensure_recent_weather_throttles_when_recent(self) -> None:
         site = Site.objects.create(
@@ -67,7 +106,10 @@ class WeatherImportTests(TestCase):
         )
         payload = {
             "hourly": {
-                "time": ["2024-01-02T10:00", "2024-01-02T11:00"],
+                "time": [
+                    _utc_timestamp(2024, 1, 2, 10),
+                    _utc_timestamp(2024, 1, 2, 11),
+                ],
                 "temperature_2m": [1.0, 2.0],
                 "precipitation": [0.1, 0.0],
                 "relative_humidity_2m": [80, 81],

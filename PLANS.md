@@ -315,7 +315,7 @@ If a valve appears open but:
 5) **Weather import**
 Regular refresh per site:
 - fetch recent hourly values (lookback window) from Open-Meteo
-- coalesce duplicate timestamps within a single fetched payload before DB writes
+- request weather timestamps in a UTC-safe format and normalize them before DB writes
 - upsert observations
 
 ---

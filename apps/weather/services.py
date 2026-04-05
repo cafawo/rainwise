@@ -15,11 +15,8 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 DEFAULT_TIMEOUT_SECONDS = 5
 
 
-def _parse_timestamp(value: str, tz: ZoneInfo) -> dt.datetime:
-    parsed = dt.datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=tz)
-    return parsed
+def _parse_timestamp(value: int | str) -> dt.datetime:
+    return dt.datetime.fromtimestamp(int(value), tz=dt.timezone.utc)
 
 
 def import_weather_range(
@@ -29,8 +26,6 @@ def import_weather_range(
         raise ValueError("Site latitude/longitude required for weather import")
 
     tz_name = site.timezone or settings.TIME_ZONE
-    tz = ZoneInfo(tz_name)
-
     params = {
         "latitude": site.latitude,
         "longitude": site.longitude,
@@ -38,6 +33,7 @@ def import_weather_range(
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
         "timezone": tz_name,
+        "timeformat": "unixtime",
     }
 
     response = requests.get(OPEN_METEO_URL, params=params, timeout=DEFAULT_TIMEOUT_SECONDS)
@@ -50,10 +46,10 @@ def import_weather_range(
     precipitation = hourly.get("precipitation", [])
     humidity = hourly.get("relative_humidity_2m") or hourly.get("relativehumidity_2m") or []
 
-    # Postgres rejects a single ON CONFLICT batch when the payload repeats a unique key.
+    # Deduplicate by the exact UTC instant stored in Postgres.
     observations_by_timestamp: dict[dt.datetime, WeatherObservation] = {}
     for idx, timestamp in enumerate(times):
-        parsed_timestamp = _parse_timestamp(timestamp, tz)
+        parsed_timestamp = _parse_timestamp(timestamp)
         observations_by_timestamp[parsed_timestamp] = WeatherObservation(
             site=site,
             timestamp=parsed_timestamp,
