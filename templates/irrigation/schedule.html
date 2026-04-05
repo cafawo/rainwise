@@ -36,6 +36,7 @@
         initialView: "timeGridWeek",
         height: "auto",
         nowIndicator: true,
+        timeZone: "{{ calendar_timezone }}",
         events: "{% url 'calendar_events' %}",
         eventDidMount: function (info) {
           info.el.addEventListener("dblclick", function () {

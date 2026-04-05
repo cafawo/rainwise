@@ -312,6 +312,7 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
         "irrigation/schedule.html",
         {
             "active_schedule": active_schedule,
+            "calendar_timezone": site.timezone or settings.TIME_ZONE,
             "schedules": schedules,
             "slot_min_time": slot_min_time,
             "slot_max_time": slot_max_time,
@@ -541,11 +542,7 @@ class RainwiseLoginView(LoginView):
 
 
 def _rule_title(rule: ScheduleRule) -> str:
-    if rule.mode == ScheduleRule.MODE_FIXED:
-        minutes = int(rule.max_duration_seconds / 60)
-        return f"{rule.valve.name} (Fixed {minutes}m)"
-    minutes = int(rule.max_duration_seconds / 60)
-    return f"{rule.valve.name} (Dynamic max {minutes}m)"
+    return rule.valve.name
 
 
 @login_required

@@ -160,6 +160,59 @@ class ScheduleNewViewTests(TestCase):
         )
 
 
+class CalendarEventsTests(TestCase):
+    def setUp(self) -> None:
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(
+            username="tester",
+            password="password",
+        )
+        self.site = Site.objects.create(name="Test Site", timezone="UTC")
+        relay = RelayDevice.objects.create(
+            site=self.site,
+            name="Relay",
+            host="127.0.0.1",
+        )
+        self.valve = Valve.objects.create(
+            relay_device=relay,
+            channel=1,
+            name="Front Lawn",
+        )
+        self.schedule = Schedule.objects.create(site=self.site, name="Default")
+        self.site.active_schedule = self.schedule
+        self.site.save(update_fields=["active_schedule"])
+        self.rule = ScheduleRule.objects.create(
+            schedule=self.schedule,
+            valve=self.valve,
+            enabled=True,
+            days_of_week_mask=1 << 0,
+            start_time=dt.time(6, 30),
+            mode=ScheduleRule.MODE_DYNAMIC,
+            max_duration_seconds=1200,
+        )
+
+    def test_calendar_events_show_only_valve_name(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.get(
+            reverse("calendar_events"),
+            {
+                "start": "2026-03-02T00:00:00Z",
+                "end": "2026-03-09T00:00:00Z",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+
+        payload = response.json()
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["title"], "Front Lawn")
+
+    def test_schedule_view_uses_site_timezone_for_calendar(self) -> None:
+        self.client.login(username="tester", password="password")
+        response = self.client.get(reverse("schedule"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'timeZone: "UTC"')
+
+
 class ChartDataTests(TestCase):
     def setUp(self) -> None:
         user_model = get_user_model()

@@ -157,6 +157,7 @@ If username/password are provided, create/update the superuser on startup (Docke
 - `DEFAULT_SITE_NAME` (default `Home`)
 - `DEFAULT_SITE_LAT`
 - `DEFAULT_SITE_LON`
+- default generated site timezone `Europe/Berlin`
 
 ### Modbus
 - `MODBUS_DEFAULT_PORT` (default `502`)

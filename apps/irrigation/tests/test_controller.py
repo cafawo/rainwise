@@ -104,7 +104,7 @@ class ControllerScheduleTests(TestCase):
         self.assertEqual(IrrigationRun.objects.count(), 1)
         close_valve.assert_called_once_with(self.valve)
 
-    def test_ensure_default_site_uses_default_coordinates(self) -> None:
+    def test_ensure_default_site_uses_default_defaults(self) -> None:
         Site.objects.all().delete()
 
         command = Command()
@@ -123,3 +123,4 @@ class ControllerScheduleTests(TestCase):
         self.assertEqual(site.name, "Home")
         self.assertEqual(site.latitude, 50.1109)
         self.assertEqual(site.longitude, 8.6821)
+        self.assertEqual(site.timezone, "Europe/Berlin")
