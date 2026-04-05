@@ -347,6 +347,7 @@ class CalendarEventsTests(TestCase):
         self.client.login(username="tester", password="password")
         response = self.client.get(reverse("schedule"))
         self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "displayEventTime: false")
         self.assertContains(response, 'timeZone: "UTC"')
 
 

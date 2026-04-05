@@ -36,6 +36,7 @@
         initialView: "timeGridWeek",
         height: "auto",
         nowIndicator: true,
+        displayEventTime: false,
         timeZone: "{{ calendar_timezone }}",
         events: "{% url 'calendar_events' %}",
         eventDidMount: function (info) {
