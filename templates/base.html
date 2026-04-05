@@ -5,6 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Rainwise{% endblock %}</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <style>
+    .navbar .nav-link {
+      text-decoration: underline;
+      text-decoration-color: transparent;
+      text-underline-offset: 0.2rem;
+      transition: text-decoration-color 0.15s ease-in-out;
+    }
+
+    .navbar .nav-link:hover,
+    .navbar .nav-link:focus-visible {
+      text-decoration-color: currentColor;
+    }
+  </style>
   {% block head %}{% endblock %}
 </head>
 <body class="bg-light d-flex flex-column min-vh-100">
@@ -32,10 +45,13 @@
         <li class="nav-item">
           <a class="nav-link{% if request.path|slice:':7' == '/admin/' %} active{% endif %}" href="/admin/">Admin</a>
         </li>
+        <li class="nav-item">
+          <a class="nav-link" href="{% url 'logout' %}">Logout</a>
+        </li>
       </ul>
       {% endwith %}
       {% if user.is_authenticated and available_sites %}
-        <form method="post" action="{% url 'site_select' %}" class="d-flex align-items-center gap-2 me-3 mb-2 mb-lg-0">
+        <form method="post" action="{% url 'site_select' %}" class="d-flex align-items-center gap-2 mb-2 mb-lg-0">
           {% csrf_token %}
           <input type="hidden" name="next" value="{{ request.get_full_path }}" />
           <label for="site-switcher" class="text-white-50 small mb-0">Site</label>
@@ -53,9 +69,6 @@
           </select>
         </form>
       {% endif %}
-      <ul class="navbar-nav">
-        <li class="nav-item"><a class="nav-link" href="{% url 'logout' %}">Logout</a></li>
-      </ul>
     </div>
   </div>
 </nav>
