@@ -250,7 +250,7 @@ def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
     )
 
     try:
-        services.open_valve(valve)
+        services.open_valve_for(valve, max_duration)
     except Exception as exc:  # noqa: BLE001 - surface hardware errors to user
         run.status = IrrigationRun.STATUS_FAILED
         run.stop_reason = IrrigationRun.STOP_ERROR
@@ -867,7 +867,7 @@ def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
     )
 
     try:
-        services.open_valve(rule.valve)
+        services.open_valve_for(rule.valve, optimal_duration)
     except Exception as exc:  # noqa: BLE001 - surface hardware errors to user
         run.status = IrrigationRun.STATUS_FAILED
         run.stop_reason = IrrigationRun.STOP_ERROR

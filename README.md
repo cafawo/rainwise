@@ -1,6 +1,6 @@
 # rainwise
 
-Rainwise is a Django MVP for monitoring and scheduling an irrigation system backed by a Waveshare Modbus TCP Ethernet relay (8-channel). It prioritizes safety, low resource usage, and simple deployment on macOS (dev) and TrueNAS SCALE via Docker.
+Rainwise is a Django MVP for monitoring and scheduling an irrigation system backed by a Waveshare Modbus POE ETH Relay / 8-channel Ethernet relay module (SKU 24964). It prioritizes safety, low resource usage, and simple deployment on macOS (dev) and TrueNAS SCALE via Docker.
 
 ## Features (MVP)
 
@@ -180,8 +180,21 @@ Use the Django admin to create or edit:
 
 ## Safety Notes
 
-- All valve openings have a planned stop and a hard max stop.
-- A watchdog closes valves that appear open unexpectedly.
+- Rainwise targets the Waveshare Modbus POE ETH Relay / 8-channel Ethernet
+  relay module (SKU 24964). See the Waveshare product page and protocol table:
+  `https://www.waveshare.com/product/modbus-poe-eth-relay.htm` and
+  `https://www.waveshare.com/wiki/Modbus_POE_ETH_Relay`.
+- Valve openings use the relay's hardware-side flash-on/flash-off timer, not a
+  normal latched relay ON command.
+- Flash intervals are `data * 100 ms`; Rainwise accepts integer durations up to
+  `3276` seconds.
+- Active-high valves open with flash-on addresses `0x0200..0x0207`.
+- Active-low valves open with flash-off addresses `0x0400..0x0407`.
+- Because the relay receives a bounded pulse, a database outage during an active
+  run should not prevent the relay from turning the valve off when the pulse
+  expires.
+- Manual close and watchdog logic still send normal close commands for early
+  cancellation and extra recovery.
 - The controller is designed for 30s cadence (no busy loops).
 
 ## Hardware Access

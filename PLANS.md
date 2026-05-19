@@ -14,6 +14,39 @@ Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigat
 - Update README with TrueNAS SCALE Apps deployment steps and GHCR usage.
 - Keep local development workflow unchanged.
 
+## Relay-enforced failsafe hardening (2026-05-19)
+
+Rainwise targets the Waveshare Modbus POE ETH Relay / 8-channel Ethernet relay
+module (SKU 24964). Valve openings must use the module's hardware-side timed
+flash command, not a latched relay ON command.
+
+### Safety model
+
+- Every valve opening is sent as a bounded relay pulse.
+- Active-high valves use flash-on addresses `0x0200..0x0207`.
+- Active-low valves use flash-off addresses `0x0400..0x0407`.
+- Flash intervals are `data * 100 ms`; Rainwise accepts integer durations from
+  1 to 3276 seconds (`0x7FFF / 10`, rounded down).
+- Scheduled fixed runs pulse for `ScheduleRule.max_duration_seconds`.
+- Scheduled dynamic runs compute `optimal_duration_seconds` first and pulse for
+  that intended duration.
+- Manual dashboard opens pulse for `Valve.default_max_duration_seconds`.
+- Manual close and watchdog close still send the normal closed coil state for
+  early cancellation and recovery, but safety does not depend on a later close.
+- New runs still require the DB because Rainwise needs configuration and audit
+  state before sending hardware commands.
+
+### Implementation notes
+
+- `apps/irrigation/services.py` exposes `open_valve_for(valve, duration_seconds)`.
+- Unbounded `open_valve(valve)` is disabled so new code cannot latch a relay on.
+- The Waveshare flash command uses Modbus function `0x05` with a non-boolean
+  value field, so Rainwise sends that one command with an explicit Modbus TCP
+  frame rather than `pyModbusTCP.write_single_coil()`.
+- Duration validators reject schedule and valve defaults above 3276 seconds.
+- Existing over-limit rows are not clamped; attempts to start them fail with a
+  clear error until configuration is corrected.
+
 ## Scope (MVP)
 
 ### Must-have
@@ -258,16 +291,18 @@ Unique constraint: `(site, timestamp)`.
 
 Create `apps/irrigation/services.py`:
 
-- `open_valve(valve: Valve) -> None`
+- `open_valve_for(valve: Valve, duration_seconds: int) -> None`
 - `close_valve(valve: Valve) -> None`
 - `read_valve_state(valve: Valve) -> bool`
 - `read_device_states(device: RelayDevice) -> list[bool]`
 
 Implementation:
-- Real mode uses `pyModbusTCP`.
+- Real mode uses explicit Modbus TCP function `0x05` frames for Waveshare flash
+  open commands and `pyModbusTCP` for normal close/read operations.
 - Simulator mode (`RELAY_SIMULATOR=true`) uses a DB-backed simulated coil state so UI/tests work without hardware.
 
 Rules:
+- Unbounded relay ON is not allowed for valve opening.
 - Use conservative timeouts and minimal retries.
 - Exceptions are caught and logged to IrrigationRun when relevant.
 
@@ -298,16 +333,19 @@ Steps each loop:
     - FIXED: max duration
     - DYNAMIC: refresh recent weather (best-effort) then random in `[min_seconds, max_duration_seconds]` (use min_seconds=60)
   - attempt open:
+    - send a relay flash command for `optimal_duration_seconds`
     - on success: status RUNNING + set `actual_start_at`
     - on failure: status FAILED + record error
 
 3) **Stop runs**
 For each RUNNING IrrigationRun:
 - If `optimal_duration_seconds` is set and `now >= actual_start_at + optimal_duration_seconds`:
-  - close valve
+  - best-effort close valve; the relay flash command already provides the
+    primary hardware stop
   - mark stop_reason COMPLETED
 - If `now >= actual_start_at + max_duration_seconds`:
-  - close valve
+  - best-effort close valve; the relay flash command already provides the
+    primary hardware stop
   - mark stop_reason FAILSAFE_TIMEOUT
 
 Manual override rule (confirmed):

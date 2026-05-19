@@ -16,6 +16,14 @@ from apps.irrigation.curves import (
 from apps.irrigation.timezones import is_valid_timezone_name
 
 
+RELAY_FLASH_TICKS_PER_SECOND = 10
+RELAY_FLASH_MAX_TICKS = 0x7FFF
+RELAY_FLASH_MAX_DURATION_SECONDS = (
+    RELAY_FLASH_MAX_TICKS // RELAY_FLASH_TICKS_PER_SECOND
+)
+RELAY_FLASH_MIN_DURATION_SECONDS = 1
+
+
 class Site(models.Model):
     name = models.CharField(max_length=100)
     latitude = models.FloatField(null=True, blank=True)
@@ -92,7 +100,13 @@ class Valve(models.Model):
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True)
     is_active_high = models.BooleanField(default=True)
-    default_max_duration_seconds = models.PositiveIntegerField(default=1800)
+    default_max_duration_seconds = models.PositiveIntegerField(
+        default=1800,
+        validators=[
+            MinValueValidator(RELAY_FLASH_MIN_DURATION_SECONDS),
+            MaxValueValidator(RELAY_FLASH_MAX_DURATION_SECONDS),
+        ],
+    )
     last_known_is_open = models.BooleanField(default=False)
     last_polled_at = models.DateTimeField(null=True, blank=True)
 
@@ -144,7 +158,10 @@ class ScheduleRule(models.Model):
     start_time = models.TimeField()
     mode = models.CharField(max_length=10, choices=MODE_CHOICES)
     max_duration_seconds = models.PositiveIntegerField(
-        validators=[MinValueValidator(60)]
+        validators=[
+            MinValueValidator(60),
+            MaxValueValidator(RELAY_FLASH_MAX_DURATION_SECONDS),
+        ]
     )
     note = models.CharField(max_length=255, blank=True)
 
@@ -214,8 +231,20 @@ class IrrigationRun(models.Model):
     requested_start_at = models.DateTimeField(null=True, blank=True)
     planned_start_at = models.DateTimeField(null=True, blank=True)
     actual_start_at = models.DateTimeField(null=True, blank=True)
-    optimal_duration_seconds = models.PositiveIntegerField(null=True, blank=True)
-    max_duration_seconds = models.PositiveIntegerField()
+    optimal_duration_seconds = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[
+            MinValueValidator(RELAY_FLASH_MIN_DURATION_SECONDS),
+            MaxValueValidator(RELAY_FLASH_MAX_DURATION_SECONDS),
+        ],
+    )
+    max_duration_seconds = models.PositiveIntegerField(
+        validators=[
+            MinValueValidator(RELAY_FLASH_MIN_DURATION_SECONDS),
+            MaxValueValidator(RELAY_FLASH_MAX_DURATION_SECONDS),
+        ]
+    )
     actual_stop_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES)
     stop_reason = models.CharField(

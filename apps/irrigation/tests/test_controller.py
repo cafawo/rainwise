@@ -48,16 +48,52 @@ class ControllerScheduleTests(TestCase):
         )
 
         command = Command()
-        with mock.patch("apps.irrigation.services.open_valve"):
+        with mock.patch(
+            "apps.irrigation.services.open_valve_for"
+        ) as open_valve_for:
             command._start_due_runs(now)
             self.assertEqual(IrrigationRun.objects.count(), 1)
             command._start_due_runs(now)
             self.assertEqual(IrrigationRun.objects.count(), 1)
+        open_valve_for.assert_called_once_with(self.valve, 600)
 
         run = IrrigationRun.objects.first()
         assert run is not None
         self.assertEqual(run.trigger, IrrigationRun.TRIGGER_SCHEDULED)
         self.assertEqual(run.status, IrrigationRun.STATUS_RUNNING)
+
+    def test_dynamic_run_opens_for_optimal_duration(self) -> None:
+        now = timezone.now().astimezone(dt.timezone.utc)
+        start_time = now.time().replace(second=0, microsecond=0)
+
+        ScheduleRule.objects.create(
+            schedule=self.schedule,
+            valve=self.valve,
+            enabled=True,
+            days_of_week_mask=1 << now.weekday(),
+            start_time=start_time,
+            mode=ScheduleRule.MODE_DYNAMIC,
+            max_duration_seconds=600,
+        )
+
+        command = Command()
+        with (
+            mock.patch(
+                "apps.irrigation.services.open_valve_for"
+            ) as open_valve_for,
+            mock.patch(
+                "apps.irrigation.management.commands.controller.ensure_recent_weather"
+            ),
+            mock.patch(
+                "apps.irrigation.management.commands.controller.random.randint",
+                return_value=123,
+            ),
+        ):
+            command._start_due_runs(now)
+
+        run = IrrigationRun.objects.get()
+        self.assertEqual(run.optimal_duration_seconds, 123)
+        open_valve_for.assert_called_once_with(self.valve, 123)
 
     def test_fixed_run_stops_as_completed(self) -> None:
         now = timezone.now().astimezone(dt.timezone.utc)
@@ -79,6 +115,32 @@ class ControllerScheduleTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, IrrigationRun.STATUS_FINISHED)
         self.assertEqual(run.stop_reason, IrrigationRun.STOP_COMPLETED)
+        self.assertIn(self.valve.id, closed)
+
+    def test_expected_stop_finishes_if_redundant_close_fails(self) -> None:
+        now = timezone.now().astimezone(dt.timezone.utc)
+        run = IrrigationRun.objects.create(
+            valve=self.valve,
+            trigger=IrrigationRun.TRIGGER_MANUAL,
+            requested_start_at=now - dt.timedelta(seconds=61),
+            planned_start_at=None,
+            actual_start_at=now - dt.timedelta(seconds=61),
+            optimal_duration_seconds=60,
+            max_duration_seconds=60,
+            status=IrrigationRun.STATUS_RUNNING,
+        )
+
+        command = Command()
+        with mock.patch(
+            "apps.irrigation.services.close_valve",
+            side_effect=RuntimeError("relay unavailable"),
+        ):
+            closed = command._stop_running_runs(now)
+
+        run.refresh_from_db()
+        self.assertEqual(run.status, IrrigationRun.STATUS_FINISHED)
+        self.assertEqual(run.stop_reason, IrrigationRun.STOP_COMPLETED)
+        self.assertIn("Best-effort close failed", run.error_message)
         self.assertIn(self.valve.id, closed)
 
     def test_watchdog_skips_recently_closed(self) -> None:

@@ -191,7 +191,7 @@ class Command(BaseCommand):
             )
 
             try:
-                services.open_valve(rule.valve)
+                services.open_valve_for(rule.valve, optimal_duration)
             except Exception as exc:  # noqa: BLE001 - capture hardware errors
                 run.status = IrrigationRun.STATUS_FAILED
                 run.stop_reason = IrrigationRun.STOP_ERROR
@@ -235,19 +235,25 @@ class Command(BaseCommand):
     def _close_run(
         self, run: IrrigationRun, now: dt.datetime, reason: str
     ) -> bool:
+        error_message = ""
         try:
             services.close_valve(run.valve)
         except Exception as exc:  # noqa: BLE001 - capture hardware errors
-            run.status = IrrigationRun.STATUS_FAILED
-            run.stop_reason = IrrigationRun.STOP_ERROR
-            run.error_message = str(exc)
-            run.save(update_fields=["status", "stop_reason", "error_message"])
-            return False
+            logger.warning(
+                "Best-effort close failed after timed pulse for %s: %s",
+                run.valve,
+                exc,
+            )
+            error_message = f"Best-effort close failed after timed pulse: {exc}"
 
         run.status = IrrigationRun.STATUS_FINISHED
         run.stop_reason = reason
         run.actual_stop_at = now
-        run.save(update_fields=["status", "stop_reason", "actual_stop_at"])
+        update_fields = ["status", "stop_reason", "actual_stop_at"]
+        if error_message:
+            run.error_message = error_message
+            update_fields.append("error_message")
+        run.save(update_fields=update_fields)
         return True
 
     def _watchdog_close(self, now: dt.datetime, recently_closed: set[int]) -> None:

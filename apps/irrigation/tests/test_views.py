@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from django.contrib.auth import get_user_model
@@ -143,6 +144,44 @@ class DashboardViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload[0]["last_polled_at"], "2026-01-15T13:00:00+01:00")
+
+    def test_manual_open_uses_valve_default_duration(self) -> None:
+        self.valve.default_max_duration_seconds = 123
+        self.valve.save(update_fields=["default_max_duration_seconds"])
+
+        self.client.login(username="tester", password="password")
+        with mock.patch(
+            "apps.irrigation.services.open_valve_for"
+        ) as open_valve_for:
+            response = self.client.post(reverse("valve_open", args=[self.valve.id]))
+
+        self.assertEqual(response.status_code, 302)
+        open_valve_for.assert_called_once_with(self.valve, 123)
+        run = IrrigationRun.objects.get()
+        self.assertEqual(run.status, IrrigationRun.STATUS_RUNNING)
+        self.assertEqual(run.max_duration_seconds, 123)
+
+    def test_manual_close_still_closes_running_valve_early(self) -> None:
+        now = timezone.now()
+        run = IrrigationRun.objects.create(
+            valve=self.valve,
+            trigger=IrrigationRun.TRIGGER_MANUAL,
+            requested_start_at=now,
+            actual_start_at=now,
+            optimal_duration_seconds=600,
+            max_duration_seconds=600,
+            status=IrrigationRun.STATUS_RUNNING,
+        )
+
+        self.client.login(username="tester", password="password")
+        with mock.patch("apps.irrigation.services.close_valve") as close_valve:
+            response = self.client.post(reverse("valve_close", args=[self.valve.id]))
+
+        self.assertEqual(response.status_code, 302)
+        close_valve.assert_called_once_with(self.valve)
+        run.refresh_from_db()
+        self.assertEqual(run.status, IrrigationRun.STATUS_FINISHED)
+        self.assertEqual(run.stop_reason, IrrigationRun.STOP_MANUAL)
 
 
 class ActiveSiteSelectionTests(TestCase):

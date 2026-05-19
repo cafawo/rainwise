@@ -3,7 +3,12 @@ from __future__ import annotations
 from django import forms
 from django.contrib.auth.forms import AuthenticationForm
 
-from apps.irrigation.models import Schedule, ScheduleRule, Valve
+from apps.irrigation.models import (
+    RELAY_FLASH_MAX_DURATION_SECONDS,
+    Schedule,
+    ScheduleRule,
+    Valve,
+)
 
 
 DAY_CHOICES = [
@@ -76,7 +81,10 @@ class ScheduleRuleForm(forms.ModelForm):
         self.fields["mode"].help_text = (
             "Fixed uses the max duration. Dynamic picks a random duration up to max."
         )
-        self.fields["max_duration_seconds"].help_text = "Hard stop for any run."
+        self.fields["max_duration_seconds"].help_text = (
+            "Relay-enforced run duration. "
+            f"Maximum {RELAY_FLASH_MAX_DURATION_SECONDS} seconds."
+        )
 
     def clean(self) -> dict:
         cleaned = super().clean()
