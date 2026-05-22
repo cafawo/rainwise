@@ -105,6 +105,8 @@ Option A: Install via YAML (single app, recommended)
 - Expose a host port (example: `8888`) mapped to container port `8000`.
   The containers will not start unless Postgres or SQLite is configured.
 
+> Small quirk when updaing the app on TrueNAs: You have to specify the version tag specifically :latest is not recognized by the TrueNAS docker handler.
+
 Option B: Custom App wizard (single image)
 - The guided wizard configures a single Docker image. If you need multiple
   services in one app, use Install via YAML with a Compose file instead.
