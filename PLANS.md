@@ -620,6 +620,8 @@ reconciliation described above; elapsed time alone cannot safely release it.
   service. Keep errors beside their fields as well; valve/rule-specific
   diagnostics and historical decisions
   remain beside the records they explain. Failed forms preserve entered values.
+  Warning text flows inline without forced line breaks, retaining bold emphasis
+  where useful and wrapping naturally on narrow screens.
 - Forbid deleting curve settings in Admin: deletion silently restores defaults
   and bypasses reservation validation. Editing or resetting through the Curve
   page remains the supported, validated path.
