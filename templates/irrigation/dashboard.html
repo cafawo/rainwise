@@ -2,7 +2,7 @@
 
 {% block title %}Valves | Rainwise{% endblock %}
 
-{% block content %}
+{% block page_feedback %}
 {% if show_default_sqlite_warning %}
   <div class="alert alert-warning" role="alert">
     Using the default SQLite database (<code>db.sqlite3</code>). This fallback is
@@ -11,8 +11,11 @@
     Postgres for production.
   </div>
 {% endif %}
-<h1 class="h3 mb-3">Valves</h1>
 {% include "irrigation/weather_status.html" %}
+{% endblock %}
+
+{% block content %}
+<h1 class="h3 mb-3">Valves</h1>
 {% include "irrigation/occurrences.html" %}
 
 <div class="card">

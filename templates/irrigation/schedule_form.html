@@ -1,16 +1,19 @@
 {% extends "base.html" %}
 {% block title %}Rule | Rainwise{% endblock %}
-{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3"><h1 class="h3 mb-0">{% if rule %}Edit{% else %}New{% endif %} rule</h1><a href="{% url 'schedule' %}">Back to schedule</a></div>
+{% block page_feedback %}
 {% if editor_errors %}
 <div class="alert alert-danger" id="editorErrors" role="alert" tabindex="-1">
-  <h2 class="h5">Rule was not saved. Correct the highlighted fields.</h2>
+  <p class="fw-semibold mb-2">Rule was not saved. Correct the highlighted fields.</p>
   <ul class="mb-0">{% for error in editor_errors %}<li><a class="alert-link" href="#{{ error.target }}">{{ error.message }}</a></li>{% endfor %}</ul>
 </div>
 {% endif %}
 {% for valve in missing_rate_valves %}
-<div class="alert alert-warning">{{ valve.name }}: skipped in Smart because a finite positive watering rate is required. Enter a measured watering rate in <a href="{% url 'admin:irrigation_valve_change' valve.pk %}">valve settings</a>.</div>
+<div class="alert alert-warning" role="alert">{{ valve.name }}: skipped in Smart because a finite positive watering rate is required. Enter a measured watering rate in <a href="{% url 'admin:irrigation_valve_change' valve.pk %}">valve settings</a>.</div>
 {% endfor %}
+{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3"><h1 class="h3 mb-0">{% if rule %}Edit{% else %}New{% endif %} rule</h1><a href="{% url 'schedule' %}">Back to schedule</a></div>
 <form method="post" id="editorForm" novalidate data-submitted="{{ submitted|yesno:'true,false' }}" data-existing="{{ editing_existing|yesno:'true,false' }}">
   {% csrf_token %}
   <div class="card mb-4"><div class="card-body">
@@ -21,11 +24,11 @@
   </div></div>
   <fieldset class="mb-4" id="memberRowsSection">
     <legend class="h5">Valves in watering order</legend>
-    <p class="text-secondary small">Each valve is a separate watering zone. Use the arrows or Position fields to change the order.</p>
+    <p class="text-secondary small">Each valve is a separate watering zone. Use the arrows to change the order.</p>
     {{ members_formset.management_form }}
     <div id="memberRows" tabindex="-1">{% for member in members_formset %}{% include "irrigation/member_row.html" with position=forloop.counter %}{% endfor %}</div>
     <button class="btn btn-outline-primary" type="button" id="addMember" hidden>Add valve</button>
-    <noscript><p>Enable JavaScript to add valve rows; current rows can be edited, reordered with Position, or removed with their checkbox.</p></noscript>
+    <noscript><p>Enable JavaScript to add or reorder valves. Current rows can be edited or removed with their checkbox.</p></noscript>
     <p id="smartRateHelp" class="form-text" {% if editor_mode != 'SMART' %}hidden{% endif %}>Smart needs measured watering rates. Existing members with N/A rates are retained and skipped until a rate is entered.</p>
     <p id="smartBreakHelp" class="form-text" {% if editor_mode != 'SMART' %}hidden{% endif %}>Before a valve repeats, it rests for at least as long as its preceding run. Watering other valves counts toward that break. <a href="{% url 'curve' %}">Peak daily demand: {{ peak_daily_mm }} mm/day</a> · Coverage: {{ coverage_days }} days.</p>
   </fieldset>
@@ -61,12 +64,14 @@
   let daysEdited = form.dataset.submitted === "true" || form.dataset.existing === "true";
   const rows = () => Array.from(container.querySelectorAll(".member-row"));
   const field = (row, name) => document.getElementById(`id_${row.dataset.prefix}-${name}`);
+  const syncOrder = () => rows().forEach((row, index) => field(row, "ORDER").value = index + 1);
   const readable = value => {
     if (!Number.isFinite(value) || value < 0) return "N/A";
     const hours = Math.floor(value / 3600), minutes = Math.floor(value % 3600 / 60), seconds = value % 60;
     return [hours ? `${hours}h` : "", minutes ? `${minutes}m` : "", seconds || (!hours && !minutes) ? `${seconds}s` : ""].filter(Boolean).join(" ");
   };
   function refresh() {
+    syncOrder();
     const smart = mode.value === "SMART";
     document.getElementById("modeHelp").textContent = smart ? "Smart calculates a target for each valve and repeats bounded runs with automatic breaks." : "Fixed waters each valve once, in the selected order.";
     document.getElementById("smartRateHelp").hidden = !smart;
@@ -86,6 +91,7 @@
       const validDuration = input.value.trim() !== "" && /^\d+$/.test(input.value.trim());
       const seconds = validDuration ? Number(input.value) : (smart && input.value.trim() === "" ? fallback : NaN);
       row.querySelector(".member-fields").hidden = deleted;
+      row.querySelector(".removed-message").hidden = !deleted;
       row.querySelector(".member-heading").textContent = deleted ? "Removed valve row" : `Valve ${active.indexOf(row) + 1}`;
       row.querySelector(".remove-member").textContent = deleted ? "Undo remove" : "Remove";
       row.querySelector(".move-up").disabled = deleted || active.indexOf(row) === 0;
@@ -100,7 +106,7 @@
       row.querySelector(".client-rate-error").classList.toggle("d-block", Boolean(invalidRate));
       row.querySelector(".rate-help").textContent = smart && select.value ? `Watering rate: ${rate > 0 ? `${rate} mm/hour` : "N/A — skipped in Smart"}` : "";
       const metrics = row.querySelector(".smart-metrics");
-      metrics.hidden = !smart;
+      metrics.hidden = !smart || deleted;
       const peakSeconds = rate > 0 ? Math.floor(peak * 3600 / rate) : NaN;
       metrics.textContent = `Peak watering for the coverage window: ${readable(peakSeconds)}. Run limit: ${readable(seconds)}. Breaks and scheduling allowance add elapsed time.`;
     });
@@ -141,7 +147,6 @@
     const active = rows().filter(item => !field(item, "DELETE").checked), index = active.indexOf(row);
     if (button.classList.contains("move-up") && index > 0) container.insertBefore(row, active[index - 1]);
     if (button.classList.contains("move-down") && index < active.length - 1) container.insertBefore(active[index + 1], row);
-    if (button.classList.contains("move-up") || button.classList.contains("move-down")) rows().filter(item => !field(item, "DELETE").checked).forEach((item, i) => field(item, "ORDER").value = i + 1);
     refresh();
   });
   document.querySelectorAll('input[name="days_of_week"]').forEach(input => input.addEventListener("change", () => daysEdited = true));
@@ -157,10 +162,10 @@
     total.value = index + 1;
     const row = rows().at(-1);
     setup(row, true);
-    field(row, "ORDER").value = rows().filter(item => !field(item, "DELETE").checked).length;
     refresh();
     field(row, "valve").focus();
   });
+  form.addEventListener("submit", syncOrder);
   refresh();
   document.getElementById("editorErrors")?.focus();
 })();

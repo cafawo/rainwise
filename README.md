@@ -219,7 +219,8 @@ path. Use `RELAY_SIMULATOR=true` for local/dev without hardware.
 ## Fixed and Smart Rules
 
 Choose a mode, select and order valves at the active site, choose weekdays and
-one local start time, and set a duration for each valve. Fixed requires explicit
+one local start time, and set a duration for each valve. Use the up/down arrows
+beside each valve to change the watering order. Fixed requires explicit
 weekday selection; Smart initially selects all seven days. Excluded days prevent
 scheduled execution but remain part of water history. Each Smart valve has its
 own target; grouping does not divide water between zones. Overlapping watered
@@ -314,6 +315,9 @@ credit their nominal amount, including known command/retry time, and show an
 uncertainty warning. An interrupted command without an end time also has unknown
 extra delivery. Relay retries can restart a timer: these are estimates, not
 measurements or an exactly-once physical watering guarantee.
+An opening that succeeds only after a retry also retains uncertain-delivery
+credit. The remaining group sequence is cancelled under the same policy as
+other uncertain deliveries; a successful retry does not erase that uncertainty.
 
 For independent valves calibrated at 12 mm/hour with 900-second run limits,
 each full pulse delivers 3 mm. With two coverage days, no rain, no initial
@@ -452,6 +456,14 @@ interrupted watering into a reported full successful delivery.
 Cancellation received before the opening acknowledgement also keeps conservative
 credit, including when a database failure prevents recording the racing close.
 Stopping a normally acknowledged run still credits its known shortened delivery.
+If recording a returned opening result fails, the sender closes the valve while
+retaining ownership, then makes one conservative attempt to record that it has
+finished. Fresh closure confirmation is still required before admitting more
+watering. If the
+database remains unavailable, unresolved ownership is retained for recovery.
+A later read failure after a successful acknowledgement leaves the bounded run
+with the controller; it does not trigger an extra close that could interrupt a
+newer run.
 
 If a web process crashes without acknowledging its opening, the site stays
 blocked conservatively. After stopping **all** old web and controller processes,
@@ -460,6 +472,13 @@ a maintenance container using the mounted database and normal relay connection,
 then restart the web app and one controller. This exceptional recovery command
 closes and reads valves; it never opens them. The flag confirms that no old sender
 can return. Do not use it while any old sender process may still be running.
+
+Page-wide warnings, errors, and action results appear above the page heading.
+Failed forms show a red summary linking to invalid fields, alongside inline
+errors; entered values are retained. Valve/rule-specific diagnostics and past
+run decisions stay beside their records. Curve settings cannot be deleted in
+Admin, because silently restoring defaults would bypass reservation checks;
+use the Curve page to edit or reset settings with validation.
 
 ## Upgrade and Verification
 

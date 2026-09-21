@@ -1,6 +1,11 @@
 {% extends "base.html" %}
+{% load irrigation %}
 
 {% block title %}Login | Rainwise{% endblock %}
+
+{% block page_feedback %}
+{% include "irrigation/form_errors.html" with error_heading="Sign in failed. Correct the errors below." %}
+{% endblock %}
 
 {% block content %}
 <div class="row justify-content-center">
@@ -10,23 +15,18 @@
         <h1 class="h4 mb-3">Sign in</h1>
         <form method="post">
           {% csrf_token %}
-          {% if form.non_field_errors %}
-            <div class="alert alert-danger" role="alert">
-              {{ form.non_field_errors }}
-            </div>
-          {% endif %}
           <div class="mb-3">
             <label class="form-label" for="{{ form.username.id_for_label }}">Username</label>
-            {{ form.username }}
+            {{ form.username|with_field_errors }}
             {% if form.username.errors %}
-              <div class="text-danger small">{{ form.username.errors }}</div>
+              <div class="invalid-feedback d-block" id="{{ form.username.auto_id }}_errors">{{ form.username.errors }}</div>
             {% endif %}
           </div>
           <div class="mb-3">
             <label class="form-label" for="{{ form.password.id_for_label }}">Password</label>
-            {{ form.password }}
+            {{ form.password|with_field_errors }}
             {% if form.password.errors %}
-              <div class="text-danger small">{{ form.password.errors }}</div>
+              <div class="invalid-feedback d-block" id="{{ form.password.auto_id }}_errors">{{ form.password.errors }}</div>
             {% endif %}
           </div>
           <button class="btn btn-primary w-100" type="submit">Login</button>

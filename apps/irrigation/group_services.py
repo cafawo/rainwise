@@ -33,6 +33,9 @@ SENDER_INTERRUPTED = (
 SENDER_CANCELLED = (
     "Opening cancelled before acknowledgement; physical delivery is uncertain."
 )
+SENDER_RETRIED = (
+    "Opening succeeded after a transport retry; physical delivery is uncertain."
+)
 UTC = dt.timezone.utc
 
 
@@ -342,6 +345,52 @@ def _confirmed_closed(run, *, close=False):
     return True
 
 
+def _recover_returned_command(run, finished_at, error_message, *, started_at=None):
+    """Try once to acknowledge a returned command, closing even if writes fail.
+
+    Unlike a vanished sender, this process knows it will not transmit again.
+    Uncertain delivery is retained after failure or cancellation during dispatch.
+    If acknowledgement fails, recovery must keep the original claim.
+    """
+    # Keep the SENDING barrier until this sender's final hardware write returns.
+    # A controller may otherwise confirm closure and admit a newer run before
+    # this emergency close, which would then incorrectly close the newer run.
+    closed_at = None
+    try:
+        services.close_valve(run.valve)
+        closed_at = timezone.now()
+    except Exception:
+        logger.exception("Emergency close after opening failure failed")
+    try:
+        updates = dict(
+            dispatch_state="DONE", status="FAILED", cancellation_requested=True,
+            attempt_finished_at=finished_at, delivery_uncertain=True,
+            closure_confirmed_at=None, stop_reason="ERROR",
+            error_message=error_message,
+        )
+        if started_at is not None:
+            updates.update(
+                status="FINISHED", actual_start_at=started_at,
+                actual_stop_at=closed_at, stop_reason="MANUAL_STOP",
+            )
+        acknowledged = IrrigationRun.objects.filter(pk=run.pk).update(**updates)
+    except Exception:
+        logger.exception(
+            "Terminal opening acknowledgement failed for run %s", run.pk,
+        )
+        return
+    if not acknowledged:
+        return
+    try:
+        if run.occurrence_id:
+            cancel_occurrence(
+                run.occurrence, "Uncertain delivery; remaining target unmet",
+            )
+        _confirmed_closed(run)
+    except Exception:
+        logger.exception("Closure reconciliation failed for run %s", run.pk)
+
+
 def _send_claimed(run):
     """Transmit one already committed logical attempt; never replay it."""
     admission_site = run.occurrence.site if run.occurrence_id else run.valve.relay_device.site
@@ -425,60 +474,47 @@ def _send_claimed(run):
         run.refresh_from_db()
         return run
     try:
-        services.open_valve_for(run.valve, run.optimal_duration_seconds)
+        retried = services.open_valve_for(
+            run.valve, run.optimal_duration_seconds,
+        ) is True
     except Exception as exc:
-        try:
-            IrrigationRun.objects.filter(pk=run.pk).update(
-                status="FAILED", attempt_finished_at=timezone.now(),
-                delivery_uncertain=True, stop_reason="ERROR", error_message=str(exc),
-                dispatch_state="DONE", closure_confirmed_at=None,
-            )
-            if occurrence:
-                cancel_occurrence(
-                    occurrence, "Ambiguous opening; remaining pulses cancelled"
-                )
-            _confirmed_closed(run, close=True)
-        except Exception:
-            # The sender cannot durably acknowledge, so ownership stays held.
-            # Still attempt closure even when recording the failed call fails.
-            try:
-                services.close_valve(run.valve)
-            except Exception:
-                logger.exception("Emergency close after failed-call persistence failed")
-            raise
+        _recover_returned_command(run, timezone.now(), str(exc))
         raise
     finished = timezone.now()
     try:
-        IrrigationRun.objects.filter(pk=run.pk).update(
+        acknowledged = IrrigationRun.objects.filter(
+            pk=run.pk, cancellation_requested=False,
+        ).update(
             status="RUNNING", actual_start_at=now, attempt_finished_at=finished,
-            # Cancellation is persisted before every close of an outstanding
-            # sender. Preserve it even if recording the close itself failed.
+            # A successful retry may have restarted the hardware timer.
             delivery_uncertain=Case(
-                When(Q(sender_interrupted=True) | Q(cancellation_requested=True),
-                     then=True),
-                default=False,
+                When(sender_interrupted=True, then=True),
+                default=retried,
             ),
             error_message=Case(
                 When(sender_interrupted=True, then=Value(SENDER_INTERRUPTED)),
-                When(cancellation_requested=True, then=Value(SENDER_CANCELLED)),
-                default=F("error_message"), output_field=TextField(),
+                default=Value(SENDER_RETRIED) if retried else F("error_message"),
+                output_field=TextField(),
             ),
             dispatch_state="DONE",
             closure_confirmed_at=None,
         )
-        run.refresh_from_db()
-        if occurrence:
-            occurrence.refresh_from_db()
-        if run.cancellation_requested or (occurrence and occurrence.cancellation_requested):
-            _confirmed_closed(run, close=True)
-    except Exception:
-        # The durable pre-command claim remains uncertain if saving the result
-        # failed. Best effort closure does not erase that recovery record.
-        try:
-            services.close_valve(run.valve)
-        except Exception:
-            logger.exception("Emergency close after result persistence failed")
+    except Exception as persistence_error:
+        _recover_returned_command(
+            run, finished, f"Opening result could not be recorded: {persistence_error}",
+        )
         raise
+    if not acknowledged:
+        # Cancellation won the atomic acknowledgement race. This sender still
+        # owns SENDING, so finish its last hardware write before publishing DONE.
+        _recover_returned_command(
+            run, finished, SENDER_CANCELLED, started_at=now,
+        )
+    # The acknowledged pulse is durably owned by the controller. A subsequent
+    # read failure must not close it (or a newer run after this request pauses).
+    run.refresh_from_db()
+    if occurrence:
+        occurrence.refresh_from_db()
     return run
 
 

@@ -160,13 +160,14 @@ def _send_raw_write_single_coil(
             raise ModbusError("Relay response does not match flash command")
 
 
-def _write_flash_command(device: RelayDevice, address: int, ticks: int) -> None:
+def _write_flash_command(device: RelayDevice, address: int, ticks: int) -> bool:
+    """Return whether an acknowledged opening retried a possibly applied pulse."""
     attempts = MODBUS_RETRIES + 1
     last_exception: Exception | None = None
-    for _attempt in range(attempts):
+    for attempt in range(attempts):
         try:
             _send_raw_write_single_coil(device, address, ticks)
-            return
+            return attempt > 0
         except (OSError, ModbusError) as exc:
             last_exception = exc
     raise ModbusError(
@@ -204,13 +205,14 @@ def open_valve(valve: Valve) -> None:
     raise RuntimeError("Unbounded valve opening is disabled. Use open_valve_for().")
 
 
-def open_valve_for(valve: Valve, duration_seconds: int) -> None:
+def open_valve_for(valve: Valve, duration_seconds: int) -> bool:
+    """Send a bounded pulse and report whether a retry made delivery uncertain."""
     ticks = _duration_to_flash_ticks(duration_seconds)
     if SIMULATOR:
         _set_simulated_state(valve, True)
-        return
+        return False
 
-    _write_flash_command(valve.relay_device, _flash_address_for(valve), ticks)
+    return _write_flash_command(valve.relay_device, _flash_address_for(valve), ticks)
 
 
 def close_valve(valve: Valve) -> None:

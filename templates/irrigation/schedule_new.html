@@ -1,6 +1,11 @@
 {% extends "base.html" %}
+{% load irrigation %}
 
 {% block title %}New Schedule | Rainwise{% endblock %}
+
+{% block page_feedback %}
+{% include "irrigation/form_errors.html" with error_heading="Schedule was not created. Correct the errors below." %}
+{% endblock %}
 
 {% block content %}
 <h1 class="h3 mb-3">New Schedule</h1>
@@ -13,25 +18,19 @@
   <div class="card-body">
     <form method="post">
       {% csrf_token %}
-      {% if form.non_field_errors %}
-        <div class="alert alert-danger" role="alert">
-          {{ form.non_field_errors }}
-        </div>
-      {% endif %}
-
       <div class="mb-3">
         <label class="form-label" for="{{ form.name.id_for_label }}">Schedule name</label>
-        {{ form.name }}
+        {{ form.name|with_field_errors }}
         {% if form.name.errors %}
-          <div class="text-danger small">{{ form.name.errors }}</div>
+          <div class="invalid-feedback d-block" id="{{ form.name.auto_id }}_errors">{{ form.name.errors }}</div>
         {% endif %}
       </div>
 
       <div class="mb-3">
         <label class="form-label" for="{{ form.description.id_for_label }}">Description</label>
-        {{ form.description }}
+        {{ form.description|with_field_errors }}
         {% if form.description.errors %}
-          <div class="text-danger small">{{ form.description.errors }}</div>
+          <div class="invalid-feedback d-block" id="{{ form.description.auto_id }}_errors">{{ form.description.errors }}</div>
         {% endif %}
       </div>
 

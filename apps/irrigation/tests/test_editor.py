@@ -76,6 +76,25 @@ class SharedRuleEditorTests(TestCase):
         rule = GroupedRule.objects.get()
         self.assertEqual(list(rule.members.order_by("order").values_list("valve_id", flat=True)), [self.b.pk, self.a.pk])
 
+    def test_member_order_is_hidden_and_arrows_are_available(self):
+        rule = self.group()
+        response = self.client.get(reverse("group_edit", args=[rule.pk]))
+        self.assertContains(response, 'type="hidden" name="members-0-ORDER"')
+        self.assertContains(response, 'type="hidden" name="members-1-ORDER"')
+        self.assertNotContains(response, "Position")
+        self.assertContains(response, 'aria-label="Move valve up"')
+        self.assertContains(response, 'aria-label="Move valve down"')
+
+    def test_invalid_hidden_order_links_to_visible_row_without_saving(self):
+        response = self.client.post(reverse("schedule_create"), self.payload(
+            **{"members-0-ORDER": "invalid"}
+        ))
+        self.assertContains(response, "The valve order could not be read.")
+        self.assertContains(response, 'href="#member-members-0"')
+        self.assertNotContains(response, 'href="#id_members-0-ORDER"')
+        self.assertContains(response, 'id="id_members-0-ORDER_errors"')
+        self.assertFalse(ScheduleRule.objects.exists())
+
     def test_smart_single_uses_group_storage(self):
         response = self.client.post(reverse("schedule_create"), self.payload("SMART"))
         self.assertEqual(response.status_code, 302)

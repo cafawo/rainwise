@@ -115,7 +115,11 @@ needed. Keep Mode first, followed by ordered valves and then the schedule.
   Remove action together in one responsive row/card. Remove the distant second
   duration list, raw-looking controls, and large numbered instruction blocks.
 - Make order easy to understand. Small accessible up/down controls can use the
-  existing formset order field; retain straightforward keyboard operation.
+  existing hidden formset order field; retain straightforward keyboard operation.
+  Show the valve, duration, arrows and Remove button on one compact desktop row,
+  wrapping on small screens. Do not expose a redundant Position input. Keep
+  hidden order synchronized with visible rows after add/remove/undo/reorder and
+  submission, so validation and saving preserve the order shown to the user.
 - Present enabled state, weekdays, start time and optional name/note compactly.
   Smart initially selects all seven weekdays; both modes require at least one.
 - Only the site's active schedule executes automatically. Reject duplicate
@@ -598,3 +602,73 @@ backup, stopping old web/controller senders, automatic startup migrations, and
 exactly one upgraded controller. No new Docker configuration is required. An
 unacknowledged crashed web sender intentionally needs the stopped-process
 reconciliation described above; elapsed time alone cannot safely release it.
+
+## 10. Critical review and consistent user feedback (2026-09-21)
+
+- All page-wide notices use a single feedback area in `base.html`, before the
+  page heading: action results, setup/weather warnings, form error summaries,
+  and preview failures. Use an ordinary template block, shared form-summary
+  include, and Bootstrap invalid-field rendering, without another notification
+  service. Keep errors beside their fields as well; valve/rule-specific
+  diagnostics and historical decisions
+  remain beside the records they explain. Failed forms preserve entered values.
+- Forbid deleting curve settings in Admin: deletion silently restores defaults
+  and bypasses reservation validation. Editing or resetting through the Curve
+  page remains the supported, validated path.
+- If opening-result persistence fails after the hardware call has returned,
+  close while sender ownership is retained, then attempt one conservative
+  terminal acknowledgement and read-only closure confirmation.
+  Keep unresolved ownership if acknowledgement or closure cannot be confirmed;
+  never release an outstanding sender based on elapsed time. This addresses a
+  transient database error without adding a worker, timer, or recovery state.
+  A read failure after a successful durable acknowledgement leaves the bounded
+  run with the controller; it must not trigger a late close of a replacement run.
+  Finish sender-side hardware writes before publishing DONE, including when
+  cancellation arrives during transmission.
+- Audit successful transport retries as well as outright failures: an opening
+  retry can restart the hardware timer. Preserve this information in the
+  existing uncertain-delivery path without changing commands, timeouts or retry
+  counts. The existing group interruption policy applies to uncertain delivery.
+- Retain the shared sequence planner and persisted rest calculation; independent
+  randomized checks found no need for a larger scheduling abstraction. A crashed
+  web sender still requires stopped-process reconciliation. Moving manual opens
+  to the controller would remove that cross-process failure mode, but is a
+  separate interaction/ownership change, not a timeout workaround.
+- Verify feedback placement and invalid forms, direct/bulk Admin deletion,
+  transient result-persistence failure, and successful retries with focused
+  regressions, followed by the full SQLite and PostgreSQL suites. Use only
+  isolated databases and mocked hardware/weather.
+
+Completed review verification:
+
+- Full suite: **278 tests pass on SQLite at 60-second cadence** (8.633 s) and
+  **278 pass on disposable PostgreSQL 17.11 at 30-second cadence** (10.505 s).
+  Fresh migrations, model-drift checks, Django system checks and diff checks pass.
+- Regression cases include successful opening retries, temporary/persistent
+  result-write failure, failed closure, and delayed acknowledgements or reads
+  after another run has started. Failed and cancelled senders share cleanup;
+  they finish hardware writes before publishing DONE. No new state or worker
+  was introduced, and relay commands/timeouts/retry counts are unchanged.
+- Feedback checks cover setup/weather/action notices, failed rule/curve/schedule
+  forms, previews and login. Browser testing caught missing invalid-field
+  attributes in Django 4.2's default widgets; the small presentation filter now
+  supplies Bootstrap styling and accessible field descriptions. Regression tests
+  inspect actual input markup, not matching text elsewhere on the page.
+- Isolated Chromium checks pass at 1280 px and 390 px: consistent placement,
+  linked error focus, red fields, retained values and no horizontal overflow or
+  JavaScript errors. Updated screenshots were visually inspected. Browser and
+  PostgreSQL servers were stopped; the temporary browser database was removed.
+- Independent sequence checks cover 24,684 randomized accepted peak/reduced
+  targets, with exact totals, pulse limits, equal-duration rest, and reservation
+  bounds. The sequence planner and rolling balance need no structural rewrite.
+
+No production data or live hardware was used. The documented crashed-web-sender
+recovery limitation remains; controller-owned manual opening requests are the
+recommended future simplification, with their response-time tradeoff made
+explicit before changing that interaction.
+
+The subsequent compact-row refinement removes the visible Position input and
+uses the existing hidden formset order with arrow controls. Valve, duration and
+actions align on desktop and wrap on mobile. All 89 relevant editor/view/feedback
+tests pass; isolated browser checks confirm order survives remove/undo/add,
+reordering, invalid submission and saved reload, with no 390 px overflow.

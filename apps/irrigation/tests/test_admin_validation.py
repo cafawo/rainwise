@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.urls import reverse
 
+from apps.irrigation import group_services
 from apps.irrigation.admin import CurveSettingsAdminForm, ValveAdminForm
 from apps.irrigation.models import (
     CurveSettings, GroupedRule, GroupedRuleValve, RelayDevice, Schedule,
@@ -120,6 +121,41 @@ class AdminReservationValidationTests(TestCase):
         self.assertContains(response, "overlaps")
         self.valve.refresh_from_db()
         self.assertEqual(self.valve.application_rate_mm_h, 12)
+
+    def test_admin_cannot_delete_curve_and_invalidate_existing_reservations(self):
+        user = get_user_model().objects.create_superuser(
+            username="admin", password="test-pass"
+        )
+        self.client.force_login(user)
+        group_services.validate_schedule(self.schedule)
+
+        response = self.client.post(
+            reverse("admin:irrigation_curvesettings_delete", args=[self.curve.pk]),
+            {"post": "yes"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.curve.refresh_from_db()
+        self.assertEqual(self.curve.max_mm, 2)
+        self.assertEqual(self.curve.coverage_days, 1)
+        group_services.validate_schedule(self.schedule)
+
+    def test_admin_has_no_curve_bulk_delete_action(self):
+        user = get_user_model().objects.create_superuser(
+            username="admin", password="test-pass"
+        )
+        self.client.force_login(user)
+        url = reverse("admin:irrigation_curvesettings_changelist")
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.context["action_form"])
+
+        self.client.post(url, {
+            "action": "delete_selected", "_selected_action": [self.curve.pk],
+            "post": "yes", "index": "0",
+        })
+        self.assertTrue(CurveSettings.objects.filter(pk=self.curve.pk).exists())
+        group_services.validate_schedule(self.schedule)
 
     def test_missing_or_invalid_fixed_duration_reports_field_error(self):
         self.rule.mode = "FIXED"

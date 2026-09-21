@@ -70,7 +70,7 @@ class RelayFlashServiceTests(TestCase):
             "apps.irrigation.services.socket.create_connection",
             return_value=fake_socket,
         ):
-            services.open_valve_for(valve, duration_seconds)
+            self.assertIs(services.open_valve_for(valve, duration_seconds), False)
         return fake_socket.sent
 
     def test_active_high_open_uses_flash_on_address(self) -> None:
@@ -112,6 +112,55 @@ class RelayFlashServiceTests(TestCase):
                 )
 
         create_connection.assert_not_called()
+
+    def test_successful_retry_reports_uncertainty_without_changing_pulse(self):
+        valve = self._create_valve(is_active_high=True)
+        first, second = FakeModbusSocket(), FakeModbusSocket()
+        with (
+            mock.patch.object(services, "MODBUS_RETRIES", 1),
+            mock.patch.object(
+                first, "recv", side_effect=TimeoutError("Lost acknowledgement"),
+            ),
+            mock.patch(
+                "apps.irrigation.services.socket.create_connection",
+                side_effect=[first, second],
+            ) as connection,
+        ):
+            self.assertIs(services.open_valve_for(valve, 1), True)
+
+        self.assertEqual(connection.call_count, 2)
+        self.assertEqual(first.sent, second.sent)
+        self.assertEqual(struct.unpack(">HHHBBHH", first.sent)[-1], 10)
+        self.assertEqual(first.timeout, services.MODBUS_TIMEOUT_SECONDS)
+        self.assertEqual(second.timeout, services.MODBUS_TIMEOUT_SECONDS)
+
+    def test_failed_retries_preserve_existing_attempt_limit(self):
+        valve = self._create_valve(is_active_high=True)
+        with (
+            mock.patch.object(services, "MODBUS_RETRIES", 1),
+            mock.patch(
+                "apps.irrigation.services._send_raw_write_single_coil",
+                side_effect=TimeoutError("Lost acknowledgement"),
+            ) as send,
+        ):
+            with self.assertRaises(services.ModbusError):
+                services.open_valve_for(valve, 1)
+        self.assertEqual(send.call_count, 2)
+
+    def test_simulator_reports_no_transport_retry(self):
+        valve = self._create_valve(is_active_high=True)
+        with (
+            mock.patch.object(services, "SIMULATOR", True),
+            mock.patch(
+                "apps.irrigation.services._set_simulated_state",
+            ) as set_state,
+            mock.patch(
+                "apps.irrigation.services.socket.create_connection",
+            ) as connection,
+        ):
+            self.assertIs(services.open_valve_for(valve, 60), False)
+        set_state.assert_called_once_with(valve, True)
+        connection.assert_not_called()
 
     def test_unbounded_open_is_disabled(self) -> None:
         valve = self._create_valve(is_active_high=True)

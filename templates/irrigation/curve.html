@@ -3,9 +3,13 @@
 
 {% block title %}Curve | Rainwise{% endblock %}
 
+{% block page_feedback %}
+{% include "irrigation/form_errors.html" with error_heading="Curve was not saved. Correct the errors below." %}
+{% include "irrigation/weather_status.html" %}
+{% endblock %}
+
 {% block content %}
 <h1 class="h3 mb-3">Curve</h1>
-{% include "irrigation/weather_status.html" %}
 
 <div class="row g-4">
   <div class="col-lg-8 d-flex">
@@ -23,8 +27,7 @@
         <h2 class="h5 mb-3">Parameters</h2>
         <form method="post" novalidate>
           {% csrf_token %}
-          {{ form.non_field_errors }}
-          {% for field in form %}<div class="mb-3"><label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>{{ field }}{{ field.errors }}<div class="form-text">{{ field.help_text }}</div></div>{% endfor %}
+          {% for field in form %}<div class="mb-3"><label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>{{ field|with_field_errors }}<div class="invalid-feedback d-block" id="{{ field.auto_id }}_errors">{{ field.errors }}</div><div class="form-text">{{ field.help_text }}</div></div>{% endfor %}
           <div class="d-flex flex-wrap gap-2">
             <button class="btn btn-primary" type="submit">Save and update</button>
             <button class="btn btn-outline-secondary" type="submit" name="reset_defaults" value="1">

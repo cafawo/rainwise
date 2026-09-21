@@ -429,7 +429,10 @@ def _editor_errors(form, formset):
         if member.cleaned_data.get("DELETE"):
             continue
         for name, messages_list in member.errors.items():
-            target = f"member-{member.prefix}" if name == "__all__" else member[name].auto_id
+            target = (
+                f"member-{member.prefix}" if name in {"__all__", "ORDER"}
+                else member[name].auto_id
+            )
             errors.extend({"target": target, "message": f"Valve row {index}: {message}"} for message in messages_list)
     for current in [form, *formset.forms]:
         for name in current.errors:

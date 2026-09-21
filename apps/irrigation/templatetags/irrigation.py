@@ -1,9 +1,24 @@
-"""Presentation helpers for durations stored in seconds."""
+"""Presentation helpers for irrigation forms and durations."""
 import math
 
 from django import template
 
 register = template.Library()
+
+
+@register.filter
+def with_field_errors(field):
+    """Render field errors with Bootstrap styling and accessible descriptions."""
+    if not field.errors:
+        return field.as_widget()
+    widget_attrs = field.field.widget.attrs
+    return field.as_widget(attrs={
+        "class": f"{widget_attrs.get('class', '')} is-invalid".strip(),
+        "aria-invalid": "true",
+        "aria-describedby": " ".join(filter(None, (
+            widget_attrs.get("aria-describedby"), f"{field.auto_id}_errors",
+        ))),
+    })
 
 
 @register.filter

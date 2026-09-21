@@ -1,0 +1,11 @@
+{% if form.errors %}
+<div class="alert alert-danger" id="formErrors" role="alert" tabindex="-1">
+  <p class="fw-semibold mb-2">{{ error_heading|default:"Please correct the errors below." }}</p>
+  <ul class="mb-0">
+    {% for error in form.non_field_errors %}<li>{{ error }}</li>{% endfor %}
+    {% for field in form %}
+      {% for error in field.errors %}<li><a class="alert-link" href="#{{ field.id_for_label }}">{{ field.label }}: {{ error }}</a></li>{% endfor %}
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}

@@ -241,7 +241,7 @@ class BaseValveMemberFormSet(forms.BaseFormSet):
         "too_few_forms": "Select at least one valve. Add a complete valve row before saving.",
         "missing_management_form": "The valve list is incomplete. Reload the editor and try again.",
     }
-    ordering_widget = forms.TextInput(attrs={"inputmode": "numeric"})
+    ordering_widget = forms.HiddenInput
 
     def add_fields(self, form, index):
         super().add_fields(form, index)
@@ -249,9 +249,9 @@ class BaseValveMemberFormSet(forms.BaseFormSet):
         form.empty_permitted = False
         if not form.is_bound and index is not None:
             form.fields["ORDER"].initial = index + 1
-        form.fields["ORDER"].widget.attrs.update({
-            "class": "form-control form-control-sm", "min": "1",
-        })
+        form.fields["ORDER"].error_messages["invalid"] = (
+            "The valve order could not be read. Reload the editor and try again."
+        )
 
     def clean(self):
         seen = set()

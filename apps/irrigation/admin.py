@@ -324,3 +324,8 @@ class CurveSettingsAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         return ("site",) if obj else ()
+
+    def has_delete_permission(self, request, obj=None):
+        # Deletion restores implicit defaults without validating reservations.
+        # Use the Curve page's validated reset instead.
+        return False
