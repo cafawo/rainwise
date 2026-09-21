@@ -41,16 +41,17 @@
       <div class="col-md-8"><label class="form-label" for="{{ form.note.id_for_label }}">Name / note</label>{{ form.note }}<div class="invalid-feedback d-block" id="id_note_errors">{{ form.note.errors }}</div></div>
     </div>
   </div></fieldset>
-  <div class="d-flex gap-2 mb-4"><button class="btn btn-primary" type="submit">Save</button><a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a></div>
 </form>
-{% if rule %}
-<div class="border-top pt-3 d-flex flex-wrap gap-2">
+<div class="d-flex flex-wrap align-items-center gap-2 mb-4">
+  <button class="btn btn-primary" type="submit" form="editorForm">Save</button>
+  <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
+  {% if rule %}
   <a class="btn btn-outline-primary" href="{{ copy_url }}">Make copy</a>
   {% if smart %}<a class="btn btn-outline-success" href="{{ preview_url }}">Preview</a>{% else %}<form method="post" action="{{ run_url }}">{% csrf_token %}<button class="btn btn-outline-success">Run now</button></form>{% endif %}
   {% if is_group %}<form method="post" action="{{ stop_url }}">{% csrf_token %}<button class="btn btn-outline-warning">Stop rule</button></form>{% endif %}
   <form method="post" action="{{ delete_url }}">{% csrf_token %}<button class="btn btn-outline-danger">Delete rule</button></form>
+  {% endif %}
 </div>
-{% endif %}
 <template id="emptyMember">{% include "irrigation/member_row.html" with member=members_formset.empty_form %}</template>
 {{ peak_window_mm|json_script:"peakWindow" }}
 {% endblock %}
