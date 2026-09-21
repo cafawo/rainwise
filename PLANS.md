@@ -174,6 +174,10 @@ hourly temperature model.
 
 For valve `v`, local date `d`, decision cutoff `t`, and coverage days `L`:
 
+Use the actual admitted decision instant for `t`, within the scheduled minute;
+store the nominal scheduled instant separately for occurrence identity. Watering
+that finishes earlier in that same minute is therefore included in the credit.
+
 ```text
 daily_need = curve(selected_temperature_at_t)                         # mm/day
 target_mm[v] = max(0, L * daily_need - rain_credit_mm - irrigation_credit_mm[v])
@@ -257,6 +261,12 @@ configured. Missing weather must be visible.
 - Base refresh freshness on successful import time and existing retry throttling,
   not the newest observation timestamp. Future/sparse rows cannot suppress a
   needed refresh. Keep short timeouts and periodic controller-owned importing.
+- Fetch/backfill the complete rainfall window required by enabled Smart rules
+  and the preceding 24 hours needed for temperature. Include missing or untrusted
+  hours within that range, including after increasing `coverage_days`; do not
+  merely continue from the newest observation or retain a two-day-only fetch.
+  Use the existing import lookback when it is longer. Repair gaps through the
+  normal throttled refresh, without extra calls during a Smart decision.
 - Credit known finite nonnegative precipitation only. Unknown rainfall supplies
   no credit and raises a separate warning: continuing during an outage can
   overwater, and zero credit must not be described as proof of no rain.
@@ -285,6 +295,10 @@ Skip fulfilled valves. Persist zero-demand Smart decisions too.
 1. At the scheduled local minute, atomically create the occurrence and planned
    pulses. A manual Fixed group request uses the same planner on a controller
    tick. Snapshots prevent subsequent configuration edits from changing history.
+   Admit scheduled work only when the site is free of conflicting active,
+   in-flight, or uncertain earlier watering. Otherwise record a skipped
+   occurrence and no runnable pulses; do not wait and launch a frozen Smart
+   target after that other watering finishes.
 2. Before each pulse, check cancellation, active schedule, enabled rule/device,
    current limits, conflicts, and remaining time. For Smart also check the two
    logical attempts per valve/local date across all Smart occurrences. A reduced
@@ -306,10 +320,20 @@ Skip fulfilled valves. Persist zero-demand Smart decisions too.
    attempted command or backfill missed dates. Normal planning resumes on the
    next eligible date; a new explicit Fixed manual request requires recovery
    and confirmed closure first.
+   Explicitly inspect attempted PLANNED/FAILED rows as well as RUNNING rows:
+   existing stops/watchdog alone cannot establish their hardware outcome.
+   Use existing close/read services even if the relay device was subsequently
+   disabled; disabling prevents new openings, not necessary closure/recovery.
 
 Claims must use atomic state changes/constraints that work on SQLite and
 Postgres, not `select_for_update()` alone. Do not hold a database transaction
 open across hardware I/O. Preserve the single-controller deployment assumption.
+Group reservation acquisition and admission of existing manual/single-valve
+Fixed starts must share atomic per-site coordination. A separate check followed
+by a later run creation is insufficient because web requests race the controller.
+Register an admitted opening as in flight before hardware I/O, so the other
+path sees it as occupied. Serialize admission transactions only; do not impose
+new lifetime exclusivity on unrelated legacy single-valve Fixed runs.
 A database/network outage cannot remove an already-issued hardware timer, but
 exactly-once physical watering cannot be promised after an ambiguous response.
 
@@ -319,10 +343,15 @@ exactly-once physical watering cannot be promised after an ambiguous response.
   window overlapping another automatic rule there; check edits, copies, and
   schedule activation. Do not reject unrelated overlaps between two existing
   single-valve Fixed rules. Existing group configuration conflicts block launch.
-- An active/manual run prevents group progression. Before a single-valve
-  automatic start, check for group claims, in-flight opens, running pulses, or
-  unconfirmed closures and skip/report conflicts. This narrow guard is needed
-  because existing automatic starts occur before the controller's stop stage.
+- A conflicting run/claim at a scheduled group's start produces a skipped
+  occurrence, with no delayed automatic launch. Fixed group Run now rejects a
+  conflict at submission; if one arises before controller admission, terminate
+  the request visibly rather than retaining it for an unexpected later start.
+  A conflict detected within an executing group interrupts its remaining work.
+  Before a single-valve automatic start, use the same atomic admission mechanism
+  to check group claims, in-flight opens, running pulses, and unconfirmed closures
+  and skip/report conflicts. This guard is needed because existing automatic
+  starts occur before the controller's stop stage.
 - Keep reservations until closure is confirmed, even past the calendar end.
   Keep attempting existing recovery/closure while group progression is stopped.
 - Closing any member of an active group cancels its remaining pulses and asks
@@ -450,6 +479,9 @@ Required regression coverage:
 - Midnight attribution, daily-start boundaries, DST gaps/folds/23/25-hour days,
   incomplete rain, future timestamps, unknown provenance, sparse/stale temperature,
   API outage/recovery, and refresh throttling. Reject non-finite/invalid inputs.
+- Complete rainfall backfill for a seven-day coverage window and after increasing
+  coverage, even when newer observations already exist; repair missing/untrusted
+  interior hours without unthrottled decision-time requests.
 - Rate snapshots survive calibration edits. Known delivery never includes a
   delayed controller bookkeeping interval; uncertain delivery is visibly distinct
   and is not silently zeroed. Uncalibrated legacy history stays unknown.
@@ -460,6 +492,13 @@ Required regression coverage:
   stale cached state, cancellation during opening, disabled devices/rules,
   deadline exhaustion, midnight rejection, active reservation overruns, and site
   isolation. Planner errors leave existing stops/watchdog operational.
+- A manual pulse crossing the Smart decision cutoff causes a recorded skip,
+  not a deferred launch with stale credit; a pulse finishing before admission
+  within the scheduled minute is credited through its end. Race group admission
+  against manual and single-valve Fixed starts in both orders on SQLite and
+  Postgres; only compatible admissions reach hardware. Recover attempted
+  PLANNED/FAILED rows with stale closed caches and subsequently disabled devices
+  without replay.
 - Group/single-rule conversion and copy/load preserve intended ownership/order;
   deletion preserves history. Conflict guards work in both directions while
   unrelated existing single-valve behavior remains unchanged.
