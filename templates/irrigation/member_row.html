@@ -18,7 +18,6 @@
             <div class="input-group">{{ member.duration_seconds }}<button type="button" class="btn btn-outline-secondary use-default" hidden>Use valve default</button></div>
             <div id="{{ member.duration_seconds.auto_id }}_errors" class="invalid-feedback d-block">{{ member.duration_seconds.errors }}</div>
             <div id="{{ member.duration_seconds.auto_id }}_help" class="form-text duration-help">{% if editor_mode == 'SMART' %}1–3276 seconds. Blank uses the valve default at Save.{% else %}Enter 60–3276 seconds.{% endif %}</div>
-            <div class="form-text duration-description"></div>
           </div>
           {% if member.ORDER.errors %}<div id="{{ member.ORDER.auto_id }}_errors" class="col-12 invalid-feedback d-block">{{ member.ORDER.errors }}</div>{% endif %}
         </div>
@@ -32,7 +31,6 @@
           <label class="delete-control small">{{ member.DELETE }} Remove this row</label>
         </div>
       </div>
-      <div class="col-12 smart-metrics small text-secondary" {% if editor_mode != 'SMART' %}hidden{% endif %}></div>
     </div>
   </div>
 </div>

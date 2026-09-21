@@ -567,14 +567,10 @@ def _edit_rule(request, rule=None, copying=False):
                     if isinstance(exc, ValidationError) else str(exc)
                 )
                 form.add_error(None, error)
-    curve = get_curve_settings(site)
     context = {"form": form, "members_formset": members_formset,
                "editor_errors": _editor_errors(form, members_formset) if data is not None else [],
                "submitted": data is not None,
                "editor_mode": editor_mode,
-               "peak_window_mm": curve.coverage_days * curve.max_mm,
-               "coverage_days": curve.coverage_days,
-               "peak_daily_mm": curve.max_mm,
                "rule": None if copying else rule, "is_group": is_group,
                "editing_existing": bool(rule and not copying),
                "missing_rate_valves": [

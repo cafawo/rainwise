@@ -136,13 +136,14 @@ ordered valves. Omit the general mode description beside the selector.
   screens. Preview is for Smart; Fixed retains Run now. Stop and Delete must
   remain distinguishable actions.
 - Keep short mode-specific help beside each valve. Fixed shows its runtime.
-  Smart shows the valve rate, per-run limit and peak watering time for the
-  selected coverage window. Omit the general Smart rate/break explanations and
-  peak-demand/coverage summary below the valves. Do not show two editable
-  maxima in the rule editor or label Fixed's runtime as a maximum.
+  Smart shows the valve rate and run-time input. Omit the per-valve peak/run-limit
+  summary, the duration/default summary, and the general Smart rate/break and
+  peak-demand/coverage paragraphs below the valves. Keep validation and invalid
+  default warnings beside the relevant input. Do not show two editable maxima
+  in the rule editor or label Fixed's runtime as a maximum.
 - Use seconds internally and keep supported precision. Display human-readable
-  durations alongside inputs and in summaries; do not introduce ambiguous
-  duration parsing or silently round existing values.
+  durations in summaries; do not introduce ambiguous duration parsing or
+  silently round existing values.
 
 ### Failed saves must explain what to fix
 

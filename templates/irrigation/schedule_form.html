@@ -69,7 +69,6 @@
   {% endif %}
 </div>
 <template id="emptyMember">{% include "irrigation/member_row.html" with member=members_formset.empty_form %}</template>
-{{ peak_window_mm|json_script:"peakWindow" }}
 {% endblock %}
 {% block scripts %}
 <script>
@@ -77,22 +76,16 @@
   const form = document.getElementById("editorForm");
   const mode = document.getElementById("id_mode");
   const container = document.getElementById("memberRows");
-  const peak = JSON.parse(document.getElementById("peakWindow").textContent);
   let daysEdited = form.dataset.submitted === "true" || form.dataset.existing === "true";
   const rows = () => Array.from(container.querySelectorAll(".member-row"));
   const field = (row, name) => document.getElementById(`id_${row.dataset.prefix}-${name}`);
   const syncOrder = () => rows().forEach((row, index) => field(row, "ORDER").value = index + 1);
-  const readable = value => {
-    if (!Number.isFinite(value) || value < 0) return "N/A";
-    const hours = Math.floor(value / 3600), minutes = Math.floor(value % 3600 / 60), seconds = value % 60;
-    return [hours ? `${hours}h` : "", minutes ? `${minutes}m` : "", seconds || (!hours && !minutes) ? `${seconds}s` : ""].filter(Boolean).join(" ");
-  };
   function refresh() {
     syncOrder();
     const smart = mode.value === "SMART";
     const active = rows().filter(row => !field(row, "DELETE").checked);
     rows().forEach(row => {
-      const select = field(row, "valve"), input = field(row, "duration_seconds");
+      const select = field(row, "valve");
       const deleted = field(row, "DELETE").checked;
       for (const option of select.options) {
         const unavailable = smart && option.dataset.smartAllowed === "false";
@@ -102,8 +95,6 @@
       const option = select.selectedOptions[0];
       const fallback = Number(option?.dataset.defaultSeconds);
       const rate = Number(option?.dataset.rate);
-      const validDuration = input.value.trim() !== "" && /^\d+$/.test(input.value.trim());
-      const seconds = validDuration ? Number(input.value) : (smart && input.value.trim() === "" ? fallback : NaN);
       row.querySelector(".member-fields").hidden = deleted;
       row.querySelector(".removed-message").hidden = !deleted;
       row.querySelector(".member-heading").textContent = deleted ? "Removed valve row" : `Valve ${active.indexOf(row) + 1}`;
@@ -111,18 +102,15 @@
       row.querySelector(".move-up").disabled = deleted || active.indexOf(row) === 0;
       row.querySelector(".move-down").disabled = deleted || active.indexOf(row) === active.length - 1;
       row.querySelector(".duration-label").textContent = smart ? "Run time before a break (seconds)" : "Runtime (seconds)";
-      row.querySelector(".duration-help").textContent = smart ? "1–3276 seconds. Blank uses the valve default at Save." : "Enter 60–3276 seconds.";
       const defaultWarning = select.value && (fallback < (smart ? 1 : 60) || fallback > 3276) ? ` This valve default is outside ${smart ? "1" : "60"}–3276 seconds; enter a valid value.` : "";
-      row.querySelector(".duration-description").textContent = `Duration: ${readable(seconds)} · Valve default: ${readable(fallback)}.${defaultWarning}`;
+      row.querySelector(".duration-help").textContent = (smart
+        ? "1–3276 seconds. Blank uses the valve default at Save."
+        : "Enter 60–3276 seconds.") + defaultWarning;
       row.querySelector(".use-default").disabled = !select.value;
       const invalidRate = smart && select.value && option.dataset.smartAllowed === "false";
       row.querySelector(".client-rate-error").hidden = !invalidRate;
       row.querySelector(".client-rate-error").classList.toggle("d-block", Boolean(invalidRate));
       row.querySelector(".rate-help").textContent = smart && select.value ? `Watering rate: ${rate > 0 ? `${rate} mm/hour` : "N/A — skipped in Smart"}` : "";
-      const metrics = row.querySelector(".smart-metrics");
-      metrics.hidden = !smart || deleted;
-      const peakSeconds = rate > 0 ? Math.floor(peak * 3600 / rate) : NaN;
-      metrics.textContent = `Peak watering for the coverage window: ${readable(peakSeconds)}. Run limit: ${readable(seconds)}. Breaks and scheduling allowance add elapsed time.`;
     });
   }
   function setup(row, isNew = false) {
