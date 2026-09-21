@@ -122,6 +122,10 @@ ordered valves. Omit the general mode description beside the selector.
   hidden order synchronized with visible rows after add/remove/undo/reorder and
   submission, so validation and saving preserve the order shown to the user.
 - Present enabled state, weekdays, start time and optional name/note compactly.
+  Align Mode, Start time and Name / note in one desktop row, with narrower
+  columns for Mode and Start time. Put Enabled beside the card heading and
+  weekdays on a compact second row. Stack fields on small screens and show
+  the local-time hint inline with the Start time label.
   Smart initially selects all seven weekdays; both modes require at least one.
 - Only the site's active schedule executes automatically. Reject duplicate
   members and valves from another site. A valve may belong to at most one
@@ -131,10 +135,11 @@ ordered valves. Omit the general mode description beside the selector.
 - Keep Save, Cancel and the available rule actions in one row, wrapping on small
   screens. Preview is for Smart; Fixed retains Run now. Stop and Delete must
   remain distinguishable actions.
-- Use short mode-specific help. Fixed shows its runtime. Smart shows the valve
-  rate, per-run limit, peak watering time for the selected coverage window,
-  and the meaning of automatic breaks. Do not show two editable maxima in the
-  rule editor or label Fixed's runtime as a maximum.
+- Keep short mode-specific help beside each valve. Fixed shows its runtime.
+  Smart shows the valve rate, per-run limit and peak watering time for the
+  selected coverage window. Omit the general Smart rate/break explanations and
+  peak-demand/coverage summary below the valves. Do not show two editable
+  maxima in the rule editor or label Fixed's runtime as a maximum.
 - Use seconds internally and keep supported precision. Display human-readable
   durations alongside inputs and in summaries; do not introduce ambiguous
   duration parsing or silently round existing values.
