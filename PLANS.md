@@ -2,6 +2,431 @@
 
 Build an MVP Django webapp named **rainwise** to monitor and schedule an irrigation system controlled by a Waveshare Modbus TCP Ethernet relay module (8-channel). Runs locally on macOS for development and is deployable to TrueNAS SCALE via Docker. MVP prioritizes simplicity, safety, and low resource usage.
 
+## Smart rules: next major update (2026-09-21)
+
+**Status: design proposal; application code is unchanged.** The user confirmed
+the finite rolling-window calculation and handovers on the normal controller
+tick. The coverage window uses whole days, default 2, matching the rule's daily
+start time. Hourly weather observations remain an internal calculation detail.
+Remaining recommendations below define the proposed first release.
+The older MVP sections describe the existing foundation, including limitations
+that this feature deliberately extends.
+
+### Non-regression contract
+
+The existing system has months of successful operation. Smart rules are an
+opt-in addition; preserving established valve control takes precedence over
+optimization or completing a watering target.
+
+- Keep FIXED and DYNAMIC rule behavior, manual pulse durations, polarity,
+  Modbus framing/retries, watchdog behavior, and hardware-timed closures intact.
+  Do not convert existing rules or replace random DYNAMIC behavior with SMART.
+  The narrow compatibility exception is conflict prevention while a smart
+  reservation is active, as defined below; sites without smart work retain
+  their existing execution behavior.
+- Every smart opening uses the existing `services.open_valve_for()` with a
+  positive integer duration, a recorded planned stop, and a bounded maximum.
+  Never introduce a latched opening or issue an extra controller opening to
+  extend an active pulse to meet demand. Existing driver retries are unchanged.
+- Smart planning and execution belong in a separate service module, called by
+  the single controller. Web pages configure, preview, and request cancellation;
+  they never execute smart sequences or perform direct hardware I/O.
+- A smart-planner error must not prevent existing run stops or watchdog work.
+  Run the smart hook after the existing stop/watchdog stages, with a separate
+  exception boundary. No network weather request belongs in smart calculation.
+- Use additive migrations, existing Django/database facilities, and no new
+  queue, worker, Redis, Celery, or high-frequency polling.
+- No controller or hardware command is run as part of this planning task.
+
+### Behavior and settings
+
+A smart rule belongs to a schedule and has a name, enabled flag, site-local
+start time, selected weekdays, and an ordered list of valves. All seven weekdays
+are selected initially. Deselected weekdays prohibit that rule from running;
+they still count as ordinary days in the balance window. Only the active
+schedule executes. A valve may occur only once in a rule and in at most one
+enabled smart rule in that schedule.
+
+Grouping specifies execution order. Each valve has its own water credit and
+runtime; the water target is not divided by the number of valves. This assumes
+distinct irrigation zones. Overlapping zones require a separate allocation
+design and are outside the first release.
+
+| Setting | Location and proposed behavior |
+| --- | --- |
+| Existing `min_mm`, `max_mm`, `g`, `m` | Keep in `CurveSettings`; retain the current temperature curve. Validate finite values, `0 <= min_mm <= max_mm`, and positive `g`. |
+| Coverage window (days) | Add `coverage_days` to `CurveSettings`; default 2, supported integers 1–7. This is a product scope limit, not a scientific soil-storage limit. |
+| Fallback temperature (°C) | Add to `CurveSettings`; require an explicit finite value before enabling smart rules. Do not silently invent a universal fallback. |
+| Application rate (mm/hour) | Add to `Valve`; optional for existing usage, finite and positive when used by a smart rule. Require measured calibration; no arbitrary default. |
+| Maximum duration per run | Store per smart-rule valve membership. Require an explicit value no greater than both the valve's configured maximum and the relay maximum. |
+| Maximum smart runs per valve per local day | Fixed at 2 logical controller attempts; display read-only on the curve/rule screens. Include uncertain outcomes; changing/copying schedules does not reset the allowance. Existing driver retries are part of one attempt. |
+
+The existing `Valve.default_max_duration_seconds` is currently the manual
+default, not a global limit on legacy scheduled rules. Applying it as an
+additional ceiling is specific to smart rules; do not retroactively alter
+FIXED/DYNAMIC schedules.
+
+Keep settings where they belong: site-wide water policy on `CurveSettings`,
+physical application rate on `Valve`, and per-rule runtime/order on membership.
+The curve screen can show all relevant limits without duplicating their storage.
+Do not add another daily-mm maximum, an irrigation interval, a hot-day threshold,
+or an independently editable total daily runtime.
+
+### Water calculation
+
+Use the existing last-24-hour 90th-percentile temperature as a demand proxy,
+with the validity checks below. The curve still returns **daily consumption**
+in mm/day. The confirmed policy applies today's estimate to the whole coverage
+window, rather than summing historical daily curve values.
+
+For valve `v`, local date `d`, daily decision time `t`, and coverage days `L`:
+
+```text
+daily_need = curve(selected_temperature_at_t)
+target_mm[v] = max(0, L * daily_need - recent_rain_mm - irrigation_credit_mm[v])
+
+run_cap_seconds[v] <= min(valve.default_max_duration_seconds, 3276)
+daily_capacity_mm[v] = 2 * run_cap_seconds[v] * application_rate_mm_h[v] / 3600
+planned_mm[v] = min(target_mm[v], daily_capacity_mm[v])
+planned_seconds[v] = floor(planned_mm[v] / application_rate_mm_h[v] * 3600)
+```
+
+Precise window definitions:
+
+- Rain credit covers `L` complete local-day periods ending at the last completed
+  provider hourly boundary at or before `t`. Subtract `L` local dates from that
+  boundary for the start. For a 06:30 decision with whole-hour local data, count
+  through 06:00 and leave the final half hour for the next decision. Do not
+  invent partial-hour rainfall or report this expected lag as missing data.
+  Respect the provider's preceding-hour accumulation convention; credit `L`
+  rain periods, not only `L - 1`. Record the actual rain cutoff in the snapshot.
+- Irrigation credit includes the preceding `L - 1` local calendar dates plus
+  any delivery earlier on today's date, before the decision cutoff. Count all
+  calibrated irrigation for that valve, including manual and legacy rules.
+  Intersect delivery intervals with the window, including midnight crossings.
+- `L = 1` therefore means one day's demand less the last daily rain period and
+  today's earlier irrigation; yesterday's irrigation is not carried forward.
+- Construct local-date boundaries in the site's IANA timezone, convert them to
+  UTC for queries, and test 23/25-hour days. Rain and irrigation use these
+  intentionally different windows: this is a batching heuristic, not a physical
+  soil-water balance over one identical interval. The setting remains whole
+  calendar days across daylight-saving changes, not fixed multiples of 24 hours.
+- Snapshot the calculation once for the scheduled occurrence. Rain arriving
+  afterward affects the next day's decision; there is no continuous replanning
+  or forecast-based rain credit in this release.
+- At initial activation, use trustworthy history if present. Otherwise the
+  recorded credit is zero, with an explicit incomplete-history warning in the
+  preview. The first day can request the full window target, within the caps.
+
+For the default two-day window, Wednesday's decision credits Tuesday's
+irrigation and anything delivered earlier on Wednesday. Monday's irrigation
+has expired from that credit window, even if it started just after 06:00.
+This preserves the intended alternating-day behavior without a sliding hourly
+boundary through an older run. The curve still uses one recent p90 temperature.
+
+This **finite rolling target** deliberately forgets old deficits and surpluses.
+It does not promise repayment of all missed water after an outage, long dry
+period, or excluded weekdays. It also does not guarantee alternating days when
+temperature, rainfall, or available capacity changes.
+
+The existing `max_mm` limits estimated daily consumption. An application serving
+multiple days may exceed `max_mm` today, without introducing another mm ceiling.
+Each of the two logical attempts has a bounded commanded duration. Existing
+driver retries can repeat a command after a lost response, so this is not a
+guarantee of exactly two physical relay activations or precisely twice the cap
+in delivered runtime. Round down to whole seconds; skip a zero-second result,
+rather than imposing a new minimum watering dose. No separate remainder is
+accumulated; later days recompute from credited delivery.
+
+### Worked examples and capacity warnings
+
+Assume two identical valves, 12 mm/hour each, a 15-minute per-run maximum,
+`L = 2`, no rain, and no earlier watering. Each pulse delivers an estimated
+3 mm, so each valve can deliver at most 6 mm per day.
+
+| Daily curve requirement | Per-valve daily delivery sequence | Interpretation |
+| --- | --- | --- |
+| 2 mm | 4, 0, 4, 0 mm | Each watering day covers two days. |
+| 4 mm | 6, 2, 6, 2 mm | The requested hot-day large/small pattern. |
+| 7 mm | 6, 6, 6, 6 mm | Capacity cannot meet even one day's need. |
+
+In the 4 mm case, day one is `A:3, B:3, A:3, B:3`; day two is `A:2, B:2`.
+If 3 mm of rain is credited on a day with 2 mm daily demand and zero irrigation
+credit, that day's target is `max(0, 4 - 3) = 1 mm` per valve. Sufficient rain
+reduces the target to zero. If demand rises from 2 to 4 mm after a 4 mm watering
+day, the next target is `8 - 4 = 4 mm`, before rain.
+
+This resolves a possible inconsistency in the original example: a large/small
+pattern requires capacity greater than one day's need but less than the full
+window target. If daily need itself exceeds capacity, every day hits the cap.
+
+Show two distinct capacity diagnostics without blocking valid configurations:
+
+- `daily_capacity_mm < max_mm`: cannot sustain peak daily demand even with
+  watering every day; report likely under-irrigation.
+- `daily_capacity_mm < L * max_mm`: cannot cover the full window at peak demand
+  in one day; additional watering on the following day is expected.
+
+Also report the current occurrence's unmet target when runtime/window limits
+prevent delivery. Never raise a safety maximum automatically to erase a deficit.
+
+### Weather failure and provenance
+
+An API failure must not disable temperature-based smart decisions, but missing
+weather must remain visible.
+
+- Use only elapsed hourly values, never future timestamps. The current curve
+  query has no upper bound, and the existing importer can store today's future
+  hours from the forecast API; both need focused correction before activation.
+- Give imported rows retrieval provenance (`retrieved_at`, nullable for legacy
+  rows), and import only elapsed hours going forward. Smart weather must have
+  been fetched at or after its valid time. Refresh legacy/previously forecast
+  rows before trusting them; do not relabel predictions as measured rainfall.
+- Proposed temperature quality rule: at least 18 finite hourly values in the
+  preceding 24 hours, with the newest valid hour no older than the existing
+  weather refresh interval. These are explicit engineering thresholds, not
+  agronomic parameters. If the checks fail, use the configured fallback.
+- Fix refresh freshness to use successful import time and retry throttling,
+  rather than the maximum stored observation timestamp. Future or sparse rows
+  must not suppress refresh. Keep existing short timeout/retry policies and
+  controller-owned periodic import; smart calculation uses cached data only.
+- Sum known nonnegative precipitation for elapsed intervals. Missing rain
+  contributes no credit and raises a separate warning; this is an explicit
+  continuity policy that can overwater during an outage, not a claim of no rain.
+- Display: “Operating with fallback temperature X °C”, why it was selected,
+  and the latest valid weather time. Show incomplete rainfall/history warnings
+  separately. Clear the current fallback warning when valid data returns, while
+  preserving each past decision's source and assumptions in its log.
+- Use the same temperature selection helper on the curve preview and in smart
+  decisions, so the curve marker and the calculated target agree.
+
+The provider supplies weather-model estimates, not a rain gauge at this lawn.
+Label precipitation and delivered irrigation as estimates. Full precipitation
+credit is a simple approximation; runoff, snow, and drainage mean it need not
+equal water available to roots. Cold-season irrigation and soil/ET modelling
+are outside this release. The provider defines precipitation as the preceding
+hour's total, including snow. [Open-Meteo API documentation](https://open-meteo.com/en/docs)
+
+### Execution, history, and restart behavior
+
+Use a separate `SmartRule` model and an ordered `SmartRuleValve` membership
+model. This avoids making the tested single-valve `ScheduleRule` fields nullable
+or overloading existing FIXED/DYNAMIC semantics.
+
+Add a `SmartOccurrence` for each rule/local-date decision, including zero-water
+decisions, with a database uniqueness constraint on `(rule, local_date)`.
+Store the scheduled UTC instant, decision inputs, resulting targets, reserved
+end time, and outcome. Keep a compact immutable calculation snapshot for audit.
+
+Represent each planned pulse with the existing `IrrigationRun`, adding optional
+smart occurrence, pass/order, attempt timestamp, and application-rate snapshot
+fields. Use a distinct SMART trigger and a uniqueness constraint on
+`(smart_occurrence, valve, pass)` for smart rows. Existing rows remain valid.
+No second execution-log or general-purpose queue system is needed.
+
+1. At the scheduled local minute, create the occurrence and its ordered pulses
+   in a transaction. Skip fulfilled valves. Split each valve's target into at
+   most two pulses: pass one in valve order, then pass two in the same order.
+2. Before each pulse, check the occurrence is active, the rule/schedule/device
+   is enabled, limits are still valid, the daily allowance remains available,
+   and the pulse fits before the reservation deadline. A reduced limit cancels
+   an incompatible pending pulse; it never lengthens or increases a plan.
+3. Claim and record the attempt before calling `open_valve_for()`. Count attempts
+   across all smart occurrences for that valve/local date, including copied or
+   switched schedules. Preserve the single-controller assumption; do not rely
+   solely on an in-memory counter or an `exists()` check for occurrence identity.
+4. Let the existing bounded-pulse stop/watchdog path finish the run. Confirm the
+   prior valve is closed with a fresh service-layer read before starting another
+   valve. Reuse a successful read from this iteration when available; cached
+   `last_polled_at` is not proof of freshness because it updates only on changes.
+5. A failed/ambiguous open or an unconfirmed close interrupts the occurrence and
+   cancels pending pulses. Never start the next valve merely because the prior
+   run is marked FINISHED: existing completion deliberately tolerates a failed
+   redundant close once the hardware timer should have expired.
+6. On controller restart, reconcile existing smart pulses through the current
+   close/watchdog facilities and cancel unfinished occurrences for that day.
+   Never replay an attempted pulse whose hardware outcome is uncertain. Resume
+   normal planning on the next eligible date; do not backfill missed dates.
+
+This conservative restart policy trades possible under-watering for avoiding
+duplicate actuation. A database failure cannot remove the relay's independent
+pulse deadline; successful command delivery and exactly-once physical watering
+cannot be guaranteed across network failures and crashes.
+
+For water credit, snapshot calibrated rates on new runs, including manual and
+legacy runs for calibrated valves. Estimate delivery using the commanded pulse
+duration, shortened by a known early stop; never count the delay until the
+controller finally recorded `actual_stop_at` as extra watering. Rate edits must
+not rewrite historical delivery. Legacy rows without a rate snapshot remain
+unknown rather than acquiring invented historical accuracy.
+
+An uncertain command outcome is not zero delivered water. Credit the full
+commanded dose conservatively during the lookback, with an uncertainty warning,
+rather than automatically replacing it with another pulse. Where the attempt
+start/end are known, include that command/retry interval in the conservative
+possible-delivery estimate. A crash with no recorded attempt end retains the
+nominal dose and explicitly unknown additional delivery. This accounting choice
+is not a proven physical upper bound or measured flow; existing retries can
+restart the relay timer without changing the recorded nominal pulse duration.
+
+### Scheduling, cancellation, and calendar reservations
+
+For the first release, reserve smart sequences serially within a site. Reject
+new/edited smart windows that overlap another automatic rule at the site;
+apply the same smart-window check when editing or activating a schedule. Do not
+retroactively reject unrelated overlaps between two existing legacy rules.
+At runtime, a conflicting active/manual run prevents smart progression and
+produces a visible skip/interruption rather than parallel watering.
+Add a narrow check before legacy automatic starts too: while a smart opening
+is claimed/in flight, running, or awaiting closure confirmation, skip and report
+conflicting automatic starts. A calendar end or FINISHED log alone must not
+release that reservation. Existing stop/watchdog processing continues. This
+guard is necessary because legacy automatic starts currently precede stops and
+the new smart hook in the controller loop.
+
+Manual close must remain effective. Closing a member of an active smart group
+also cancels the occurrence's remaining pulses; the controller closes any other
+active pulse in that occurrence through the existing service. Provide a clear
+“Stop smart run” action. Manual open and legacy “Run now” must check an active
+smart reservation before issuing a pulse and ask the user to stop that smart
+run first. Outside an active smart reservation, existing manual behavior stays
+the same. Persist cancellation and treat a claimed/in-flight opening as an
+active reservation. After the hardware call returns, immediately recheck
+cancellation and close through the existing service if cancellation arrived
+during the call. Show “Stopping” until the controller acknowledges cancellation
+and confirms closure; a web close alone cannot defeat an in-flight later open.
+Use atomic database state transitions that work on SQLite and Postgres, not
+`select_for_update()` alone. Test both possible orderings of start/cancel and
+do not hold a transaction open across hardware I/O.
+
+Disabling/deleting a smart rule or changing the active schedule cancels its
+pending work and requests closure of its active pulse. Preserve occurrence/run
+audit history when editing or deleting configuration.
+
+For differing per-valve limits, maximum watering time is:
+
+```text
+water_time = 2 * sum(per_valve_run_cap_seconds)
+```
+
+The original `valve_count * common_max * 2` is its equal-limit special case.
+Normal controller handovers also consume wall-clock time. Reserve and display
+`water_time + 2 * valve_count * controller_interval_seconds` as the initial
+window, showing watering time and handover allowance separately. This derived
+allowance introduces no new user setting. Slow hardware/network operations can
+exhaust it: use the end as a launch/progression deadline and skip pulses whose
+nominal duration plus the configured command/retry allowance cannot fit.
+Calculate fit using a fresh clock reading immediately before sending, not the
+controller loop's earlier timestamp. Network timing prevents this from being
+an exact physical stop guarantee: retain the active reservation and block
+conflicting starts until closure is confirmed, even beyond the displayed end.
+Revalidate before starting if cadence changed.
+
+Reject smart windows crossing local midnight in the first release, so weekday
+selection and the two-runs-per-date limit remain straightforward. A repeated
+DST start time has one occurrence per local date; a nonexistent local start
+time is skipped and reported. No catch-up batch is started outside its due
+minute. Tests must cover both DST transitions and controller delays.
+
+**Cadence discrepancy to resolve explicitly during implementation:** current
+code, README, and `.env.example` use 30 seconds; `AGENTS.md` requires a 60-second
+default. Align defaults/documentation with 60 seconds, preserve explicit
+deployment overrides, and regression-test 30 and 60 seconds. An existing
+deployment that currently omits the setting also inherits a changed default;
+document that it must pin both controller/poll intervals to 30 before upgrading
+if unchanged cadence is required. Do not add faster polling for smart handovers.
+
+### Research and scope boundaries
+
+- German LWG guidance puts established-lawn consumption around 2–3 mm/day at
+  20–25 °C daily maximum and 4–7 mm/day at 30–35 °C, with less frequent deeper
+  applications. This supports the current curve's rough scale, but not its
+  exact sigmoid, p90 input, or a universal two-day schedule.
+  [LWG: Basiswissen Rasenbau](https://www.lwg.bayern.de/mam/cms06/landespflege/dateien/basiswissen_rasenbau.pdf)
+- Application rates and soil conditions vary substantially. Measure each zone
+  with catch containers; a simple calibration is average collected depth in mm
+  divided by run time in hours. There is no defensible universal per-run minute
+  cap. Set membership caps from site observations and retain both hardware and
+  valve ceilings. [CSU: Methods to Schedule Home Lawn Irrigation](https://extension.colostate.edu/resource/methods-to-schedule-home-lawn-irrigation/)
+- Rotating zones provides a break, but one-valve groups, skipped valves, and
+  short pulses may give almost no soak time. The proposed first release does
+  not guarantee runoff prevention and adds no soak-delay parameter. If a site
+  needs a guaranteed absorption period, a separately designed minimum soak
+  setting and longer calendar reservation are necessary before using smart
+  control there. Two runs is the requested operating cap, not an agronomic
+  optimum. [CSU: Watering Efficiently](https://extension.colostate.edu/resource/watering-efficiently/)
+- Effective rainfall differs from total precipitation because some water is
+  lost before roots can use it. Keep the approximation visible and avoid an
+  uncalibrated efficiency multiplier. [FAO: Rainfall and Evapotranspiration](https://www.fao.org/4/r4082e/r4082e05.htm)
+- The existing Waveshare duration limit is grounded in the device's
+  `0x7FFF * 100 ms` pulse range, yielding 3276 whole seconds. This is a hardware
+  ceiling, not a recommended irrigation duration.
+  [Waveshare relay protocol](https://www.waveshare.com/wiki/Modbus_POE_ETH_Relay)
+
+### Implementation sequence and acceptance gates
+
+1. **Protect the baseline.** Retain all existing tests, document the compatibility
+   contract, resolve the cadence documentation/default discrepancy explicitly,
+   and add regression coverage for smart exceptions leaving stops/watchdog
+   operational. Do not refactor the Modbus driver as part of this feature.
+2. **Add configuration and pure calculation.** Add models/migrations, calibrated
+   rate snapshots, shared curve/fallback selection, corrected weather provenance
+   and freshness, and deterministic balance/capacity helpers. Smart rules remain
+   disabled until their required configuration is valid.
+3. **Build a reviewable preview.** Extend the curve screen with units, parameter
+   explanations, fallback state, capacity checks, calibration guidance, and the
+   worked examples. Add smart rule CRUD, ordered members, all-days defaults,
+   calendar reservations, and a preview of expected doses/pulse order. Copy/load
+   schedules must include smart rules and validate conflicts. This stage has no
+   smart actuation.
+4. **Integrate bounded execution.** Add durable occurrences/claims, the isolated
+   controller hook, fresh closure confirmation, cancellation/conflict handling,
+   global per-valve daily attempt accounting, and restart interruption. Record
+   zero-demand, capacity-limited, fallback, uncertain, and skipped decisions.
+5. **Verify before deployment.** Run the full Django suite and deterministic
+   multi-day simulations. Update README and curve-page documentation with the
+   final behavior, setup/calibration, persistence, fallback trade-offs, and
+   recovery policy. Synchronize `.env.example` if defaults change; no new
+   environment variables or dependencies are planned. Review simulator results
+   before a separately arranged bounded hardware commissioning run.
+
+Required focused tests cover:
+
+- Alternate-day and large/small examples; sustained insufficient capacity;
+  rainfall-only skipping; temperature changes; `L = 1`, `L = 2`, and longer
+  supported windows; reject fractional-day settings; local-date windows across
+  DST; irrigation just after the daily start time; excluded days; first
+  activation and credit expiry; different valve rates.
+- Invalid/missing calibration and fallback; NaN/infinite/negative inputs;
+  temperature coverage/staleness; future weather; incomplete rain; API outage
+  and recovery; import freshness; DST and precipitation interval boundaries.
+- Valve order across two passes, partial second pulses, fulfilled-valve skipping,
+  caps at all three levels, zero duration, and no third attempt after duplicate
+  ticks, errors, copies, active-schedule changes, or restarts.
+- Failures before/after command delivery and DB writes, no uncertain replay,
+  fresh closed-state confirmation, manual cancellation/start races, disabled
+  devices/rules, deadline exhaustion, midnight restrictions, and site isolation.
+- Estimated delivery bounded by pulse/early stop, midnight attribution, unknown
+  historical rates, and unchanged credit after calibration edits.
+- Existing fixed/dynamic/manual behavior, active-high/low protocol frames,
+  forbidden unbounded opening, weather/UI behavior, schedule copy/load, and
+  SQLite-compatible constraints; verify the new migrations on Postgres too.
+
+Planning validation (2026-09-21): all **43 existing irrigation/weather tests
+pass** in the `rainwise` Conda environment, using Django's temporary test DB
+and mocked hardware/network access:
+
+```sh
+env POSTGRES_HOST='' SQLITE_PATH='' RELAY_SIMULATOR=false \
+  conda run -n rainwise python manage.py test apps.irrigation apps.weather --verbosity 1
+```
+
+An initial run with an explicit SQLite path made the existing default-SQLite
+warning test fail because that test expects the fallback configuration; the
+command above restores that intended test configuration. No application change
+was needed. The suite also emits the existing missing-`staticfiles` warning.
+These automated tests establish a regression baseline, not hardware validation.
+
 ## Deployment prep (2026-03-06)
 
 - Add a `.dockerignore` to keep images small and avoid copying dev data into images.
