@@ -942,6 +942,30 @@ class GroupExecutionTests(TestCase):
             "pass_number", flat=True,
         )), [1, 2, 3, 4])
 
+    def test_45_minute_override_keeps_two_hour_target_and_required_rests(self):
+        rule = self.smart_rule(need=7, durations=(2700,))
+        Valve.objects.filter(pk=self.valves[0].pk).update(
+            application_rate_mm_h=7, default_max_duration_seconds=600,
+        )
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        snapshot = occurrence.config
+        self.finish_occurrence(occurrence)
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "FINISHED")
+        self.assertEqual(occurrence.config, snapshot)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 2700), mock.call(self.valves[0], 2700),
+            mock.call(self.valves[0], 1800),
+        ])
+        runs = list(occurrence.runs.order_by("pass_number"))
+        for previous, following in zip(runs, runs[1:]):
+            self.assertGreaterEqual(
+                following.actual_start_at - previous.closure_confirmed_at,
+                dt.timedelta(seconds=previous.optimal_duration_seconds),
+            )
+        self.assertEqual(rule.members.get().duration_seconds, 2700)
+
     def test_short_intervening_valve_counts_only_its_elapsed_time_toward_break(self):
         rule = self.smart_rule(need=7, durations=(1800, 300))
         Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=14)

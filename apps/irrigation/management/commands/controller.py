@@ -170,28 +170,42 @@ class Command(BaseCommand):
                 logger.warning("Scheduled start skipped/failed for rule %s: %s", rule.pk, exc)
 
     def _tick(self, now: dt.datetime) -> None:
-        # Planning/weather failures cannot prevent stops or watchdog work.
-        # Groups run after the existing stops.
-        try:
-            self._start_due_runs(now)
-        except Exception:
-            logger.exception("Single-valve planning failed")
+        # All safety work finishes before this single process admits an opening.
+        # A database error blocks dispatch for this tick, not emergency closures.
+        safety_ready = True
+        reconciled = False
         recently_closed = set()
+        fresh_closed = set()
         try:
             recently_closed = self._stop_running_runs(now)
         except Exception:
+            safety_ready = False
             logger.exception("Stopping runs failed")
-        try:
-            self._watchdog_close(now, recently_closed)
-        except Exception:
-            logger.exception("Watchdog failed")
         try:
             if getattr(self, "_recovery_pending", False):
                 group_services.recover_groups()
                 self._recovery_pending = False
-            group_services.group_tick()
+            else:
+                fresh_closed = group_services.reconcile_attempts()
+            reconciled = True
         except Exception:
-            logger.exception("Group planning/execution failed")
+            safety_ready = False
+            logger.exception("Closure reconciliation failed")
+        try:
+            self._watchdog_close(now, recently_closed, reconciled=reconciled)
+        except Exception:
+            safety_ready = False
+            logger.exception("Watchdog failed")
+        if safety_ready:
+            try:
+                group_services.dispatch_manual_requests()
+                self._start_due_runs(now)
+            except Exception:
+                logger.exception("Single-valve planning failed")
+            try:
+                group_services.group_tick(fresh_closed=fresh_closed)
+            except Exception:
+                logger.exception("Group planning/execution failed")
         try:
             self._refresh_weather(now)
         except Exception:
@@ -201,6 +215,8 @@ class Command(BaseCommand):
         runs = IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
         recently_closed: set[int] = set()
         for run in runs.select_related("valve"):
+            if group_services._legacy_unresolved().filter(pk=run.pk).exists():
+                continue
             if not run.actual_start_at:
                 continue
 
@@ -255,7 +271,9 @@ class Command(BaseCommand):
         run.save(update_fields=update_fields)
         return True
 
-    def _watchdog_close(self, now: dt.datetime, recently_closed: set[int]) -> None:
+    def _watchdog_close(
+        self, now: dt.datetime, recently_closed: set[int], *, reconciled=False,
+    ) -> None:
         running = {
             run.valve_id: run
             for run in IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
@@ -266,32 +284,27 @@ class Command(BaseCommand):
             if valve.id in recently_closed:
                 continue
             run = running.get(valve.id)
-            if run and run.actual_start_at:
+            if (run and run.actual_start_at and not run.cancellation_requested
+                    and not run.delivery_uncertain):
                 max_stop = run.actual_start_at + dt.timedelta(
                     seconds=run.max_duration_seconds
                 )
                 if now < max_stop:
                     continue
 
-            opening = IrrigationRun.objects.filter(
-                valve=valve, status="PLANNED", attempt_started_at__isnull=False,
-                attempt_finished_at=None,
-                dispatch_state__in=("UNSENT", "SENDING", "LEGACY"),
-            ).first()
-            if opening:
-                age = (now - opening.attempt_started_at).total_seconds()
-                allowance = (
-                    group_services.command_allowance()
-                    + group_services.controller_interval()
-                )
-                if not opening.cancellation_requested and 0 <= age <= allowance:
-                    # The committed attempt explains the open relay even while
-                    # the sender awaits acknowledgement. Do not fabricate an
-                    # early watchdog closure and later claim full delivery.
-                    continue
-                IrrigationRun.objects.filter(pk=opening.pk).update(
-                    cancellation_requested=True, delivery_uncertain=True,
-                )
+            if group_services._legacy_unresolved(valve.relay_device.site).exists():
+                # Old web processes must be stopped before hardware ownership
+                # can be transferred. Ordinary ticks never acknowledge them.
+                continue
+
+            if reconciled and (group_services._pending_closures(valve.relay_device.site).filter(
+                valve=valve,
+            ).exists() or group_services._unresolved_runs().filter(
+                valve=valve,
+            ).exclude(dispatch_state="QUEUED").exists()):
+                # This tick's reconciliation already handles known unfinished
+                # work, including failed closes. Watchdog handles orphan opens.
+                continue
 
             recent_failsafe = IrrigationRun.objects.filter(
                 valve=valve,
@@ -305,11 +318,12 @@ class Command(BaseCommand):
                 continue
 
             try:
-                try:
-                    if opening:
-                        group_services.mark_sender_interrupted([opening.pk])
-                finally:
-                    services.close_valve(valve)
+                services.close_valve(valve)
+                if services.read_valve_state(valve):
+                    raise RuntimeError("Watchdog closure not confirmed")
+                Valve.objects.filter(pk=valve.pk).update(
+                    last_known_is_open=False, last_polled_at=now,
+                )
                 status = IrrigationRun.STATUS_FINISHED
                 stop_reason = IrrigationRun.STOP_FAILSAFE
                 error_message = ""
@@ -327,6 +341,8 @@ class Command(BaseCommand):
                 optimal_duration_seconds=None,
                 max_duration_seconds=valve.default_max_duration_seconds,
                 actual_stop_at=now,
+                attempt_started_at=now,
+                closure_confirmed_at=now if status == "FINISHED" else None,
                 status=status,
                 stop_reason=stop_reason,
                 error_message=error_message,

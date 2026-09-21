@@ -9,6 +9,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
+from apps.irrigation import group_services
 from apps.irrigation.models import (
     CurveSettings,
     IrrigationRun,
@@ -157,9 +158,10 @@ class DashboardViewTests(TestCase):
             response = self.client.post(reverse("valve_open", args=[self.valve.id]))
 
         self.assertEqual(response.status_code, 302)
-        open_valve_for.assert_called_once_with(self.valve, 123)
+        open_valve_for.assert_not_called()
         run = IrrigationRun.objects.get()
-        self.assertEqual(run.status, IrrigationRun.STATUS_RUNNING)
+        self.assertEqual(run.status, IrrigationRun.STATUS_PLANNED)
+        self.assertEqual(run.dispatch_state, "QUEUED")
         self.assertEqual(run.max_duration_seconds, 123)
 
     def test_manual_close_still_closes_running_valve_early(self) -> None:
@@ -179,7 +181,14 @@ class DashboardViewTests(TestCase):
             response = self.client.post(reverse("valve_close", args=[self.valve.id]))
 
         self.assertEqual(response.status_code, 302)
-        close_valve.assert_called_once_with(self.valve)
+        close_valve.assert_not_called()
+        run.refresh_from_db()
+        self.assertTrue(run.cancellation_requested)
+        with (
+            mock.patch("apps.irrigation.services.close_valve"),
+            mock.patch("apps.irrigation.services.read_valve_state", return_value=False),
+        ):
+            group_services.reconcile_attempts()
         run.refresh_from_db()
         self.assertEqual(run.status, IrrigationRun.STATUS_FINISHED)
         self.assertEqual(run.stop_reason, IrrigationRun.STOP_MANUAL)

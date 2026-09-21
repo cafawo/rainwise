@@ -7,6 +7,7 @@ from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone
 
 from apps.irrigation.curves import (
     DEFAULT_G,
@@ -419,17 +420,31 @@ class RuleOccurrence(models.Model):
         return f"{self.get_mode_display()} {self.requested_at} ({self.status})"
 
 
+class ValveClosure(models.Model):
+    """Coalesced close intent, including valves with no watering record."""
+
+    valve = models.OneToOneField(
+        Valve, on_delete=models.CASCADE, related_name="closure_request",
+    )
+    requested_at = models.DateTimeField(default=timezone.now)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    error_message = models.TextField(blank=True)
+
+
 class IrrigationRun(models.Model):
+    # Historical evidence only: retained for pre-controller-command records.
     sender_interrupted = models.BooleanField(default=False, editable=False)
     dispatch_state = models.CharField(
         max_length=8,
         choices=[
             ("LEGACY", "Legacy"),
-            ("UNSENT", "Awaiting sender"),
-            ("SENDING", "Opening in flight"),
-            ("DONE", "Sender acknowledged"),
+            ("UNSENT", "Legacy unsent"),
+            ("SENDING", "Legacy sender in flight"),
+            ("QUEUED", "Queued"),
+            ("OPENING", "Controller opening"),
+            ("DONE", "Dispatch complete"),
         ],
-        default="LEGACY",
+        default="DONE",
         editable=False,
     )
     TRIGGER_SCHEDULED = "SCHEDULED"

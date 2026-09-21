@@ -152,6 +152,53 @@ def _occurrence_cards(site, limit=30):
     return occurrences
 
 
+def _valve_feedback(valves):
+    valves = list(valves.select_related("closure_request"))
+    latest_run = IrrigationRun.objects.filter(
+        valve_id=models.OuterRef("pk"),
+    ).order_by("-pk").values("pk")[:1]
+    latest_ids = Valve.objects.filter(pk__in=[v.pk for v in valves]).annotate(
+        latest_run=models.Subquery(latest_run),
+    ).values("latest_run")
+    runs = {run.valve_id: run for run in IrrigationRun.objects.filter(pk__in=latest_ids)}
+    legacy_ids = set(group_services._legacy_unresolved().filter(
+        valve_id__in=[v.pk for v in valves],
+    ).values_list("valve_id", flat=True))
+    for valve in valves:
+        run = runs.get(valve.pk)
+        closure = getattr(valve, "closure_request", None)
+        valve.action_status = "—"
+        valve.action_error = (
+            run.error_message if run and (
+                run.status == "FAILED" or run.delivery_uncertain
+                or run.closure_confirmed_at is None
+            ) else ""
+        )
+        if valve.pk in legacy_ids:
+            valve.action_status = "Stopping"
+            valve.action_error = (
+                "Legacy sender unresolved. Stop old web/controller processes and run "
+                "reconcile_openings --senders-stopped before starting watering."
+            )
+        elif closure and closure.confirmed_at is None:
+            valve.action_status = "Stopping"
+            valve.action_error = closure.error_message or valve.action_error
+        elif run:
+            if run.cancellation_requested and run.closure_confirmed_at is None:
+                valve.action_status = "Stopping"
+            elif run.dispatch_state == "QUEUED":
+                valve.action_status = "Queued"
+            elif run.dispatch_state == "OPENING":
+                valve.action_status = "Opening requested"
+            elif run.status == "RUNNING":
+                valve.action_status = "Running"
+            elif run.attempt_started_at and run.closure_confirmed_at is None:
+                valve.action_status = "Stopping"
+            elif run.status == "FAILED":
+                valve.action_status = "Failed"
+    return valves
+
+
 @login_required
 def dashboard(request: HttpRequest) -> HttpResponse:
     site = _get_active_site(request)
@@ -162,23 +209,12 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         if site
         else Valve.objects.none()
     )
-    running_runs = (
-        IrrigationRun.objects.filter(
-            status=IrrigationRun.STATUS_RUNNING,
-            valve__relay_device__site=site,
-        )
-        .select_related("valve")
-        .order_by("-actual_start_at")
-        if site
-        else IrrigationRun.objects.none()
-    )
-    running_valve_ids = [run.valve_id for run in running_runs]
     return render(
         request,
         "irrigation/dashboard.html",
         {
-            "valves": valves,
-            "running_valve_ids": running_valve_ids,
+            "valves": _valve_feedback(valves),
+            "controller_interval_seconds": group_services.controller_interval(),
             "show_default_sqlite_warning": _using_default_sqlite(),
             "occurrences": _occurrence_cards(site, limit=10),
             **_smart_status(site),
@@ -298,12 +334,12 @@ def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
     site = _get_active_site(request)
     valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
     try:
-        group_services.start_single(
-            valve, valve.default_max_duration_seconds, IrrigationRun.TRIGGER_MANUAL
+        group_services.request_single(
+            valve, valve.default_max_duration_seconds
         )
-        messages.success(request, "Valve opened.")
+        messages.success(request, "Opening requested; queued for the next controller tick.")
     except Exception as exc:
-        messages.error(request, f"Failed to open valve: {exc}")
+        messages.error(request, f"Opening request failed: {exc}")
     return redirect("dashboard")
 
 
@@ -316,7 +352,7 @@ def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
         group_services.close_member(valve)
         messages.success(request, "Closure requested. Any active rule is stopping.")
     except Exception as exc:
-        messages.error(request, f"Failed to close valve: {exc}")
+        messages.error(request, f"Closure request failed: {exc}")
     return redirect("dashboard")
 
 
@@ -1102,7 +1138,7 @@ def valve_status(request: HttpRequest) -> JsonResponse:
         )
     }
     payload = []
-    for valve in valves:
+    for valve in _valve_feedback(valves):
         payload.append(
             {
                 "id": valve.id,
@@ -1112,6 +1148,8 @@ def valve_status(request: HttpRequest) -> JsonResponse:
                 if valve.last_polled_at
                 else None,
                 "is_running": valve.id in running,
+                "action_status": valve.action_status,
+                "action_error": valve.action_error,
             }
         )
     return JsonResponse(payload, safe=False)
@@ -1126,11 +1164,11 @@ def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
     try:
         if normalize_rule_mode(rule.mode) != ScheduleRule.MODE_FIXED:
             raise ValidationError("Unsupported rule mode; no valve was opened.")
-        group_services.start_single(
-            rule.valve, rule.max_duration_seconds, IrrigationRun.TRIGGER_MANUAL,
+        group_services.request_single(
+            rule.valve, rule.max_duration_seconds,
             rule=rule,
         )
-        messages.success(request, "Run started.")
+        messages.success(request, "Run requested; queued for the next controller tick.")
     except Exception as exc:
         messages.error(request, f"Failed to start run: {exc}")
     return redirect("schedule")

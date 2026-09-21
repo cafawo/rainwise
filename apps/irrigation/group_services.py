@@ -14,22 +14,19 @@ from zoneinfo import ZoneInfo
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Case, F, Q, TextField, Value, When
+from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.irrigation import services
 from apps.irrigation.models import (
     GroupedRule, GroupedRuleValve, IrrigationRun,
-    RuleOccurrence, ScheduleRule, Site, Valve, get_curve_settings,
+    RuleOccurrence, ScheduleRule, Site, Valve, ValveClosure, get_curve_settings,
     normalize_rule_mode,
 )
 
 logger = logging.getLogger(__name__)
 RESERVED_STATUSES = ("PENDING", "ACTIVE", "STOPPING")
 MISSING_RATE_SKIP = "Skipped in Smart: enter a valid watering rate for this valve."
-SENDER_INTERRUPTED = (
-    "Closure attempted while opening awaited acknowledgement; physical delivery is uncertain."
-)
 SENDER_CANCELLED = (
     "Opening cancelled before acknowledgement; physical delivery is uncertain."
 )
@@ -234,19 +231,22 @@ def _reservations(site, exclude=None):
     return query.exclude(pk=exclude.pk) if exclude else query
 
 
-def _unresolved_runs(site):
-    return IrrigationRun.objects.filter(valve__relay_device__site=site).filter(
+def _unresolved_runs(site=None):
+    runs = IrrigationRun.objects.filter(
         Q(status="RUNNING") |
-        Q(dispatch_state="SENDING") |
+        Q(dispatch_state__in=("QUEUED", "OPENING", "UNSENT", "SENDING")) |
+        Q(cancellation_requested=True, closure_confirmed_at=None) |
         Q(attempt_started_at__isnull=False, closure_confirmed_at__isnull=True)
     )
+    return runs.filter(valve__relay_device__site=site) if site else runs
 
 
 def _group_conflict(site, occurrence=None):
     runs = _unresolved_runs(site)
     if occurrence:
         runs = runs.exclude(occurrence=occurrence)
-    return (_reservations(site, occurrence).exists() or runs.exists()
+    return (_legacy_unresolved(site).exists() or _pending_closures(site).exists()
+            or _reservations(site, occurrence).exists() or runs.exists()
             or Valve.objects.filter(relay_device__site=site,
                                     last_known_is_open=True).exclude(
                 pk__in=IrrigationRun.objects.filter(
@@ -281,7 +281,11 @@ def cancel_occurrence(occurrence, reason="Stopped by user"):
             )
             IrrigationRun.objects.filter(
                 occurrence=occurrence, status="PLANNED", attempt_started_at=None,
-            ).update(status="FAILED", stop_reason="MANUAL_STOP", error_message=reason)
+            ).update(
+                status="FAILED", stop_reason="MANUAL_STOP", error_message=reason,
+                closure_confirmed_at=timezone.now(), dispatch_state="DONE",
+                delivery_uncertain=False,
+            )
 
 
 def cancel_rule(rule, reason="Rule disabled or deleted"):
@@ -294,39 +298,52 @@ def cancel_site_groups(site, reason="Active schedule changed"):
         cancel_occurrence(occurrence, reason)
 
 
-def mark_sender_interrupted(run_ids):
-    """Record a close racing transmission before its eventual acknowledgement."""
-    IrrigationRun.objects.filter(
-        pk__in=run_ids, dispatch_state="SENDING", sender_interrupted=False,
-    ).update(
-        sender_interrupted=True, delivery_uncertain=True,
-        error_message=SENDER_INTERRUPTED,
+def _pending_closures(site):
+    return ValveClosure.objects.filter(
+        valve__relay_device__site=site, confirmed_at=None,
     )
 
 
-def _confirmed_closed(run, *, close=False):
-    """Read afresh, preserving the first safe closure used for Smart rests."""
-    run.refresh_from_db()
-    sender_outstanding = run.dispatch_state == "SENDING"
+def _legacy_unresolved(site=None):
+    runs = IrrigationRun.objects.filter(
+        dispatch_state__in=("LEGACY", "UNSENT", "SENDING"),
+    ).filter(
+        Q(status__in=("PLANNED", "RUNNING"))
+        | Q(dispatch_state__in=("UNSENT", "SENDING"))
+        | Q(attempt_started_at__isnull=False, closure_confirmed_at=None)
+    )
+    return runs.filter(valve__relay_device__site=site) if site else runs
+
+
+def _closure_error(valve, *, close=True):
+    """Controller only: a fresh closed read can resolve a lost close response."""
+    error = ""
     if close:
         try:
-            try:
-                mark_sender_interrupted([run.pk])
-            finally:
-                services.close_valve(run.valve)
+            services.close_valve(valve)
         except Exception as exc:
-            # A timed pulse can already have expired even if this redundant
-            # command fails. Only a fresh closed-state read can resolve it.
-            logger.warning("Recovery close failed for run %s: %s", run.pk, exc)
+            error = f"Closure command failed: {exc}"
     try:
-        if services.read_valve_state(run.valve):
-            return False
+        if services.read_valve_state(valve):
+            error = error or "Valve remains open; closure will be retried."
+        else:
+            error = ""
     except Exception as exc:
-        logger.warning("Closure not confirmed for run %s: %s", run.pk, exc)
+        error = f"Closure not confirmed: {exc}"
+    return error
+
+
+def _confirmed_closed(run, *, close=False):
+    """Controller only: confirm closure after its preceding hardware work."""
+    run.refresh_from_db()
+    if _legacy_unresolved().filter(pk=run.pk).exists():
         return False
-    # A surviving web process may not have transmitted yet. Its acknowledgement
-    # is the barrier: a closed read before that barrier cannot release ownership.
-    if sender_outstanding:
+    error = _closure_error(run.valve, close=close)
+    if error:
+        run.error_message = error
+        IrrigationRun.objects.filter(pk=run.pk).exclude(error_message=error).update(
+            error_message=error,
+        )
         return False
     now = timezone.now()
     updates = {}
@@ -335,26 +352,22 @@ def _confirmed_closed(run, *, close=False):
     if run.status in ("RUNNING", "PLANNED"):
         updates.update(status="FINISHED", actual_stop_at=now,
                        stop_reason="MANUAL_STOP" if close else "COMPLETED")
-    if updates and not IrrigationRun.objects.filter(pk=run.pk).exclude(
-        dispatch_state="SENDING"
-    ).update(**updates):
-        return False
-    Valve.objects.filter(pk=run.valve_id, last_known_is_open=True).update(
-        last_known_is_open=False, last_polled_at=now
-    )
+    # Publish completion and the cached physical state together. A failed write
+    # leaves the run unresolved; the next tick can only close/read it again.
+    with transaction.atomic():
+        if updates:
+            IrrigationRun.objects.filter(pk=run.pk).update(**updates)
+        Valve.objects.filter(pk=run.valve_id).filter(
+            Q(last_known_is_open=True) | Q(last_polled_at=None)
+        ).update(last_known_is_open=False, last_polled_at=now)
     return True
 
 
 def _recover_returned_command(run, finished_at, error_message, *, started_at=None):
-    """Try once to acknowledge a returned command, closing even if writes fail.
+    """Controller cleanup: close even when result storage is unavailable.
 
-    Unlike a vanished sender, this process knows it will not transmit again.
-    Uncertain delivery is retained after failure or cancellation during dispatch.
-    If acknowledgement fails, recovery must keep the original claim.
+    An unresolved OPENING is recovered on the next tick or restart, never replayed.
     """
-    # Keep the SENDING barrier until this sender's final hardware write returns.
-    # A controller may otherwise confirm closure and admit a newer run before
-    # this emergency close, which would then incorrectly close the newer run.
     closed_at = None
     try:
         services.close_valve(run.valve)
@@ -397,7 +410,7 @@ def _send_claimed(run):
     with site_admission(admission_site):
         run.refresh_from_db()
         occurrence = run.occurrence
-        if run.dispatch_state != "UNSENT":
+        if run.dispatch_state != "QUEUED":
             return run
         if (occurrence and occurrence.mode == "SMART"
                 and not run.valve.has_valid_application_rate):
@@ -415,9 +428,23 @@ def _send_claimed(run):
         if (run.cancellation_requested
                 or (occurrence and occurrence.cancellation_requested)):
             reason = "Cancelled before command"
-        elif (run.attempt_started_at is None or now > run.attempt_started_at
-              + dt.timedelta(seconds=command_allowance() + controller_interval())):
+        elif now > (run.attempt_started_at or run.requested_start_at) + dt.timedelta(
+            seconds=command_allowance() + controller_interval()
+        ):
             reason = "Opening dispatch window expired before command"
+        elif (_pending_closures(admission_site).exists()
+              or _legacy_unresolved(admission_site).exists()):
+            reason = "Closure or legacy reconciliation pending; opening cancelled"
+        elif not occurrence and (
+            _reservations(admission_site).exists()
+            or _unresolved_runs(admission_site).exclude(pk=run.pk).filter(
+                Q(valve=run.valve) | ~Q(
+                    status="RUNNING", cancellation_requested=False,
+                    delivery_uncertain=False,
+                )
+            ).exists()
+        ):
+            reason = "Conflicting watering or unconfirmed closure; opening cancelled"
         elif not run.valve.relay_device.enabled:
             reason = "Relay disabled before command"
         elif occurrence:
@@ -452,14 +479,16 @@ def _send_claimed(run):
             run.refresh_from_db()
             return run
         claimed = IrrigationRun.objects.filter(
-            pk=run.pk, status="PLANNED", dispatch_state="UNSENT",
+            pk=run.pk, status="PLANNED", dispatch_state="QUEUED",
             cancellation_requested=False,
-        ).update(dispatch_state="SENDING", closure_confirmed_at=None)
+        ).update(
+            dispatch_state="OPENING", attempt_started_at=now,
+            delivery_uncertain=True, closure_confirmed_at=None,
+        )
         if not claimed:
             run.refresh_from_db()
             return run
-    # Use the actual sending time, after admission database work. Recovery keeps
-    # the SENDING claim until this call acknowledges, even if the process pauses.
+    # A durable OPENING marks the non-replay boundary before network I/O.
     now = timezone.now()
     if occurrence and now + dt.timedelta(
         seconds=run.optimal_duration_seconds + command_allowance()
@@ -487,15 +516,8 @@ def _send_claimed(run):
         ).update(
             status="RUNNING", actual_start_at=now, attempt_finished_at=finished,
             # A successful retry may have restarted the hardware timer.
-            delivery_uncertain=Case(
-                When(sender_interrupted=True, then=True),
-                default=retried,
-            ),
-            error_message=Case(
-                When(sender_interrupted=True, then=Value(SENDER_INTERRUPTED)),
-                default=Value(SENDER_RETRIED) if retried else F("error_message"),
-                output_field=TextField(),
-            ),
+            delivery_uncertain=retried,
+            error_message=SENDER_RETRIED if retried else "",
             dispatch_state="DONE",
             closure_confirmed_at=None,
         )
@@ -505,20 +527,29 @@ def _send_claimed(run):
         )
         raise
     if not acknowledged:
-        # Cancellation won the atomic acknowledgement race. This sender still
-        # owns SENDING, so finish its last hardware write before publishing DONE.
+        # A web cancellation arrived during dispatch. Complete closure before
+        # this controller can perform any other opening.
         _recover_returned_command(
             run, finished, SENDER_CANCELLED, started_at=now,
         )
-    # The acknowledged pulse is durably owned by the controller. A subsequent
-    # read failure must not close it (or a newer run after this request pauses).
     run.refresh_from_db()
     if occurrence:
         occurrence.refresh_from_db()
     return run
 
 
+def request_single(valve, duration, rule=None):
+    """HTTP service: persist intent only; controller dispatches on its next tick."""
+    return _admit_single(valve, duration, "MANUAL", rule=rule, queued=True)
+
+
 def start_single(valve, duration, trigger, planned_start_at=None, rule=None):
+    """Controller only: admit and dispatch a bounded single-valve pulse."""
+    run = _admit_single(valve, duration, trigger, planned_start_at, rule)
+    return _send_claimed(run) if run.dispatch_state == "QUEUED" else run
+
+
+def _admit_single(valve, duration, trigger, planned_start_at=None, rule=None, *, queued=False):
     services._duration_to_flash_ticks(duration)
     site = valve.relay_device.site
     with site_admission(site):
@@ -560,12 +591,26 @@ def start_single(valve, duration, trigger, planned_start_at=None, rule=None):
             ).first()
             if existing:
                 return existing
+        if queued:
+            existing = IrrigationRun.objects.filter(
+                valve=valve, occurrence=None, trigger="MANUAL",
+                dispatch_state="QUEUED", cancellation_requested=False,
+                optimal_duration_seconds=duration,
+            ).first()
+            if existing:
+                return existing
         conflict = None
-        if _reservations(site).exists():
+        if _legacy_unresolved(site).exists():
+            conflict = "Legacy sender unresolved: stop old processes and run reconcile_openings --senders-stopped."
+        elif _pending_closures(site).exists():
+            conflict = "Closure requested; wait for controller confirmation before opening."
+        elif _reservations(site).exists():
             conflict = "Stop the active group and wait for closure before starting another valve."
         elif _unresolved_runs(site).filter(valve=valve).exists():
             conflict = "Valve is already running or awaiting confirmed closure."
-        elif _unresolved_runs(site).exclude(status="RUNNING").exists():
+        elif _unresolved_runs(site).exclude(
+            status="RUNNING", cancellation_requested=False, delivery_uncertain=False,
+        ).exists():
             # Unrelated legacy running pulses retain their original coexistence.
             conflict = "An opening or uncertain closure is awaiting recovery."
         if conflict:
@@ -584,35 +629,71 @@ def start_single(valve, duration, trigger, planned_start_at=None, rule=None):
             valve=valve, trigger=trigger, requested_start_at=now,
             planned_start_at=planned_start_at, status="PLANNED",
             optimal_duration_seconds=duration, max_duration_seconds=duration,
-            application_rate_mm_h=rate, attempt_started_at=now,
-            delivery_uncertain=True, dispatch_state="UNSENT",
+            application_rate_mm_h=rate,
+            attempt_started_at=None if queued else now,
+            delivery_uncertain=False, dispatch_state="QUEUED",
         )
-    return _send_claimed(run)
+    return run
 
 
 def close_member(valve):
+    """HTTP service: persist cancellation and orphan-safe closure intent."""
     site = valve.relay_device.site
     with site_admission(site):
+        valve.refresh_from_db()
+        if valve.relay_device.site_id != site.pk:
+            raise ValidationError("Valve ownership changed before cancellation.")
         for occurrence in _reservations(site):
             if any(m["valve_id"] == valve.pk for m in occurrence.config.get("members", [])):
                 cancel_occurrence(occurrence)
-        runs = list(_unresolved_runs(site).filter(valve=valve))
-        IrrigationRun.objects.filter(pk__in=[r.pk for r in runs]).update(
-            cancellation_requested=True
-        )
-    try:
-        mark_sender_interrupted([run.pk for run in runs])
-    finally:
-        services.close_valve(valve)
-    now = timezone.now()
-    # An in-flight opener must acknowledge cancellation after its call returns.
-    for run in runs:
-        if run.attempt_started_at and not run.attempt_finished_at:
+        _unresolved_runs(site).filter(valve=valve).update(cancellation_requested=True)
+        request, _ = ValveClosure.objects.get_or_create(valve=valve)
+        if request.confirmed_at is not None:
+            request.requested_at = timezone.now()
+            request.confirmed_at = None
+            request.error_message = ""
+            request.save(update_fields=["requested_at", "confirmed_at", "error_message"])
+    return request
+
+
+def process_closures(observed_closures):
+    """Controller only: close/read, then durably acknowledge a coalesced Close."""
+    for request in ValveClosure.objects.filter(confirmed_at=None).select_related(
+        "valve__relay_device",
+    ).order_by("pk"):
+        valve = request.valve
+        if _legacy_unresolved(valve.relay_device.site).exists():
+            error = "Legacy sender unresolved; stop old processes and run reconcile_openings --senders-stopped."
+        elif valve.pk in observed_closures:
+            # The same controller already closed/read this valve in this safety
+            # phase, with no intervening opening. Reuse that physical result.
+            error = observed_closures[valve.pk]
+        else:
+            error = _closure_error(valve)
+        if error:
+            ValveClosure.objects.filter(pk=request.pk).exclude(error_message=error).update(
+                error_message=error,
+            )
             continue
-        IrrigationRun.objects.filter(pk=run.pk).update(
-            status="FINISHED", actual_stop_at=now, stop_reason="MANUAL_STOP",
-            attempt_started_at=run.attempt_started_at or run.actual_start_at,
-        )
+        with site_admission(valve.relay_device.site):
+            now = timezone.now()
+            ValveClosure.objects.filter(pk=request.pk).update(
+                confirmed_at=now, error_message="",
+            )
+            Valve.objects.filter(pk=valve.pk).filter(
+                Q(last_known_is_open=True) | Q(last_polled_at=None)
+            ).update(last_known_is_open=False, last_polled_at=now)
+
+
+def dispatch_manual_requests():
+    """Controller only; a crashed HTTP request needs no acknowledgement."""
+    for run in IrrigationRun.objects.filter(
+        occurrence=None, dispatch_state="QUEUED", status="PLANNED",
+    ).order_by("pk"):
+        try:
+            _send_claimed(run)
+        except Exception:
+            logger.exception("Manual opening failed for run %s", run.pk)
 
 
 def _snapshot(rule, members, *, include_reservation=True, available_seconds=None):
@@ -1032,7 +1113,7 @@ def _progress(occurrence, fresh_closed):
                 cancellation_requested=False,
             ).update(
                 attempt_started_at=now, delivery_uncertain=True,
-                dispatch_state="UNSENT",
+                dispatch_state="QUEUED",
             )
             if not claimed:
                 return
@@ -1043,106 +1124,93 @@ def _progress(occurrence, fresh_closed):
 
 
 def recover_groups():
-    """Called once on controller startup; attempts are never replayed."""
+    """Startup cancels stale requests; attempted openings are never replayed."""
     for occurrence in RuleOccurrence.objects.filter(status__in=RESERVED_STATUSES):
         cancel_occurrence(occurrence, "Controller restarted; unfinished sequence cancelled")
-    # Single-valve attempted PLANNED/FAILED rows also need explicit recovery.
     reconcile_attempts(restarting=True)
 
 
 def reconcile_attempts(restarting=False, *, senders_stopped=False):
-    """Reconcile outcomes without releasing a surviving sender's ownership.
-
-    Time bounds request cancellation and closure; they never prove that a web
-    sender cannot subsequently transmit. Only its acknowledgement, or an
-    operator's explicit confirmation that senders have stopped, resolves that.
-    """
+    """Controller only; legacy web senders require explicit offline recovery."""
+    if senders_stopped:
+        # Offline maintenance also stops acknowledged bounded runs; ordinary
+        # controller startup keeps their original stop times instead.
+        IrrigationRun.objects.filter(status="RUNNING").update(
+            cancellation_requested=True,
+        )
+        _legacy_unresolved().filter(dispatch_state="UNSENT").update(
+            dispatch_state="DONE", status="FAILED", cancellation_requested=True,
+            attempt_started_at=None, attempt_finished_at=None,
+            delivery_uncertain=False, closure_confirmed_at=timezone.now(),
+            stop_reason="MANUAL_STOP", error_message="Legacy unsent opening cancelled",
+        )
+        # Preserve all timing, calibration and historical evidence. No old row
+        # becomes a queued controller opening, regardless of its trigger.
+        _legacy_unresolved().update(
+            dispatch_state="DONE", cancellation_requested=True,
+            delivery_uncertain=True, closure_confirmed_at=None,
+        )
     fresh_closed = set()
+    observed_closures = {}
     query = IrrigationRun.objects.filter(
-        Q(attempt_started_at__isnull=False, closure_confirmed_at__isnull=True)
-        | Q(dispatch_state="SENDING")
-    ).select_related("valve__relay_device", "occurrence")
+        Q(attempt_started_at__isnull=False, closure_confirmed_at=None)
+        | Q(dispatch_state__in=("QUEUED", "OPENING"))
+        | Q(status="RUNNING")
+        | Q(cancellation_requested=True, closure_confirmed_at=None)
+    ).select_related("valve__relay_device", "occurrence").order_by("pk")
     for run in query:
+        if _legacy_unresolved().filter(pk=run.pk).exists():
+            continue
         now = timezone.now()
         stopping = run.cancellation_requested or (
             run.occurrence and run.occurrence.status == "STOPPING"
         )
-        bounded_until = (
-            run.attempt_started_at + dt.timedelta(
-                seconds=command_allowance() + controller_interval()
-            ) if run.attempt_started_at else now
-        )
-        expired = now > bounded_until
-        if run.dispatch_state == "UNSENT":
-            if not (restarting or stopping or expired or senders_stopped):
-                continue
-            with site_admission(run.valve.relay_device.site):
-                revoked = IrrigationRun.objects.filter(
-                    pk=run.pk, dispatch_state="UNSENT",
-                ).update(
+        if run.dispatch_state == "QUEUED":
+            queued_at = run.attempt_started_at or run.requested_start_at
+            expired = queued_at is None or now > queued_at + dt.timedelta(
+                seconds=command_allowance() + controller_interval(),
+            )
+            if restarting or stopping or expired or senders_stopped:
+                IrrigationRun.objects.filter(pk=run.pk, dispatch_state="QUEUED").update(
                     dispatch_state="DONE", cancellation_requested=True,
                     status="FAILED", stop_reason="MANUAL_STOP",
-                    error_message="Opening cancelled before sender dispatch",
-                    attempt_started_at=None, attempt_finished_at=now,
+                    error_message=("Controller restarted; queued opening cancelled"
+                                   if restarting else "Queued opening cancelled or expired"),
+                    attempt_started_at=None, attempt_finished_at=None,
                     delivery_uncertain=False, closure_confirmed_at=now,
                 )
-            if revoked:
-                if run.occurrence:
-                    cancel_occurrence(run.occurrence, "Unsent opening cancelled")
-                continue
-            run.refresh_from_db()
-        if run.dispatch_state == "SENDING":
-            controller_sender = run.occurrence_id is not None or run.trigger == "SCHEDULED"
-            orphaned = senders_stopped or (restarting and controller_sender)
-            if not (restarting or stopping or expired or orphaned):
-                continue
-            if (orphaned or not run.cancellation_requested
-                    or run.closure_confirmed_at is not None):
-                with site_admission(run.valve.relay_device.site):
-                    updates = {
-                        "cancellation_requested": True,
-                        "closure_confirmed_at": None,
-                    }
-                    if orphaned:
-                        # No invented attempt end: extra delivery stays unknown.
-                        updates.update(
-                            dispatch_state="DONE", delivery_uncertain=True,
-                        )
-                    IrrigationRun.objects.filter(
-                        pk=run.pk, dispatch_state="SENDING",
-                    ).update(**updates)
-            run.refresh_from_db()
+            continue
+        if run.dispatch_state == "OPENING":
+            # No other live controller exists. An attempt seen here returned
+            # without a durable result, or belongs to the previous process.
+            IrrigationRun.objects.filter(pk=run.pk).update(
+                dispatch_state="DONE", status="FAILED", stop_reason="ERROR",
+                cancellation_requested=True, delivery_uncertain=True,
+                error_message="Opening result unknown; recovering closure without replay",
+                closure_confirmed_at=None,
+            )
             stopping = True
-            if run.dispatch_state == "SENDING":
-                _confirmed_closed(run, close=True)
-                continue
         if run.status == "RUNNING" and not stopping:
-            if restarting and run.occurrence_id:
-                # Startup cancellation should already cover every group.
-                stopping = True
             stop_at = run.actual_start_at + dt.timedelta(
                 seconds=run.optimal_duration_seconds or run.max_duration_seconds
             ) if run.actual_start_at else None
-            if not stopping and (stop_at is None or timezone.now() < stop_at):
+            if stop_at and now < stop_at:
                 continue
-        # Legacy claims lack the new dispatch barrier. Deployment must stop old
-        # web senders as well as the controller before upgrading that protocol.
-        if (run.attempt_finished_at is None and run.actual_start_at is None
-                and not restarting and not senders_stopped):
-            if not run.occurrence:
-                if not expired:
-                    continue
-        needs_close = (restarting or stopping or run.delivery_uncertain
-                       or run.status in ("PLANNED", "FAILED"))
-        if _confirmed_closed(run, close=needs_close):
+        needs_close = (stopping or run.delivery_uncertain
+                       or run.status in ("PLANNED", "FAILED", "RUNNING"))
+        confirmed = _confirmed_closed(run, close=needs_close)
+        observed_closures[run.valve_id] = "" if confirmed else run.error_message
+        if confirmed:
             fresh_closed.add(run.pk)
         elif run.occurrence:
             cancel_occurrence(run.occurrence, "Closure unconfirmed; sequence interrupted")
+    process_closures(observed_closures)
     return fresh_closed
 
 
-def group_tick(now=None):
-    fresh_closed = reconcile_attempts()
+def group_tick(now=None, *, fresh_closed=None):
+    if fresh_closed is None:
+        fresh_closed = reconcile_attempts()
     for occurrence in RuleOccurrence.objects.filter(status__in=("ACTIVE", "STOPPING")):
         try:
             _progress(occurrence, fresh_closed)

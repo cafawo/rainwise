@@ -117,7 +117,7 @@ class ControllerScheduleTests(TestCase):
             now = timezone.now()
             command._tick(now)
         stop.assert_called_once_with(now)
-        watchdog.assert_called_once_with(now, {self.valve.pk})
+        watchdog.assert_called_once_with(now, {self.valve.pk}, reconciled=True)
         weather.assert_called_once_with(now)
 
     def test_fixed_run_stops_as_completed(self) -> None:

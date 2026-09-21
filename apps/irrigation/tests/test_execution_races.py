@@ -1,14 +1,13 @@
 import datetime as dt
 import io
-import threading
 from unittest import mock
 
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import DatabaseError, connections
+from django.db import DatabaseError
 from django.db.models.query import QuerySet
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase
 
 from apps.irrigation import group_services
 from apps.irrigation.balance import delivery_estimate
@@ -193,7 +192,7 @@ class ScheduledAdmissionTests(ExecutionFixtures, TestCase):
         run = IrrigationRun.objects.create(
             valve=self.valve, trigger="MANUAL", status="PLANNED",
             attempt_started_at=self.now - dt.timedelta(hours=1),
-            dispatch_state="UNSENT", optimal_duration_seconds=600,
+            dispatch_state="QUEUED", optimal_duration_seconds=600,
             max_duration_seconds=600, delivery_uncertain=True,
         )
         group_services._send_claimed(run)
@@ -235,7 +234,7 @@ class ScheduledAdmissionTests(ExecutionFixtures, TestCase):
             with self.assertRaisesMessage(RuntimeError, "Ambiguous hardware response"):
                 group_services.start_single(self.valve, 600, "MANUAL")
         run = IrrigationRun.objects.get()
-        self.assertEqual(run.dispatch_state, "SENDING")
+        self.assertEqual(run.dispatch_state, "OPENING")
         self.assertIsNone(run.attempt_finished_at)
         self.assertTrue(group_services._unresolved_runs(self.site).exists())
         self.close.assert_called_once_with(self.valve)
@@ -244,6 +243,7 @@ class ScheduledAdmissionTests(ExecutionFixtures, TestCase):
         run = group_services.start_single(self.valve, 600, "MANUAL")
         self.now += dt.timedelta(seconds=120)
         group_services.close_member(self.valve)
+        group_services.reconcile_attempts()
         run.refresh_from_db()
         self.assertFalse(run.sender_interrupted)
         self.assertFalse(run.delivery_uncertain)
@@ -345,7 +345,7 @@ class ScheduledAdmissionTests(ExecutionFixtures, TestCase):
             with self.assertRaisesMessage(DatabaseError, "Result storage unavailable"):
                 group_services.start_single(self.valve, 600, "MANUAL")
         run = IrrigationRun.objects.get()
-        self.assertEqual(run.dispatch_state, "SENDING")
+        self.assertEqual(run.dispatch_state, "OPENING")
         self.assertIsNone(run.closure_confirmed_at)
         self.assertTrue(group_services._unresolved_runs(self.site).exists())
         self.assertFalse(self.physical[self.valve.pk])
@@ -471,267 +471,3 @@ class ScheduledAdmissionTests(ExecutionFixtures, TestCase):
 
     def test_cancelled_opening_cannot_close_replacement_after_ack(self):
         self.assert_final_close_precedes_acknowledgement("cancelled")
-
-
-class SenderInterleavingTests(ExecutionFixtures, TransactionTestCase):
-    def start_sender(self, *, before_dispatch=False, physical_before_pause=False):
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.errors = []
-        sender = group_services._send_claimed
-
-        def pause():
-            self.entered.set()
-            if not self.release.wait(5):
-                raise AssertionError("Sender was not released by its test")
-
-        if before_dispatch:
-            def delayed_dispatch(run):
-                pause()
-                return sender(run)
-
-            patcher = mock.patch.object(
-                group_services, "_send_claimed", side_effect=delayed_dispatch,
-            )
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        else:
-            def delayed_hardware(valve, _duration):
-                if physical_before_pause:
-                    self.physical[valve.pk] = True
-                    Valve.objects.filter(pk=valve.pk).update(last_known_is_open=True)
-                pause()
-                if not physical_before_pause:
-                    self.physical[valve.pk] = True
-
-            self.open.side_effect = delayed_hardware
-
-        def work():
-            try:
-                group_services.start_single(self.valve, 600, "MANUAL")
-            except Exception as exc:
-                self.errors.append(exc)
-            finally:
-                connections.close_all()
-
-        thread = threading.Thread(target=work, daemon=True)
-        thread.start()
-        self.assertTrue(self.entered.wait(5))
-        self.addCleanup(self.release.set)
-        return thread
-
-    def finish_sender(self, thread):
-        self.release.set()
-        thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(self.errors, [])
-
-    def test_restart_cannot_release_manual_sender_before_late_open_acknowledges(self):
-        rule = self.grouped_rule()
-        thread = self.start_sender()
-        try:
-            group_services.recover_groups()
-            run = IrrigationRun.objects.get(valve=self.valve)
-            self.assertEqual(run.dispatch_state, "SENDING")
-            self.assertTrue(run.cancellation_requested)
-            self.assertIsNone(run.closure_confirmed_at)
-            self.read.assert_called_with(self.valve)
-            occurrence = group_services._plan_occurrence(rule, scheduled_at=self.now)
-            self.assertEqual(occurrence.status, "SKIPPED")
-            with self.assertRaises(ValidationError):
-                group_services.start_single(self.other, 60, "MANUAL")
-        finally:
-            self.finish_sender(thread)
-        run.refresh_from_db()
-        self.assertEqual(run.dispatch_state, "DONE")
-        self.assertEqual(run.status, "FINISHED")
-        self.assertIsNotNone(run.closure_confirmed_at)
-        self.assertFalse(self.physical[self.valve.pk])
-
-    def test_elapsed_time_never_releases_unacknowledged_manual_sender(self):
-        thread = self.start_sender()
-        try:
-            self.now += dt.timedelta(days=1)
-            group_services.reconcile_attempts()
-            run = IrrigationRun.objects.get(valve=self.valve)
-            self.assertEqual(run.dispatch_state, "SENDING")
-            self.assertIsNone(run.closure_confirmed_at)
-            with self.assertRaises(ValidationError):
-                group_services.start_single(self.other, 60, "MANUAL")
-        finally:
-            self.finish_sender(thread)
-
-    def test_restart_revokes_unsent_claim_and_late_sender_cannot_transmit(self):
-        rule = self.grouped_rule()
-        thread = self.start_sender(before_dispatch=True)
-        try:
-            self.assertEqual(IrrigationRun.objects.get().dispatch_state, "UNSENT")
-            group_services.recover_groups()
-            occurrence = group_services._plan_occurrence(rule, scheduled_at=self.now)
-            self.assertEqual(occurrence.status, "ACTIVE")
-        finally:
-            self.finish_sender(thread)
-        self.open.assert_not_called()
-        revoked = IrrigationRun.objects.get(valve=self.valve)
-        self.assertEqual(revoked.dispatch_state, "DONE")
-        self.assertIsNone(revoked.attempt_started_at)
-
-    def test_late_result_clears_obsolete_closure_until_new_read_confirms(self):
-        thread = self.start_sender()
-        try:
-            group_services.recover_groups()
-            IrrigationRun.objects.filter(valve=self.valve).update(
-                closure_confirmed_at=self.now - dt.timedelta(minutes=1),
-            )
-            self.read.side_effect = RuntimeError("Fresh confirmation unavailable")
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(valve=self.valve)
-        self.assertIsNone(run.closure_confirmed_at)
-        self.assertTrue(group_services._unresolved_runs(self.site).exists())
-
-    def test_watchdog_does_not_close_valid_opening_awaiting_acknowledgement(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            Command()._watchdog_close(self.now, set())
-            self.close.assert_not_called()
-            self.assertTrue(self.physical[self.valve.pk])
-            self.assertFalse(IrrigationRun.objects.filter(trigger="RECOVERY").exists())
-        finally:
-            self.finish_sender(thread)
-        self.assertEqual(IrrigationRun.objects.get().status, "RUNNING")
-
-    def test_watchdog_expiry_cancels_but_holds_sender_until_acknowledgement(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=120)
-            Command()._watchdog_close(self.now, set())
-            run = IrrigationRun.objects.get(trigger="MANUAL")
-            self.assertTrue(run.cancellation_requested)
-            self.assertEqual(run.dispatch_state, "SENDING")
-            self.assertIsNone(run.closure_confirmed_at)
-        finally:
-            self.finish_sender(thread)
-        run.refresh_from_db()
-        self.assertEqual(run.status, "FINISHED")
-        self.assertLess((run.actual_stop_at - run.actual_start_at).total_seconds(), 600)
-        self.assertTrue(run.sender_interrupted)
-        estimate = delivery_estimate(run)
-        self.assertTrue(estimate["uncertain"])
-        self.assertGreaterEqual(estimate["estimated_mm"], 2)
-        self.assertIn("physical delivery is uncertain", run.error_message)
-
-    def test_restart_close_before_acknowledgement_retains_uncertain_delivery(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=20)
-            group_services.recover_groups()
-            self.assertFalse(self.physical[self.valve.pk])
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(trigger="MANUAL")
-        self.assertTrue(run.sender_interrupted)
-        self.assertTrue(run.delivery_uncertain)
-        self.assertGreaterEqual(delivery_estimate(run)["estimated_mm"], 2)
-        self.assertIsNotNone(run.closure_confirmed_at)
-
-    def test_manual_stop_before_acknowledgement_retains_uncertain_delivery(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=20)
-            group_services.close_member(self.valve)
-            self.assertFalse(self.physical[self.valve.pk])
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(trigger="MANUAL")
-        self.assertTrue(run.sender_interrupted)
-        self.assertTrue(delivery_estimate(run)["uncertain"])
-
-    def test_cancellation_before_acknowledgement_keeps_conservative_delivery(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=20)
-            IrrigationRun.objects.filter(valve=self.valve).update(
-                cancellation_requested=True,
-            )
-            self.close.assert_not_called()
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(trigger="MANUAL")
-        self.assertFalse(run.sender_interrupted)
-        estimate = delivery_estimate(run)
-        self.assertTrue(estimate["uncertain"])
-        self.assertGreaterEqual(estimate["estimated_mm"], 2)
-        self.assertIn("physical delivery is uncertain", run.error_message)
-
-    def test_failed_recovery_interruption_record_still_preserves_uncertainty(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=20)
-            with mock.patch.object(
-                group_services, "mark_sender_interrupted",
-                side_effect=DatabaseError("Transient interruption record failure"),
-            ):
-                group_services.recover_groups()
-            self.assertFalse(self.physical[self.valve.pk])
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(trigger="MANUAL")
-        self.assertTrue(run.cancellation_requested)
-        self.assertFalse(run.sender_interrupted)
-        self.assertTrue(delivery_estimate(run)["uncertain"])
-        self.assertGreaterEqual(delivery_estimate(run)["estimated_mm"], 2)
-        self.assertIn("physical delivery is uncertain", run.error_message)
-
-    def test_failed_watchdog_interruption_record_still_preserves_uncertainty(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=120)
-            with mock.patch.object(
-                group_services, "mark_sender_interrupted",
-                side_effect=DatabaseError("Transient interruption record failure"),
-            ):
-                Command()._watchdog_close(self.now, set())
-            self.assertFalse(self.physical[self.valve.pk])
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(trigger="MANUAL")
-        self.assertTrue(run.cancellation_requested)
-        self.assertFalse(run.sender_interrupted)
-        self.assertTrue(delivery_estimate(run)["uncertain"])
-        self.assertGreaterEqual(delivery_estimate(run)["estimated_mm"], 2)
-
-    def test_failed_manual_stop_interruption_record_still_preserves_uncertainty(self):
-        thread = self.start_sender(physical_before_pause=True)
-        try:
-            self.now += dt.timedelta(seconds=20)
-            with mock.patch.object(
-                group_services, "mark_sender_interrupted",
-                side_effect=DatabaseError("Transient interruption record failure"),
-            ):
-                with self.assertRaises(DatabaseError):
-                    group_services.close_member(self.valve)
-            self.assertFalse(self.physical[self.valve.pk])
-        finally:
-            self.finish_sender(thread)
-        run = IrrigationRun.objects.get(trigger="MANUAL")
-        self.assertTrue(run.cancellation_requested)
-        self.assertFalse(run.sender_interrupted)
-        self.assertTrue(delivery_estimate(run)["uncertain"])
-        self.assertGreaterEqual(delivery_estimate(run)["estimated_mm"], 2)
-
-    def test_watchdog_still_closes_genuine_orphan(self):
-        Valve.objects.filter(pk=self.valve.pk).update(last_known_is_open=True)
-        self.physical[self.valve.pk] = True
-        Command()._watchdog_close(self.now, set())
-        self.close.assert_called_once_with(self.valve)
-        self.assertFalse(self.physical[self.valve.pk])
-        self.assertTrue(IrrigationRun.objects.filter(trigger="RECOVERY").exists())
-
-    def test_acknowledged_manual_run_survives_controller_restart_until_its_stop(self):
-        run = group_services.start_single(self.valve, 600, "MANUAL")
-        group_services.recover_groups()
-        run.refresh_from_db()
-        self.assertEqual(run.dispatch_state, "DONE")
-        self.assertEqual(run.status, "RUNNING")
-        self.close.assert_not_called()

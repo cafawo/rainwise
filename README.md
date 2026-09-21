@@ -211,10 +211,19 @@ schedule executes automatically.
 
 ## Hardware Access
 
-Hardware I/O is isolated in `apps/irrigation/services.py`; views call services
-instead of containing hardware logic. Group sequences are executed only by the
-single controller process. Existing individual manual controls use their service
-path. Use `RELAY_SIMULATOR=true` for local/dev without hardware.
+Hardware I/O is isolated in `apps/irrigation/services.py` and performed only by
+the single controller. HTTP actions persist database requests/cancellations and
+never open, close, or read a relay. Use `RELAY_SIMULATOR=true` for local/dev
+without hardware.
+
+Manual **Open**, **Close**, and single Fixed **Run now** execute on the normal
+controller tick, every 60 seconds by default. Saving a request does not confirm
+physical opening or closure. The dashboard/status API show **Queued** or
+**Stopping** until execution/confirmation, and display execution errors beside
+the valve. Refresh to see the result; there is no additional polling loop.
+**Last Known** is the last observed relay state, or **Unknown** before a read.
+Repeated pending requests coalesce. Close also works for an unexpectedly open
+valve with no active watering record, including a disabled relay device.
 
 ## Fixed and Smart Rules
 
@@ -450,35 +459,37 @@ devices subsequently disabled. Attempted commands are never replayed and missed
 dates are not backfilled. The next eligible scheduled date starts normally;
 a new explicit Fixed request requires recovery and confirmed closure first.
 
-Opening claims distinguish a sender that has not started from one whose command
-is in flight. Recovery can revoke an unsent claim atomically. An in-flight web
-sender keeps ownership until it acknowledges cancellation; an earlier closed
-read or elapsed timeout cannot prove that a surviving process will not send
-later. Scheduled senders belong to the single controller and can be reconciled
-when that controller restarts. Recent committed opening attempts are recognized
-by the watchdog, while genuine unexplained openings still receive closure.
-If closure interrupts a command still awaiting acknowledgement, the later result
-retains uncertain-delivery accounting and a warning; it cannot turn that
-interrupted watering into a reported full successful delivery.
-Cancellation received before the opening acknowledgement also keeps conservative
-credit, including when a database failure prevents recording the racing close.
-Stopping a normally acknowledged run still credits its known shortened delivery.
-If recording a returned opening result fails, the sender closes the valve while
-retaining ownership, then makes one conservative attempt to record that it has
-finished. Fresh closure confirmation is still required before admitting more
-watering. If the
-database remains unavailable, unresolved ownership is retained for recovery.
-A later read failure after a successful acknowledgement leaves the bounded run
-with the controller; it does not trigger an extra close that could interrupt a
-newer run.
+Open requests use the existing run record: **QUEUED** has not transmitted,
+**OPENING** is the durable controller attempt, and **DONE** records its result.
+Close requests have one coalesced durable row per valve, independent of run
+history. The controller processes stops, cancellation, recovery and watchdog
+closures before admitting watering. Both fresh physical closure and its database
+confirmation are required before releasing a failed/stopping valve or group.
+Admission checks run again at dispatch, including failures since enqueue.
+Cancellation committed before dispatch prevents opening; cancellation during a
+hardware call closes immediately after that call returns, before replacement.
 
-If a web process crashes without acknowledging its opening, the site stays
-blocked conservatively. After stopping **all** old web and controller processes,
-an operator can run `python manage.py reconcile_openings --senders-stopped` from
-a maintenance container using the mounted database and normal relay connection,
-then restart the web app and one controller. This exceptional recovery command
-closes and reads valves; it never opens them. The flag confirms that no old sender
-can return. Do not use it while any old sender process may still be running.
+A web process can disappear after enqueue without blocking recovery. On controller
+restart, queued manual requests and unfinished groups are cancelled visibly;
+attempted openings are closed/reconciled without replay. Acknowledged bounded
+single-valve runs retain their original stop times. Unsent individual requests
+also expire after one configured controller interval plus command allowance,
+rather than starting unexpectedly after a long stall. This freshness check never
+releases an attempted opening or an unconfirmed close.
+
+If storing an opening result fails, the controller attempts emergency closure
+even when the database is unavailable. The durable attempt blocks replacement;
+the next tick or restart reconciles it without any web acknowledgement. Ambiguous
+openings and successful transport retries retain conservative delivery estimates.
+Known early closure of an acknowledged run retains shortened delivery. Failed
+closure remains **Stopping**, with its error visible and a retry on normal ticks.
+
+Legacy web-sender states (`LEGACY`, `UNSENT`, `SENDING`) retain their old meaning;
+no existing `MANUAL` run is silently made controller-owned. Unresolved legacy
+states block that site's new watering until the offline upgrade procedure below.
+A legacy unsent command is cancelled without irrigation credit. A possibly sent
+command is closed/read and retains uncertain delivery; historical timing, rates,
+settings and completed records are preserved.
 
 Page-wide warnings, errors, and action results appear above the page heading.
 Failed forms show a red summary linking to invalid fields, alongside inline
@@ -489,10 +500,30 @@ use the Curve page to edit or reset settings with validation.
 
 ## Upgrade and Verification
 
-Back up the persistent database, stop the old web and controller processes, apply migrations, then
-start the upgraded web app and exactly one controller. Keep SQLite on the mounted
-`/data` volume or use Postgres; no host cron/systemd or extra worker is required.
-No deployment or hardware commissioning is part of the automated test suite.
+For the controller-command upgrade:
+
+1. Back up the persistent database. Stop **all old web and controller processes**;
+   a paused old process must never resume sending commands after reconciliation.
+2. Apply migrations through `0011_controller_commands` from an upgraded
+   maintenance container/process using the existing database volume. Migration
+   preserves all old run fields, rule IDs, durations (including 2700 seconds),
+   calibration and occurrence snapshots. It adds closure requests and distinct
+   controller dispatch values; it does not rewrite old sender ownership.
+3. With old processes still stopped, run
+   `python manage.py reconcile_openings --senders-stopped` using the normal relay
+   connection. This maintenance command only closes/reads; it never opens valves.
+   If closure/database access fails it exits with an error. Restore access and
+   repeat until no unresolved run or close request remains. Do not use this
+   command alongside a live controller or old web sender.
+4. Start the upgraded web app and **exactly one** upgraded controller. Startup
+   cancels stale manual requests/groups and reconciles interrupted controller
+   attempts. Routine new web failures no longer require maintenance recovery.
+
+Keep SQLite on the mounted `/data` volume or use Postgres. Docker's startup
+migration step still applies schema changes, but does not replace stopped-process
+reconciliation for legacy in-flight commands. No host cron/systemd, additional
+worker, dependency, or environment variable is required. No deployment or
+hardware commissioning is part of the automated test suite.
 
 The fallback migration fills missing temperatures with 25 °C and adds standard
 curve settings for existing sites without a settings row. Existing temperature

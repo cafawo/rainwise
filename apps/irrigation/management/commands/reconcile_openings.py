@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand, CommandError
 
 from apps.irrigation import group_services
-from apps.irrigation.models import IrrigationRun
+from apps.irrigation.models import ValveClosure
 
 
 class Command(BaseCommand):
@@ -23,9 +23,14 @@ class Command(BaseCommand):
                 "--senders-stopped. Elapsed time does not prove a sender stopped."
             )
         group_services.reconcile_attempts(senders_stopped=True)
-        unresolved = IrrigationRun.objects.filter(
-            attempt_started_at__isnull=False, closure_confirmed_at=None,
-        ).count()
+        unresolved = group_services._unresolved_runs().count()
+        pending_closures = ValveClosure.objects.filter(confirmed_at=None).count()
+        if unresolved or pending_closures:
+            raise CommandError(
+                f"Reconciliation incomplete: {unresolved} run(s) and "
+                f"{pending_closures} close request(s) remain unresolved. "
+                "Restore relay/database access and repeat before starting watering."
+            )
         self.stdout.write(
             f"Opening reconciliation completed; {unresolved} run(s) still "
             "awaiting safe completion or confirmed closure."

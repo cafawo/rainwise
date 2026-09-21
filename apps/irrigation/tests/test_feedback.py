@@ -131,14 +131,14 @@ class PageFeedbackTests(TestCase):
         self.assert_feedback_before_heading(response)
         self.assertContains(response, 'class="alert alert-success" role="status"')
         with mock.patch(
-            "apps.irrigation.group_services.start_single",
+            "apps.irrigation.group_services.request_single",
             side_effect=RuntimeError("Another rule is active."),
         ):
             response = self.client.post(
                 reverse("valve_open", args=[self.valve.pk]), follow=True,
             )
         self.assert_feedback_before_heading(response)
-        self.assertContains(response, "Failed to open valve: Another rule is active.")
+        self.assertContains(response, "Opening request failed: Another rule is active.")
         self.assertContains(response, 'class="alert alert-danger" role="alert"')
 
     def test_login_failure_precedes_sign_in_heading(self):

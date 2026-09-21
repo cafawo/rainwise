@@ -18,6 +18,12 @@ from apps.irrigation.models import (
 
 class SharedRuleEditorTests(TestCase):
     def setUp(self):
+        clock = mock.patch(
+            "django.utils.timezone.now",
+            return_value=dt.datetime(2026, 9, 21, 6, tzinfo=dt.timezone.utc),
+        )
+        clock.start()
+        self.addCleanup(clock.stop)
         user = get_user_model().objects.create_user(username="editor", password="test")
         self.client.force_login(user)
         self.site = Site.objects.create(name="Home", timezone="UTC")
@@ -181,7 +187,8 @@ class SharedRuleEditorTests(TestCase):
         old = self.legacy()
         ScheduleRule.objects.filter(pk=old.pk).update(mode="DYNAMIC")
         self.client.post(reverse("schedule_run", args=[old.pk]))
-        self.assertEqual(opening.call_args.args[1], 900)
+        opening.assert_not_called()
+        self.assertEqual(IrrigationRun.objects.get().dispatch_state, "QUEUED")
         self.assertEqual(IrrigationRun.objects.get().optimal_duration_seconds, 900)
 
     @mock.patch("apps.irrigation.services.open_valve_for")

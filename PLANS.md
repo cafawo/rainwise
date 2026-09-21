@@ -5,6 +5,13 @@ feedback. This is the current design and supersedes the earlier two-pass plan.
 The implementation baseline and review findings are recorded below. Section 9
 records the implementation decisions and verification for this revision.
 
+**Release gate: HOLD (2026-09-21).** The final adversarial review reproduced
+delayed close commands interrupting replacement runs without correcting their
+delivery history. Section 11 records this remaining reliability issue. Passing
+the existing suite is not sufficient for the requested clean release signoff;
+do not create the next version tag until this issue is resolved or the release
+condition is explicitly reconsidered.
+
 Confirmed follow-up decisions:
 
 - Keep the day-based rolling balance and allow coverage-window catch-up above
@@ -689,3 +696,96 @@ uses the existing hidden formset order with arrow controls. Valve, duration and
 actions align on desktop and wrap on mobile. All 89 relevant editor/view/feedback
 tests pass; isolated browser checks confirm order survives remove/undo/add,
 reordering, invalid submission and saved reload, with no 390 px overflow.
+
+## 11. Final release review: delayed close ownership
+
+### Authorized implementation: controller owns all valve commands
+
+The implementation below supersedes the web-sender protocol in sections 6, 9
+and 10. Preserve the existing release-review evidence and history while replacing
+normal cross-process hardware coordination:
+
+- HTTP Open and single Fixed Run now persist a queued `IrrigationRun`; no
+  attempt or delivery is recorded until the controller claims it. Repeated
+  pending requests coalesce. Group Run now retains its existing durable request.
+- Add one small per-valve closure-request table, independent of watering runs,
+  with request time, confirmation time and current error. Close atomically
+  cancels queued/active member work and its group, including orphan valves.
+- The single controller completes stops, recovery, explicit closure requests
+  and watchdog work before admitting watering. Pending closure or uncertain
+  attempts block replacement until a fresh closed read and durable confirmation.
+  Hardware calls remain outside short database transactions.
+- Use new QUEUED / OPENING dispatch values for controller-owned commands;
+  retain old LEGACY / UNSENT / SENDING values as historical/upgrade states.
+  Never infer ownership from MANUAL. Remove web sender interruption and
+  acknowledgement coordination from normal execution. Preserve old history.
+- Restart cancels unfinished queued manual requests and group sequences,
+  reconciles attempted controller commands without replay, and retains bounded
+  acknowledged single-run timing. Legacy unresolved senders block their site
+  until explicit stopped-process reconciliation; stop all old web/controller
+  processes before migration/reconciliation. New failures never need a web ack.
+- Show Queued / Stopping and actionable execution errors in the dashboard and
+  status API; request-success notices describe saved intent and normal tick
+  latency (60 seconds by default), never claim physical completion.
+- Keep relay limits/retries, scheduling, balance, rests, snapshots, configuration
+  and editor behavior unchanged, including saved 2700-second settings.
+
+Verification order: first preserve deterministic failing delayed-close
+regressions; implement; cover enqueue/dispatch/result/closure/database failure,
+restart, cancellation, duplicates, site isolation and populated legacy upgrades;
+run complete isolated SQLite and disposable PostgreSQL suites, migrations and
+drift checks; browser-check feedback/errors/editor; independently red-team the
+final ordering and recovery. No deployment, push or version tag is authorized.
+
+Reviewed application commit: `10456f3`. The working tree was clean at review
+start. Runtime, driver and migrations are unchanged from the previous reviewed
+commit; the intervening changes are presentation refinements.
+
+The red team reproduced two interleavings with isolated databases and mocked
+physical valve states:
+
+1. A manual Close request commits cancellation, then pauses before sending its
+   hardware close. The controller closes and confirms the old run and starts a
+   new group using the same valve. The delayed manual close then stops the new
+   run, which remains RUNNING with certain delivery in the database.
+2. Controller recovery inspects an old SENDING run and pauses before closing.
+   The original web sender finishes closing and acknowledging its cancellation.
+   Another manual opening is admitted. The old controller close then stops that
+   replacement, again without recording its shortened or uncertain delivery.
+
+These are two manifestations of the same remaining command-ownership problem
+in `close_member` and `_confirmed_closed`. The demonstrated consequence is
+under-watering and overstated irrigation credit; no unbounded opening was
+demonstrated. The previous acknowledgement fixes remain necessary and intact.
+A database recheck or timeout would only narrow the window: it cannot invalidate
+a close command belonging to another paused process.
+
+Recommended next design: let the existing single controller own manual opening
+and closing commands too. HTTP requests persist intent; the controller performs
+hardware I/O in its normal loop and records the result. Preserve bounded relay
+pulses, restart recovery and existing history. This removes the cross-process
+command race and the separately documented crashed-web-sender ownership problem
+without another worker or a second distributed command protocol. Manual commands
+would execute on a controller tick, rather than immediately in the web request;
+that interaction change must be made explicit before implementation.
+
+Verification completed for this review:
+
+- **280 tests pass on SQLite at 60-second cadence** (8.897 s) and **280 pass on
+  disposable PostgreSQL at 30-second cadence** (10.704 s). Fresh migrations,
+  model-drift checks, Django system checks and installed dependency checks pass.
+- Eight additional isolated probes pass for invalid/extreme inputs, tiny caps,
+  corrupted pulse budgets, midnight and DST boundaries, and repeated ticks.
+- A 45-minute rule limit (`2700` seconds) is already supported, including an
+  override above a valve's 600-second default. A two-hour Smart target correctly
+  executes 45 + 45 + 30 minutes with the required rests. Changing a valve default
+  does not rewrite existing rules or occurrence snapshots.
+- Current-commit browser checks pass for Fixed/Smart 2700-second overrides,
+  Preview, ordering and remove/undo/add, failed-save preservation, linked errors,
+  malformed hidden order/management fields, ignored deleted invalid rows, and
+  the current Curve explanation. Desktop and 390 px layouts have no unexpected
+  overflow or JavaScript errors. The disposable browser server/database and
+  PostgreSQL cluster were stopped after verification.
+- The separate delayed-close reproductions demonstrate the release hold despite
+  the passing suite. No production database, live valve, deployment or version
+  tag was changed. The last local and remote release tag remains `v0.1.4`.

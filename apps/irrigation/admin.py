@@ -46,10 +46,9 @@ class SiteAdmin(admin.ModelAdmin):
 
 
 def _has_unresolved_runs(query):
-    return query.filter(
-        Q(status="RUNNING")
-        | Q(attempt_started_at__isnull=False, closure_confirmed_at__isnull=True)
-    ).exists()
+    ids = query.values("pk")
+    return (group_services._unresolved_runs().filter(pk__in=ids).exists()
+            or group_services._legacy_unresolved().filter(pk__in=ids).exists())
 
 
 def _validate_reservation_change(candidate, site):
@@ -84,7 +83,9 @@ class RelayDeviceAdminForm(forms.ModelForm):
             with group_services.site_admission(original.site):
                 if _has_unresolved_runs(models.IrrigationRun.objects.filter(
                     valve__relay_device=original
-                )):
+                )) or models.ValveClosure.objects.filter(
+                    valve__relay_device=original, confirmed_at=None,
+                ).exists():
                     raise ValidationError(
                         "Stop watering and wait for confirmed closure before "
                         "changing relay hardware identity."
@@ -113,7 +114,9 @@ class ValveAdminForm(forms.ModelForm):
             with group_services.site_admission(original.relay_device.site):
                 if _has_unresolved_runs(models.IrrigationRun.objects.filter(
                     valve=original
-                )):
+                )) or models.ValveClosure.objects.filter(
+                    valve=original, confirmed_at=None,
+                ).exists():
                     raise ValidationError(
                         "Stop watering and wait for confirmed closure before "
                         "changing valve hardware identity."
@@ -137,6 +140,13 @@ class RelayDeviceAdmin(admin.ModelAdmin):
     form = RelayDeviceAdminForm
     list_display = ("name", "host", "port", "unit_id", "enabled")
     list_filter = ("enabled",)
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and models.ValveClosure.objects.filter(
+            valve__relay_device=obj, confirmed_at=None,
+        ).exists():
+            return False
+        return super().has_delete_permission(request, obj)
 
     def save_model(self, request, obj, form, change):
         with group_services.site_admission(obj.site):
@@ -167,6 +177,11 @@ class ValveAdmin(admin.ModelAdmin):
         "last_polled_at",
     )
     list_filter = ("relay_device", "is_active_high")
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and models.ValveClosure.objects.filter(valve=obj, confirmed_at=None).exists():
+            return False
+        return super().has_delete_permission(request, obj)
 
 
 class RuleConfigurationAdmin(admin.ModelAdmin):
