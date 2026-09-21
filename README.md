@@ -283,6 +283,13 @@ unknown. See [CSU's home lawn irrigation guidance](https://extension.colostate.e
 The curve returns daily demand in mm/day from temperature in °C. `min_mm` and
 `max_mm` are finite and satisfy `0 <= min_mm <= max_mm`; `g` is finite and positive
 and `m` is finite. `coverage_days` is an integer from 1 through 7, default 2.
+The Curve page displays the symbolic logistic equation in "How Smart calculates water":
+`D(T) = min_mm + (max_mm - min_mm) / (1 + exp(-g * (T - m)))`.
+The equation, parameter definitions and reference-point explanation precede the
+rolling-balance description. The default curve approximates the chart's four
+reference points: 15 °C / 1 mm/day, 20 °C / 2 mm/day, 25 °C / 3 mm/day and
+30 °C / 5 mm/day. These provide a practical demand scale; the sigmoid itself
+is Rainwise's adjustable model.
 The fallback temperature defaults to 25 °C; review it for the site and change it
 on the curve page when needed. Finite overrides, including 0 °C, are supported.
 New sites receive the standard curve settings without a settings-page visit.

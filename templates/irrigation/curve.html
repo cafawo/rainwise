@@ -47,13 +47,35 @@
 {% for row in capacity_rows %}<tr><td>{{ row.valve.name }}</td><td>{% if row.valve.has_valid_application_rate %}{{ row.valve.application_rate_mm_h }} mm/hour{% else %}N/A — skipped in Smart; enter a measured watering rate{% endif %}</td><td>{{ row.cap|duration }}</td><td>{{ row.peak_seconds|duration }}{% if row.warning %}<div class="text-danger">{{ row.warning }}</div>{% endif %}</td></tr>{% empty %}<tr><td colspan="4">No Smart valves in the active schedule.</td></tr>{% endfor %}
 </tbody></table>
 <h2 class="h4 mt-4">How Smart calculates water</h2>
-<p>The curve estimates daily need in mm/day. Min and Max bound daily demand; g controls the slope and m the midpoint in °C. Max is not an application-day limit. Coverage of 1–7 local days multiplies today's estimate, then subtracts known rain over that many day periods and irrigation from the preceding coverage minus one local dates plus earlier today. Dates follow the site's timezone, including daylight-saving changes.</p>
+<p>Rainwise uses a smooth logistic curve to estimate daily lawn water demand from temperature:</p>
+<div class="overflow-x-auto py-2 mb-3">
+  <math id="curveEquation" xmlns="http://www.w3.org/1998/Math/MathML" display="block" class="fs-5">
+    <mi>D</mi><mo>(</mo><mi>T</mi><mo>)</mo><mo>=</mo>
+    <msub><mi>D</mi><mtext>min</mtext></msub><mo>+</mo>
+    <mfrac>
+      <mrow>
+        <msub><mi>D</mi><mtext>max</mtext></msub><mo>−</mo>
+        <msub><mi>D</mi><mtext>min</mtext></msub>
+      </mrow>
+      <mrow>
+        <mn>1</mn><mo>+</mo>
+        <msup>
+          <mi>e</mi>
+          <mrow><mo>−</mo><mi>g</mi><mo>(</mo><mi>T</mi><mo>−</mo><mi>m</mi><mo>)</mo></mrow>
+        </msup>
+      </mrow>
+    </mfrac>
+  </math>
+</div>
+<p><var>T</var> is temperature in °C and <var>D(T)</var> is daily demand in mm/day. <var>D</var><sub>min</sub> and <var>D</var><sub>max</sub> correspond to the Minimum and Peak daily demand settings. <var>g</var> controls the slope; <var>m</var> is the temperature where demand is halfway between those limits.</p>
+<p>The default curve approximates the reference points shown in the chart: {% for point in known_points|dictsort:"x" %}{{ point.x|floatformat:"-1" }} °C → {{ point.y|floatformat:"-1" }} mm/day{% if not forloop.last %}, {% else %}.{% endif %}{% endfor %} <a href="https://www.lwg.bayern.de/mam/cms06/landespflege/dateien/basiswissen_rasenbau.pdf#page=17">LWG lawn guidance</a> supports this approximate demand scale. The smooth curve is Rainwise's model; changing the parameters adjusts it for your site.</p>
+<p>Coverage of 1–7 local days multiplies today's estimated daily demand, then subtracts known rain over that many day periods and irrigation from the preceding coverage minus one local dates plus earlier today. Peak daily demand bounds the curve; it is not an application-day limit. Dates follow the site's timezone, including daylight-saving changes.</p>
 <p>Temperature uses the last 24 hours' 90th percentile, with at least 18 trusted finite hours and a recent valid observation. Otherwise the configured fallback temperature is used (25 °C by default, editable above). The red point shows the same selected temperature as execution. Unknown rain gives no credit and can cause overwatering. Open-Meteo values are model estimates, not rain-gauge measurements.</p>
 <p>Each valve has its own target. Smart rotates through all valves, then repeats if needed, shortening the final pulse and skipping fulfilled valves. No minimum dose or carried rounding remainder is added. Rain after a decision affects the next decision. Old deficits and surpluses expire, so recovery after prolonged outages is not guaranteed.</p>
 <p>With two-day coverage, no rain or initial credit, and sufficient time in the day, constant daily needs of 2, 4 and 7 mm produce targets of 4, 8 and 14 mm, then zero the next day. This pattern depends on recorded delivery and current weather; it is not a watering guarantee.</p>
 <p>At 7 mm/hour, a 7 mm target takes one hour of actual watering. With a 30-minute run limit, one valve waters 30 minutes, rests 30 minutes, then waters 30 minutes. A two-day peak at 7 mm/day takes two hours of watering and three 30-minute breaks: 3 hours 30 minutes before scheduling allowance.</p>
 <p>With 2 mm/day need and 3 mm rain credit, the two-day target is 1 mm. If need rises from 2 to 4 mm/day after a 4 mm watering day, the next target is 4 mm before rain.</p>
-<p><a href="https://www.lwg.bayern.de/mam/cms06/landespflege/dateien/basiswissen_rasenbau.pdf">LWG lawn guidance</a> supports the approximate demand scale, not this exact curve or a universally optimal schedule. <a href="https://extension.colostate.edu/resource/methods-to-schedule-home-lawn-irrigation/">CSU calibration guidance</a> explains measuring zone output. The equal-duration minimum break is a product rule, not a guarantee of soil absorption. Other valves’ watering counts toward the break; the controller waits the remaining time. Total rain approximates root-available water, without modelling runoff, drainage, soil storage, or cold-season controls.</p>
+<p><a href="https://extension.colostate.edu/resource/methods-to-schedule-home-lawn-irrigation/">CSU calibration guidance</a> explains measuring zone output. The equal-duration minimum break is a product rule, not a guarantee of soil absorption. Other valves’ watering counts toward the break; the controller waits the remaining time. Total rain approximates root-available water, without modelling runoff, drainage, soil storage, or cold-season controls.</p>
 {% endblock %}
 
 {% block scripts %}

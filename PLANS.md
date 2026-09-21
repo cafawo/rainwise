@@ -102,6 +102,13 @@ constraint, not another editable watering target.
 Keep existing finite curve validation (`0 <= min_mm <= max_mm`, positive `g`,
 finite `m`), integer coverage days 1–7 with default 2, editable fallback default
 25 °C, and finite positive measured application rates. Preserve 0 °C overrides.
+In "How Smart calculates water", introduce the daily-demand curve, then show
+its symbolic logistic equation and define minimum/maximum demand, `g`, `m` and
+temperature `T` before explaining the rolling balance. Describe the default as
+an approximation to the four plotted reference points; published lawn guidance
+supports the approximate demand scale without specifying this exact curve.
+Use native MathML for the fraction and exponent; keep parameter values in the
+existing form.
 Do not add a separate daily-mm maximum, editable daily total runtime, cycle
 count, or independently configured soak duration.
 
