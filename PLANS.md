@@ -2,8 +2,9 @@
 
 Current design for the next Rainwise release, consolidated on 2026-09-21.
 This document replaces the previous MVP checklist and intermediate proposals.
-Application implementation is pending. Follow this plan as the current source
-of truth; update it explicitly if implementation reveals a necessary change.
+Application implementation is complete as of 2026-09-21. Follow this plan as
+the current source of truth; update it explicitly if behavior changes. The
+implementation and verification record is in section 10 below.
 
 ## 1. Goal and compatibility contract
 
@@ -522,3 +523,43 @@ env POSTGRES_HOST='' SQLITE_PATH='' RELAY_SIMULATOR=false \
 The explicit empty database environment values select the configuration expected
 by the default-SQLite warning test; Django creates its own temporary test DB.
 The service tests mock the hardware transport even with simulator mode disabled.
+
+## 10. Implementation and verification record (2026-09-21)
+
+All five implementation phases are complete. The implementation retains the
+existing hardware driver and introduces no dependencies. Shared group services
+own durable planning, atomic per-site admission, sequential execution,
+cancellation, and recovery. The shared editor, calendar, preview, curve page,
+dashboard, logs, admin paths, and documentation cover both storage types.
+
+- Baseline before edits: all 43 existing irrigation/weather tests passed.
+- Final complete Django suite: all 145 tests passed on isolated SQLite with
+  controller/poll cadence explicitly set to 60 seconds.
+- Final complete Django suite: all 145 tests passed on disposable PostgreSQL
+  17.11 with controller/poll cadence explicitly set to 30 seconds. Its temporary
+  server was shut down after verification.
+- Fresh migrations passed on both SQLite and PostgreSQL. The suite also tests
+  forward/reverse migration preservation, database constraints, and admission
+  races using independent connections. Migration drift and whitespace checks
+  pass.
+- End-to-end simulations using recorded delivery reproduce the approved
+  `4/0/4/0`, `6/2/6/2`, and `6/6/6/6` sequences for both valves. Acceptance tests
+  also cover weather provenance/backfill, DST, actual decision cutoffs, calibrated
+  and uncertain credit, snapshots, UI conversion/copy/cancellation, durable
+  claims, failures around hardware calls/database writes, and restart recovery.
+- Independent implementation/review findings were resolved, including repeated
+  valve passes, pre-upgrade running pulses without attempt metadata, startup
+  recovery failure, queued request snapshots, and fresh closure confirmation
+  after a failed redundant close. Uncertain commands retain the approved full
+  nominal conservative credit even when that allowance extends past a cutoff;
+  this is explicitly reported, while known delivery remains cutoff-bounded.
+
+No implementation phase remains incomplete. Browser interaction and live
+hardware commissioning were not performed; automated UI validation uses Django
+requests/rendering, and hardware/weather are mocked throughout. No live
+controller was launched, production data changed, or deployment performed.
+Deployment still requires a database backup, stopping the old controller,
+applying migrations before starting exactly one upgraded controller, and
+measured application rates plus a configured fallback before enabling Smart.
+Pin both cadence settings to 30 before upgrading if the old cadence is desired;
+otherwise the defaults are 60 seconds. See README for the operational steps.

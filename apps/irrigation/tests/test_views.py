@@ -107,6 +107,7 @@ class DashboardViewTests(TestCase):
             name="Valve 1",
         )
 
+    @override_settings(POSTGRES_HOST="", SQLITE_PATH="")
     def test_dashboard_shows_default_sqlite_warning(self) -> None:
         self.client.login(username="tester", password="password")
         response = self.client.get(reverse("dashboard"))
@@ -330,7 +331,7 @@ class ScheduleNewViewTests(TestCase):
                 "note": "Copy",
             },
         )
-        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.status_code, 302, (response.context["form"].errors, response.context["members_formset"].errors, response.context["members_formset"].non_form_errors()) if response.context else "")
         self.assertEqual(
             ScheduleRule.objects.filter(schedule=self.schedule).count(), 2
         )
@@ -363,7 +364,7 @@ class CalendarEventsTests(TestCase):
             enabled=True,
             days_of_week_mask=1 << 0,
             start_time=dt.time(6, 30),
-            mode=ScheduleRule.MODE_DYNAMIC,
+            mode="DYNAMIC",
             max_duration_seconds=1200,
         )
 
@@ -509,21 +510,12 @@ class CurveViewTests(TestCase):
 
     def test_curve_includes_p90_point(self) -> None:
         now = timezone.now()
-        WeatherObservation.objects.create(
-            site=self.site,
-            timestamp=now - dt.timedelta(hours=1),
-            temperature_c=10.0,
-        )
-        WeatherObservation.objects.create(
-            site=self.site,
-            timestamp=now - dt.timedelta(hours=2),
-            temperature_c=20.0,
-        )
-        WeatherObservation.objects.create(
-            site=self.site,
-            timestamp=now - dt.timedelta(hours=3),
-            temperature_c=30.0,
-        )
+        newest = now.replace(minute=0, second=0, microsecond=0)
+        for hour in range(24):
+            WeatherObservation.objects.create(
+                site=self.site, timestamp=newest - dt.timedelta(hours=hour),
+                retrieved_at=now, temperature_c=float(hour),
+            )
 
         self.client.login(username="tester", password="password")
         response = self.client.get(reverse("curve"))

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from zoneinfo import ZoneInfo
 
 import requests
 from django.conf import settings
 from django.utils import timezone
 
-from apps.irrigation.models import Site
+from apps.irrigation.models import CurveSettings, GroupedRule, Site
 from apps.weather.models import WeatherImportLog, WeatherObservation
 
 
@@ -20,7 +21,8 @@ def _parse_timestamp(value: int | str) -> dt.datetime:
 
 
 def import_weather_range(
-    site: Site, start_date: dt.date, end_date: dt.date
+    site: Site, start_date: dt.date, end_date: dt.date,
+    *, now: dt.datetime | None = None,
 ) -> int:
     if site.latitude is None or site.longitude is None:
         raise ValueError("Site latitude/longitude required for weather import")
@@ -36,26 +38,35 @@ def import_weather_range(
         "timeformat": "unixtime",
     }
 
-    response = requests.get(OPEN_METEO_URL, params=params, timeout=DEFAULT_TIMEOUT_SECONDS)
+    response = requests.get(
+        OPEN_METEO_URL, params=params, timeout=DEFAULT_TIMEOUT_SECONDS
+    )
     response.raise_for_status()
     payload = response.json()
+    retrieved_at = now or timezone.now()
 
     hourly = payload.get("hourly", {})
     times = hourly.get("time", [])
     temperatures = hourly.get("temperature_2m", [])
     precipitation = hourly.get("precipitation", [])
-    humidity = hourly.get("relative_humidity_2m") or hourly.get("relativehumidity_2m") or []
+    humidity = (
+        hourly.get("relative_humidity_2m")
+        or hourly.get("relativehumidity_2m") or []
+    )
 
     # Deduplicate by the exact UTC instant stored in Postgres.
     observations_by_timestamp: dict[dt.datetime, WeatherObservation] = {}
     for idx, timestamp in enumerate(times):
         parsed_timestamp = _parse_timestamp(timestamp)
+        if parsed_timestamp > retrieved_at:
+            continue
         observations_by_timestamp[parsed_timestamp] = WeatherObservation(
             site=site,
             timestamp=parsed_timestamp,
             temperature_c=temperatures[idx] if idx < len(temperatures) else None,
             precipitation_mm=precipitation[idx] if idx < len(precipitation) else None,
             humidity_percent=humidity[idx] if idx < len(humidity) else None,
+            retrieved_at=retrieved_at,
         )
 
     observations = list(observations_by_timestamp.values())
@@ -68,6 +79,7 @@ def import_weather_range(
                 "temperature_c",
                 "precipitation_mm",
                 "humidity_percent",
+                "retrieved_at",
             ],
             unique_fields=["site", "timestamp"],
         )
@@ -102,24 +114,64 @@ def ensure_recent_weather(
     tz = ZoneInfo(site.timezone or settings.TIME_ZONE)
     local_now = timezone.localtime(now, tz)
 
-    last_obs = (
-        WeatherObservation.objects.filter(site=site)
-        .order_by("-timestamp")
-        .first()
-    )
-    if last_obs:
-        last_time = timezone.localtime(last_obs.timestamp, tz)
-        if local_now - last_time < dt.timedelta(hours=max_age_hours):
-            return 0
-
-    log = WeatherImportLog.objects.filter(site=site, date=local_now.date()).first()
-    if log and local_now - log.imported_at < dt.timedelta(minutes=min_retry_minutes):
+    log = WeatherImportLog.objects.filter(site=site).order_by("-imported_at").first()
+    if log and now - log.imported_at < dt.timedelta(minutes=min_retry_minutes):
         return 0
 
-    if last_obs:
-        start_date = (last_time - dt.timedelta(hours=1)).date()
-    else:
-        start_date = local_now.date() - dt.timedelta(days=lookback_days)
+    coverage_days = 1
+    if GroupedRule.objects.filter(
+        schedule__site=site, enabled=True, mode="SMART"
+    ).exists():
+        curve = CurveSettings.objects.filter(site=site).first()
+        if curve:
+            coverage_days = curve.coverage_days
+    lookback_days = max(1, lookback_days, coverage_days)
+    start_date = local_now.date() - dt.timedelta(days=lookback_days)
+    start_at = dt.datetime.combine(
+        start_date, dt.time.min, tzinfo=tz
+    ).astimezone(dt.timezone.utc)
+    end_at = local_now.replace(
+        minute=0, second=0, microsecond=0
+    ).astimezone(dt.timezone.utc)
+    latest_success = (
+        WeatherImportLog.objects.filter(site=site, last_success_at__isnull=False)
+        .order_by("-last_success_at")
+        .values_list("last_success_at", flat=True).first()
+    )
+    success_is_fresh = bool(
+        latest_success and now - latest_success < dt.timedelta(hours=max_age_hours)
+    )
+    if success_is_fresh:
+        # Newly elapsed hours are expected between periodic refreshes. Only
+        # holes within the previous successful import require an early repair.
+        end_at = latest_success.astimezone(tz).replace(
+            minute=0, second=0, microsecond=0
+        ).astimezone(dt.timezone.utc)
+
+    # Check all required hours: a newer row cannot hide an interior gap, legacy
+    # row without provenance, or a value originally retrieved as a forecast.
+    expected = set()
+    boundary = start_at
+    while boundary <= end_at:
+        expected.add(boundary)
+        boundary += dt.timedelta(hours=1)
+    trusted = set()
+    rows = WeatherObservation.objects.filter(
+        site=site, timestamp__gte=start_at, timestamp__lte=end_at
+    )
+    for row in rows:
+        if (
+            row.retrieved_at is not None
+            and row.timestamp <= row.retrieved_at <= now
+            and row.temperature_c is not None
+            and math.isfinite(row.temperature_c)
+            and row.precipitation_mm is not None
+            and math.isfinite(row.precipitation_mm)
+            and row.precipitation_mm >= 0
+        ):
+            trusted.add(row.timestamp)
+    if success_is_fresh and expected.issubset(trusted):
+        return 0
 
     end_date = local_now.date()
     if start_date > end_date:
@@ -129,7 +181,7 @@ def ensure_recent_weather(
     error_message = ""
     count = 0
     try:
-        count = import_weather_range(site, start_date, end_date)
+        count = import_weather_range(site, start_date, end_date, now=now)
     except Exception as exc:  # noqa: BLE001 - keep failures non-fatal
         status = WeatherImportLog.STATUS_FAILED
         error_message = str(exc)
@@ -139,5 +191,8 @@ def ensure_recent_weather(
         date=local_now.date(),
         defaults={"status": status, "error_message": error_message},
     )
-    WeatherImportLog.objects.filter(id=log.id).update(imported_at=timezone.now())
+    timestamps = {"imported_at": now}
+    if status == WeatherImportLog.STATUS_SUCCESS:
+        timestamps["last_success_at"] = now
+    WeatherImportLog.objects.filter(id=log.id).update(**timestamps)
     return count

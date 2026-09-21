@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from django import forms
 from django.contrib.auth.forms import AuthenticationForm
 
@@ -7,6 +9,8 @@ from apps.irrigation.models import (
     RELAY_FLASH_MAX_DURATION_SECONDS,
     Schedule,
     ScheduleRule,
+    GroupedRule,
+    normalize_rule_mode,
     Valve,
 )
 
@@ -57,6 +61,7 @@ class ScheduleRuleForm(forms.ModelForm):
                 relay_device__site=site
             ).order_by("name")
         if self.instance and self.instance.pk:
+            self.initial["mode"] = normalize_rule_mode(self.instance.mode)
             selected = [
                 str(idx)
                 for idx in range(7)
@@ -79,7 +84,7 @@ class ScheduleRuleForm(forms.ModelForm):
         )
         self.fields["days_of_week"].help_text = "Select at least one day."
         self.fields["mode"].help_text = (
-            "Fixed uses the max duration. Dynamic picks a random duration up to max."
+            "Fixed runs for the configured duration."
         )
         self.fields["max_duration_seconds"].help_text = (
             "Relay-enforced run duration. "
@@ -101,6 +106,69 @@ class ScheduleRuleForm(forms.ModelForm):
         if commit:
             instance.save()
         return instance
+
+
+class RuleEditorForm(forms.Form):
+    mode = forms.ChoiceField(choices=GroupedRule.MODE_CHOICES, initial="FIXED")
+    enabled = forms.BooleanField(required=False, initial=True)
+    days_of_week = forms.MultipleChoiceField(
+        choices=DAY_CHOICES, widget=forms.CheckboxSelectMultiple,
+        help_text="Select at least one day. Smart defaults to every day.",
+    )
+    start_time = forms.TimeField(
+        widget=forms.TimeInput(attrs={"type": "time"}),
+        help_text="Local start time for the entire sequence.",
+    )
+    note = forms.CharField(max_length=255, required=False, label="Name / note")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name, field in self.fields.items():
+            if name not in {"enabled", "days_of_week"}:
+                field.widget.attrs["class"] = "form-select" if name == "mode" else "form-control"
+
+
+class ValveMemberForm(forms.Form):
+    valve = forms.ModelChoiceField(queryset=Valve.objects.none())
+    duration_seconds = forms.IntegerField(
+        min_value=1, max_value=RELAY_FLASH_MAX_DURATION_SECONDS,
+        label="Duration (seconds)",
+    )
+
+    def __init__(self, *args, site=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["valve"].queryset = Valve.objects.filter(
+            relay_device__site=site
+        ).select_related("relay_device").order_by("name")
+        self.fields["valve"].widget.attrs["class"] = "form-select"
+        self.fields["duration_seconds"].widget.attrs["class"] = "form-control"
+
+
+class BaseValveMemberFormSet(forms.BaseFormSet):
+    def clean(self):
+        if any(self.errors):
+            return
+        seen = set()
+        count = 0
+        for form in self.forms:
+            values = form.cleaned_data
+            if not values or values.get("DELETE"):
+                continue
+            valve = values.get("valve")
+            if valve is None:
+                continue
+            if valve.pk in seen:
+                raise forms.ValidationError("Select each valve only once.")
+            seen.add(valve.pk)
+            count += 1
+        if not count:
+            raise forms.ValidationError("Select at least one valve.")
+
+
+ValveMemberFormSet = forms.formset_factory(
+    ValveMemberForm, formset=BaseValveMemberFormSet,
+    can_order=True, can_delete=True, extra=0, min_num=1, validate_min=True,
+)
 
 
 class LoginForm(AuthenticationForm):
@@ -201,8 +269,22 @@ class CurveForm(forms.Form):
         ),
     )
 
+    coverage_days = forms.IntegerField(
+        min_value=1, max_value=7, initial=2, label="Coverage (local days)",
+        widget=forms.NumberInput(attrs={"class": "form-control"}),
+    )
+    fallback_temperature_c = forms.FloatField(
+        required=False, label="Fallback temperature (°C)",
+        help_text="Set a finite site-specific value before enabling Smart.",
+        widget=forms.NumberInput(attrs={"class": "form-control", "step": "0.1"}),
+    )
+
     def clean(self) -> dict:
         cleaned = super().clean()
+        for name in ("min_mm", "max_mm", "g", "m", "fallback_temperature_c"):
+            value = cleaned.get(name)
+            if value is not None and not math.isfinite(value):
+                self.add_error(name, "Enter a finite value.")
         min_mm = cleaned.get("min_mm")
         max_mm = cleaned.get("max_mm")
         g = cleaned.get("g")

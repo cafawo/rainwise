@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import random
 import os
 import time
 from zoneinfo import ZoneInfo
@@ -12,7 +11,7 @@ from django.core.management.base import BaseCommand
 from django.db import close_old_connections
 from django.utils import timezone
 
-from apps.irrigation import services
+from apps.irrigation import group_services, services
 from apps.irrigation.models import (
     IrrigationRun,
     RelayDevice,
@@ -20,6 +19,7 @@ from apps.irrigation.models import (
     ScheduleRule,
     Site,
     Valve,
+    normalize_rule_mode,
 )
 from apps.weather.services import ensure_recent_weather
 
@@ -47,8 +47,8 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-CONTROLLER_INTERVAL_SECONDS = _env_int("CONTROLLER_INTERVAL_SECONDS", 30)
-RELAY_POLL_INTERVAL_SECONDS = _env_int("RELAY_POLL_INTERVAL_SECONDS", 30)
+CONTROLLER_INTERVAL_SECONDS = _env_int("CONTROLLER_INTERVAL_SECONDS", 60)
+RELAY_POLL_INTERVAL_SECONDS = _env_int("RELAY_POLL_INTERVAL_SECONDS", 60)
 WEATHER_REFRESH_HOURS = _env_int("WEATHER_REFRESH_HOURS", 6)
 WEATHER_LOOKBACK_DAYS = _env_int("WEATHER_LOOKBACK_DAYS", 30)
 WEATHER_RETRY_MINUTES = _env_int("WEATHER_RETRY_MINUTES", 60)
@@ -63,23 +63,24 @@ class Command(BaseCommand):
         last_poll_at: dt.datetime | None = None
         self._ensure_default_site()
         self._ensure_default_schedules()
+        self._recovery_pending = True
+        try:
+            group_services.recover_groups()
+            self._recovery_pending = False
+        except Exception:
+            logger.exception("Startup recovery failed; group execution remains blocked")
 
         while True:
             loop_started = timezone.now()
             close_old_connections()
 
             try:
-                poll_due = self._poll_due(loop_started, last_poll_at)
-                if poll_due:
+                if self._poll_due(loop_started, last_poll_at):
                     self._poll_relays(loop_started)
                     last_poll_at = loop_started
-
-                self._start_due_runs(loop_started)
-                recently_closed = self._stop_running_runs(loop_started)
-                self._watchdog_close(loop_started, recently_closed)
-                self._refresh_weather(loop_started)
-            except Exception:  # noqa: BLE001 - controller must keep running
-                logger.exception("Controller loop failed")
+            except Exception:
+                logger.exception("Relay polling failed")
+            self._tick(loop_started)
 
             elapsed = (timezone.now() - loop_started).total_seconds()
             sleep_for = max(1, CONTROLLER_INTERVAL_SECONDS - int(elapsed))
@@ -138,8 +139,6 @@ class Command(BaseCommand):
             )
         )
 
-        refreshed_sites: set[int] = set()
-
         for rule in rules:
             site = rule.valve.relay_device.site
             tz_name = site.timezone or settings.TIME_ZONE
@@ -157,51 +156,46 @@ class Command(BaseCommand):
 
             planned_start_at = local_now.replace(second=0, microsecond=0)
 
-            if IrrigationRun.objects.filter(
-                valve=rule.valve,
-                planned_start_at=planned_start_at,
-                trigger=IrrigationRun.TRIGGER_SCHEDULED,
-            ).exists():
-                continue
-
-            if rule.mode == ScheduleRule.MODE_DYNAMIC:
-                if site.id not in refreshed_sites:
-                    ensure_recent_weather(
-                        site,
-                        now=now,
-                        max_age_hours=WEATHER_REFRESH_HOURS,
-                        lookback_days=WEATHER_LOOKBACK_DAYS,
-                        min_retry_minutes=WEATHER_RETRY_MINUTES,
-                    )
-                    refreshed_sites.add(site.id)
-                max_duration = max(60, rule.max_duration_seconds)
-                optimal_duration = random.randint(60, max_duration)
-            else:
-                optimal_duration = rule.max_duration_seconds
-
-            run = IrrigationRun.objects.create(
-                valve=rule.valve,
-                trigger=IrrigationRun.TRIGGER_SCHEDULED,
-                requested_start_at=planned_start_at,
-                planned_start_at=planned_start_at,
-                actual_start_at=None,
-                optimal_duration_seconds=optimal_duration,
-                max_duration_seconds=rule.max_duration_seconds,
-                status=IrrigationRun.STATUS_PLANNED,
-            )
-
             try:
-                services.open_valve_for(rule.valve, optimal_duration)
-            except Exception as exc:  # noqa: BLE001 - capture hardware errors
-                run.status = IrrigationRun.STATUS_FAILED
-                run.stop_reason = IrrigationRun.STOP_ERROR
-                run.error_message = str(exc)
-                run.save(update_fields=["status", "stop_reason", "error_message"])
-                continue
+                if normalize_rule_mode(rule.mode) != ScheduleRule.MODE_FIXED:
+                    raise ValueError("Unsupported single-valve schedule mode")
+                group_services.start_single(
+                    rule.valve,
+                    rule.max_duration_seconds,
+                    IrrigationRun.TRIGGER_SCHEDULED,
+                    planned_start_at=planned_start_at,
+                    rule=rule,
+                )
+            except Exception as exc:
+                logger.warning("Scheduled start skipped/failed for rule %s: %s", rule.pk, exc)
 
-            run.status = IrrigationRun.STATUS_RUNNING
-            run.actual_start_at = now
-            run.save(update_fields=["status", "actual_start_at"])
+    def _tick(self, now: dt.datetime) -> None:
+        # Planning/weather failures cannot prevent stops or watchdog work.
+        # Groups run after the existing stops.
+        try:
+            self._start_due_runs(now)
+        except Exception:
+            logger.exception("Single-valve planning failed")
+        recently_closed = set()
+        try:
+            recently_closed = self._stop_running_runs(now)
+        except Exception:
+            logger.exception("Stopping runs failed")
+        try:
+            self._watchdog_close(now, recently_closed)
+        except Exception:
+            logger.exception("Watchdog failed")
+        try:
+            if getattr(self, "_recovery_pending", False):
+                group_services.recover_groups()
+                self._recovery_pending = False
+            group_services.group_tick()
+        except Exception:
+            logger.exception("Group planning/execution failed")
+        try:
+            self._refresh_weather(now)
+        except Exception:
+            logger.exception("Weather refresh failed")
 
     def _stop_running_runs(self, now: dt.datetime) -> set[int]:
         runs = IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
@@ -250,6 +244,11 @@ class Command(BaseCommand):
         run.stop_reason = reason
         run.actual_stop_at = now
         update_fields = ["status", "stop_reason", "actual_stop_at"]
+        if run.attempt_started_at is None and run.actual_start_at is not None:
+            # A pulse already running during upgrade has no new metadata. Keep
+            # its recorded timing, but require fresh closure before group work.
+            run.attempt_started_at = run.actual_start_at
+            update_fields.append("attempt_started_at")
         if error_message:
             run.error_message = error_message
             update_fields.append("error_message")

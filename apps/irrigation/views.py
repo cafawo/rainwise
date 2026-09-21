@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import datetime as dt
-import random
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView
-from django.db import models, transaction
+from django.core.exceptions import ValidationError
+from django.db import models
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -16,7 +16,7 @@ from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_POST
 
-from apps.irrigation import services
+from apps.irrigation import balance, group_services
 from apps.irrigation.curves import (
     DEFAULT_G,
     DEFAULT_M,
@@ -25,17 +25,22 @@ from apps.irrigation.curves import (
     KNOWN_POINTS,
     daily_water_required,
     generate_curve_points,
-    percentile,
 )
 from apps.irrigation.forms import (
     CurveForm,
     LoginForm,
     ScheduleLoadForm,
     ScheduleNewForm,
-    ScheduleRuleForm,
+    RuleEditorForm,
+    ValveMemberFormSet,
+    mask_from_days,
 )
 from apps.irrigation.models import (
     CurveSettings,
+    GroupedRule,
+    GroupedRuleValve,
+    RuleOccurrence,
+    normalize_rule_mode,
     IrrigationRun,
     Schedule,
     ScheduleRule,
@@ -44,7 +49,6 @@ from apps.irrigation.models import (
 )
 from apps.irrigation.site_context import store_active_site
 from apps.weather.models import WeatherObservation
-from apps.weather.services import ensure_recent_weather
 
 
 def _get_active_site(request: HttpRequest) -> Site | None:
@@ -76,6 +80,63 @@ def _using_default_sqlite() -> bool:
     return not postgres_host and not sqlite_path
 
 
+def _smart_status(site):
+    if not site:
+        return {}
+    now = timezone.now()
+    temperature = balance.temperature_selection(site, now)
+    temperature["latest_valid_time"] = (
+        dt.datetime.fromisoformat(temperature["latest_valid_at"])
+        if temperature["latest_valid_at"] else None
+    )
+    warnings = []
+    if site.active_schedule_id:
+        for rule in GroupedRule.objects.filter(
+            schedule_id=site.active_schedule_id, mode="SMART", enabled=True
+        ).prefetch_related("members__valve__relay_device"):
+            try:
+                decision = balance.build_smart_decision(site, list(rule.members.all()), now)
+                warnings.extend(
+                    warning for warning in decision["warnings"]
+                    if not warning.startswith("Operating with fallback")
+                )
+            except (ValidationError, ValueError) as exc:
+                warnings.append(str(exc))
+    return {"temperature": temperature, "quality_warnings": list(dict.fromkeys(warnings))}
+
+
+def _occurrence_cards(site, limit=30):
+    if not site:
+        return []
+    now = timezone.now()
+    occurrences = list(
+        RuleOccurrence.objects.filter(site=site).select_related("rule")
+        .prefetch_related("runs").order_by("-requested_at", "-pk")[:limit]
+    )
+    for occurrence in occurrences:
+        runs = list(occurrence.runs.all())
+        occurrence.progress_total = len(runs)
+        occurrence.progress_finished = sum(run.status == "FINISHED" for run in runs)
+        occurrence.member_names = " → ".join(
+            member.get("name", "")
+            for member in occurrence.config.get("members", [])
+        )
+        occurrence.decision_rows = []
+        for saved_row in occurrence.decision.get("valves", {}).values():
+            row = saved_row.copy()
+            estimates = [balance.delivery_estimate(run, cutoff=now) for run in runs
+                         if run.valve_id == row["valve_id"]]
+            row["execution_estimated_mm"] = sum(
+                estimate["estimated_mm"] or 0 for estimate in estimates
+            )
+            row["execution_unmet_mm"] = max(
+                0, row["target_mm"] - row["execution_estimated_mm"]
+            )
+            row["execution_uncertain"] = any(estimate["uncertain"] for estimate in estimates)
+            occurrence.decision_rows.append(row)
+    return occurrences
+
+
 @login_required
 def dashboard(request: HttpRequest) -> HttpResponse:
     site = _get_active_site(request)
@@ -104,6 +165,8 @@ def dashboard(request: HttpRequest) -> HttpResponse:
             "valves": valves,
             "running_valve_ids": running_valve_ids,
             "show_default_sqlite_warning": _using_default_sqlite(),
+            "occurrences": _occurrence_cards(site, limit=10),
+            **_smart_status(site),
         },
     )
 
@@ -111,55 +174,42 @@ def dashboard(request: HttpRequest) -> HttpResponse:
 @login_required
 def curve_view(request: HttpRequest) -> HttpResponse:
     default_params = {
-        "min_mm": DEFAULT_MIN_MM,
-        "max_mm": DEFAULT_MAX_MM,
-        "g": DEFAULT_G,
-        "m": DEFAULT_M,
+        "min_mm": DEFAULT_MIN_MM, "max_mm": DEFAULT_MAX_MM,
+        "g": DEFAULT_G, "m": DEFAULT_M,
     }
     site = _get_active_site(request)
-    settings_obj = (
-        CurveSettings.objects.filter(site=site).first() if site else None
-    )
-    stored_params = (
-        {
-            "min_mm": settings_obj.min_mm,
-            "max_mm": settings_obj.max_mm,
-            "g": settings_obj.g,
-            "m": settings_obj.m,
-        }
-        if settings_obj
-        else default_params
-    )
-
+    settings_obj = CurveSettings.objects.filter(site=site).first() if site else None
+    stored_params = {
+        **default_params, "coverage_days": 2, "fallback_temperature_c": None,
+    }
+    if settings_obj:
+        stored_params.update({key: getattr(settings_obj, key) for key in stored_params})
+    user_params = stored_params.copy()
     if request.method == "POST":
-        if "reset_defaults" in request.POST:
-            form = CurveForm(initial=default_params)
-            user_params = default_params
-            if site:
-                CurveSettings.objects.update_or_create(
-                    site=site,
-                    defaults=default_params,
-                )
-                messages.success(request, "Curve reset to defaults.")
+        data = request.POST.copy()
+        if "reset_defaults" in data:
+            data.update({**stored_params, **default_params})
+        elif "coverage_days" not in data:
+            data["coverage_days"] = stored_params["coverage_days"]
+        form = CurveForm(data)
+        if form.is_valid():
+            if not site:
+                form.add_error(None, "No site configured to store curve settings.")
             else:
-                messages.error(request, "No site configured to store curve settings.")
-        else:
-            form = CurveForm(request.POST)
-            if form.is_valid():
-                user_params = form.cleaned_data
-                if site:
-                    CurveSettings.objects.update_or_create(
-                        site=site,
-                        defaults=user_params,
-                    )
+                try:
+                    with group_services.site_admission(site):
+                        candidate, _ = CurveSettings.objects.update_or_create(
+                            site=site, defaults=form.cleaned_data
+                        )
+                        candidate.full_clean()
+                        for schedule in Schedule.objects.filter(site=site):
+                            group_services.validate_schedule(schedule)
+                    user_params = form.cleaned_data
                     messages.success(request, "Curve saved.")
-                else:
-                    messages.error(request, "No site configured to store curve settings.")
-            else:
-                user_params = stored_params
+                except (ValidationError, RuntimeError) as exc:
+                    form.add_error(None, str(exc))
     else:
         form = CurveForm(initial=stored_params)
-        user_params = stored_params
 
     default_curve = generate_curve_points(
         0,
@@ -180,32 +230,29 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         m=user_params["m"],
     )
 
+    status = _smart_status(site)
+    selected = status.get("temperature", {}).get("temperature_c")
     p90_point = None
-    site = _get_active_site(request)
+    if selected is not None:
+        p90_point = {"x": round(selected, 2), "y": round(daily_water_required(
+            selected, user_params["min_mm"], user_params["max_mm"],
+            user_params["g"], user_params["m"],
+        ), 3)}
+    capacity_rows = []
     if site:
-        cutoff = timezone.now() - dt.timedelta(hours=24)
-        temps = list(
-            WeatherObservation.objects.filter(
-                site=site,
-                timestamp__gte=cutoff,
-                temperature_c__isnull=False,
-            ).values_list("temperature_c", flat=True)
-        )
-        p90_temp = percentile(temps, 0.9)
-        if p90_temp is not None:
-            p90_point = {
-                "x": round(p90_temp, 2),
-                "y": round(
-                    daily_water_required(
-                        p90_temp,
-                        user_params["min_mm"],
-                        user_params["max_mm"],
-                        user_params["g"],
-                        user_params["m"],
-                    ),
-                    3,
+        for member in GroupedRuleValve.objects.filter(
+            rule__schedule=site.active_schedule, rule__mode="SMART"
+        ).select_related("valve", "rule"):
+            rate = member.valve.application_rate_mm_h
+            capacity = 2 * member.duration_seconds * rate / 3600 if rate else None
+            capacity_rows.append({
+                "valve": member.valve, "cap": member.duration_seconds, "capacity": capacity,
+                "cannot_sustain": capacity is not None and capacity < user_params["max_mm"],
+                "cannot_cover": (
+                    capacity is not None and capacity
+                    < user_params["coverage_days"] * user_params["max_mm"]
                 ),
-            }
+            })
 
     return render(
         request,
@@ -216,6 +263,8 @@ def curve_view(request: HttpRequest) -> HttpResponse:
             "default_curve": default_curve,
             "user_curve": user_curve,
             "p90_point": p90_point,
+            "capacity_rows": capacity_rows,
+            **status,
         },
     )
 
@@ -224,45 +273,14 @@ def curve_view(request: HttpRequest) -> HttpResponse:
 @require_POST
 def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
     site = _get_active_site(request)
-    if not site:
-        messages.warning(request, "Create a site in the admin before opening valves.")
-        return redirect("dashboard")
     valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
-    if IrrigationRun.objects.filter(
-        valve=valve, status=IrrigationRun.STATUS_RUNNING
-    ).exists():
-        messages.warning(request, "Valve is already running.")
-        return redirect("dashboard")
-
-    now = timezone.now()
-    max_duration = valve.default_max_duration_seconds
-    optimal_duration = max_duration
-
-    run = IrrigationRun.objects.create(
-        valve=valve,
-        trigger=IrrigationRun.TRIGGER_MANUAL,
-        requested_start_at=now,
-        planned_start_at=None,
-        actual_start_at=None,
-        optimal_duration_seconds=optimal_duration,
-        max_duration_seconds=max_duration,
-        status=IrrigationRun.STATUS_PLANNED,
-    )
-
     try:
-        services.open_valve_for(valve, max_duration)
-    except Exception as exc:  # noqa: BLE001 - surface hardware errors to user
-        run.status = IrrigationRun.STATUS_FAILED
-        run.stop_reason = IrrigationRun.STOP_ERROR
-        run.error_message = str(exc)
-        run.save(update_fields=["status", "stop_reason", "error_message"])
+        group_services.start_single(
+            valve, valve.default_max_duration_seconds, IrrigationRun.TRIGGER_MANUAL
+        )
+        messages.success(request, "Valve opened.")
+    except Exception as exc:
         messages.error(request, f"Failed to open valve: {exc}")
-        return redirect("dashboard")
-
-    run.status = IrrigationRun.STATUS_RUNNING
-    run.actual_start_at = now
-    run.save(update_fields=["status", "actual_start_at"])
-    messages.success(request, "Valve opened.")
     return redirect("dashboard")
 
 
@@ -270,34 +288,12 @@ def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
 @require_POST
 def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
     site = _get_active_site(request)
-    if not site:
-        messages.warning(request, "Create a site in the admin before closing valves.")
-        return redirect("dashboard")
     valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
-    now = timezone.now()
-    run = (
-        IrrigationRun.objects.filter(valve=valve, status=IrrigationRun.STATUS_RUNNING)
-        .order_by("-actual_start_at")
-        .first()
-    )
-
     try:
-        services.close_valve(valve)
-    except Exception as exc:  # noqa: BLE001 - surface hardware errors to user
-        if run:
-            run.status = IrrigationRun.STATUS_FAILED
-            run.stop_reason = IrrigationRun.STOP_ERROR
-            run.error_message = str(exc)
-            run.save(update_fields=["status", "stop_reason", "error_message"])
+        group_services.close_member(valve)
+        messages.success(request, "Closure requested. Any active rule is stopping.")
+    except Exception as exc:
         messages.error(request, f"Failed to close valve: {exc}")
-        return redirect("dashboard")
-
-    if run:
-        run.status = IrrigationRun.STATUS_FINISHED
-        run.stop_reason = IrrigationRun.STOP_MANUAL
-        run.actual_stop_at = now
-        run.save(update_fields=["status", "stop_reason", "actual_stop_at"])
-    messages.success(request, "Valve closed.")
     return redirect("dashboard")
 
 
@@ -315,6 +311,11 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
         .only("start_time", "max_duration_seconds")
         .order_by("start_time")
     )
+    group_list = list(
+        GroupedRule.objects.filter(schedule=active_schedule)
+        .prefetch_related("members__valve")
+    )
+    rule_list.extend(group_list)
     slot_min_time = None
     slot_max_time = None
 
@@ -323,7 +324,9 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
             _time_to_seconds(rule.start_time) for rule in rule_list
         )
         max_end_seconds = max(
-            _time_to_seconds(rule.start_time) + rule.max_duration_seconds
+            _time_to_seconds(rule.start_time) + (sum(group_services.reservation_seconds(rule))
+                                                   if isinstance(rule, GroupedRule)
+                                                   else rule.max_duration_seconds)
             for rule in rule_list
         )
         slot_min_time = _seconds_to_time_str(_floor_to_hour(min_start_seconds))
@@ -338,6 +341,7 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
             "schedules": schedules,
             "slot_min_time": slot_min_time,
             "slot_max_time": slot_max_time,
+            "rule_cards": [_rule_card(rule) for rule in rule_list],
         },
     )
 
@@ -353,105 +357,251 @@ def logs_view(request: HttpRequest) -> HttpResponse:
         else []
     )
     for run in runs:
+        run.delivery = balance.delivery_estimate(run)
         run.duration_minutes_display = "-"
         if run.actual_start_at and run.actual_stop_at:
             start = timezone.localtime(run.actual_start_at)
             stop = timezone.localtime(run.actual_stop_at)
             minutes = round((stop - start).total_seconds() / 60.0, 1)
             run.duration_minutes_display = f"{minutes:g}"
-    return render(request, "irrigation/logs.html", {"runs": runs})
+    return render(request, "irrigation/logs.html", {
+        "runs": runs, "occurrences": _occurrence_cards(site),
+    })
 
 
-@login_required
-def schedule_create(request: HttpRequest) -> HttpResponse:
+def _editor_data(request):
+    """Accept the old single-valve POST fields through the shared editor."""
+    if request.method != "POST":
+        return None
+    data = request.POST.copy()
+    if "members-TOTAL_FORMS" not in data and "valve" in data:
+        data.update({
+            "members-TOTAL_FORMS": "1", "members-INITIAL_FORMS": "1",
+            "members-MIN_NUM_FORMS": "1", "members-MAX_NUM_FORMS": "1000",
+            "members-0-valve": data.get("valve"),
+            "members-0-duration_seconds": data.get("max_duration_seconds"),
+            "members-0-ORDER": "1",
+        })
+    return data
+
+
+def _rule_urls(rule):
+    prefix = "group" if isinstance(rule, GroupedRule) else "schedule"
+    return {action + "_url": reverse(prefix + "_" + action, args=[rule.pk])
+            for action in ("edit", "copy", "delete", "run", "stop", "preview")
+            if prefix == "group" or action not in {"stop", "preview"}}
+
+
+def _edit_rule(request, rule=None, copying=False):
     site = _get_active_site(request)
     if not site:
-        messages.warning(request, "Create a site in the admin to add schedule rules.")
+        messages.warning(request, "Create a site before editing rules.")
         return redirect("dashboard")
-    active_schedule = _ensure_active_schedule(site)
-
-    if request.method == "POST":
-        form = ScheduleRuleForm(request.POST, site=site)
-        if form.is_valid():
-            rule = form.save(commit=False)
-            rule.schedule = active_schedule
-            rule.save()
-            messages.success(request, "Schedule rule created.")
-            return redirect("schedule")
-    else:
-        form = ScheduleRuleForm(site=site)
-    return render(request, "irrigation/schedule_form.html", {"form": form})
-
-
-@login_required
-def schedule_edit(request: HttpRequest, rule_id: int) -> HttpResponse:
-    site = _get_active_site(request)
-    if not site:
-        messages.warning(request, "Create a site in the admin to edit schedule rules.")
-        return redirect("schedule")
-    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
-    if request.method == "POST":
-        form = ScheduleRuleForm(request.POST, instance=rule, site=site)
-        if form.is_valid():
-            form.save()
-            messages.success(request, "Schedule rule updated.")
-            return redirect("schedule")
-    else:
-        form = ScheduleRuleForm(instance=rule, site=site)
-    return render(
-        request,
-        "irrigation/schedule_form.html",
-        {"form": form, "rule": rule},
+    schedule = rule.schedule if rule else _ensure_active_schedule(site)
+    is_group = isinstance(rule, GroupedRule)
+    initial = {"mode": "FIXED", "enabled": True}
+    members_initial = []
+    if rule:
+        initial.update({
+            "mode": normalize_rule_mode(rule.mode), "enabled": rule.enabled,
+            "days_of_week": [str(i) for i in range(7) if rule.uses_weekday(i)],
+            "start_time": rule.start_time, "note": rule.note,
+        })
+        members_initial = [
+            {"valve": member.valve_id, "duration_seconds": member.duration_seconds,
+             "ORDER": member.order}
+            for member in rule.members.order_by("order")
+        ] if is_group else [{
+            "valve": rule.valve_id, "duration_seconds": rule.max_duration_seconds,
+            "ORDER": 1,
+        }]
+    data = _editor_data(request)
+    form = RuleEditorForm(data, initial=initial)
+    members_formset = ValveMemberFormSet(
+        data, prefix="members", initial=members_initial if data is None else None,
+        form_kwargs={"site": site}
     )
+    if request.method == "POST":
+        valid_form = form.is_valid()
+        valid_members = members_formset.is_valid()
+        if valid_form and valid_members:
+            values = form.cleaned_data
+            selected = [row.cleaned_data for row in members_formset.ordered_forms]
+            grouped = is_group or values["mode"] == "SMART" or len(selected) > 1
+            attributes = {
+                "schedule": schedule, "mode": values["mode"],
+                "enabled": values["enabled"], "note": values["note"],
+                "days_of_week_mask": mask_from_days(values["days_of_week"]),
+                "start_time": values["start_time"],
+            }
+            try:
+                with group_services.site_admission(site):
+                    existing = None if copying else rule
+                    if grouped:
+                        candidate = (
+                            GroupedRule.objects.get(pk=existing.pk)
+                            if is_group and existing else GroupedRule()
+                        )
+                        for key, value in attributes.items():
+                            setattr(candidate, key, value)
+                        members = [GroupedRuleValve(
+                            rule=candidate, valve=row["valve"], order=index,
+                            duration_seconds=row["duration_seconds"],
+                        ) for index, row in enumerate(selected, 1)]
+                        if existing:
+                            old_members = ([(m.valve_id, m.order) for m in
+                                            existing.members.order_by("order")]
+                                           if is_group else [(existing.valve_id, 1)])
+                            new_members = [(m.valve_id, m.order) for m in members]
+                            if (not is_group or old_members != new_members or
+                                    normalize_rule_mode(existing.mode) != candidate.mode):
+                                group_services.assert_configuration_editable(existing)
+                        group_services.validate_configuration(
+                            candidate, members=members, exclude_rule=existing
+                        )
+                        if existing and is_group and not candidate.enabled:
+                            group_services.cancel_rule(existing, "Rule disabled")
+                        candidate.save()
+                        if existing and is_group:
+                            candidate.members.all().delete()
+                        for member in members:
+                            member.rule = candidate
+                        GroupedRuleValve.objects.bulk_create(members)
+                        if existing and not is_group:
+                            existing.delete()
+                    else:
+                        candidate = (
+                            ScheduleRule.objects.get(pk=existing.pk)
+                            if existing else ScheduleRule()
+                        )
+                        attributes.update(
+                            valve=selected[0]["valve"],
+                            max_duration_seconds=selected[0]["duration_seconds"],
+                        )
+                        for key, value in attributes.items():
+                            setattr(candidate, key, value)
+                        candidate.full_clean()
+                        group_services.validate_configuration(candidate, exclude_rule=existing)
+                        candidate.save()
+                messages.success(request, "Schedule rule saved.")
+                if existing and not is_group and grouped:
+                    return redirect("group_edit", rule_id=candidate.pk)
+                return redirect("schedule")
+            except (ValidationError, RuntimeError) as exc:
+                error = (
+                    "; ".join(exc.messages)
+                    if isinstance(exc, ValidationError) else str(exc)
+                )
+                form.add_error(None, error)
+    context = {"form": form, "members_formset": members_formset,
+               "rule": None if copying else rule, "is_group": is_group,
+               "editing_existing": bool(rule and not copying)}
+    if rule and not copying:
+        context.update(_rule_urls(rule))
+        context["smart"] = normalize_rule_mode(rule.mode) == "SMART"
+    return render(request, "irrigation/schedule_form.html", context)
 
 
 @login_required
-def schedule_copy(request: HttpRequest, rule_id: int) -> HttpResponse:
-    site = _get_active_site(request)
-    if not site:
-        messages.warning(request, "Create a site in the admin to copy schedule rules.")
-        return redirect("schedule")
-    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
-    if request.method == "POST":
-        form = ScheduleRuleForm(request.POST, site=site)
-        if form.is_valid():
-            new_rule = form.save(commit=False)
-            new_rule.schedule = rule.schedule
-            new_rule.save()
-            messages.success(request, "Schedule rule copied.")
-            return redirect("schedule")
-    else:
-        selected_days = [
-            str(idx)
-            for idx in range(7)
-            if rule.days_of_week_mask & (1 << idx)
-        ]
-        form = ScheduleRuleForm(
-            site=site,
-            initial={
-                "valve": rule.valve_id,
-                "enabled": rule.enabled,
-                "days_of_week": selected_days,
-                "start_time": rule.start_time,
-                "mode": rule.mode,
-                "max_duration_seconds": rule.max_duration_seconds,
-                "note": rule.note,
-            },
-        )
-    return render(request, "irrigation/schedule_form.html", {"form": form})
+def schedule_create(request):
+    return _edit_rule(request)
+
+
+@login_required
+def schedule_edit(request, rule_id):
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=_get_active_site(request))
+    return _edit_rule(request, rule)
+
+
+@login_required
+def schedule_copy(request, rule_id):
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=_get_active_site(request))
+    return _edit_rule(request, rule, copying=True)
+
+
+@login_required
+def group_edit(request, rule_id):
+    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
+    return _edit_rule(request, rule)
+
+
+@login_required
+def group_copy(request, rule_id):
+    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
+    return _edit_rule(request, rule, copying=True)
 
 
 @login_required
 @require_POST
-def schedule_delete(request: HttpRequest, rule_id: int) -> HttpResponse:
-    site = _get_active_site(request)
-    if not site:
-        messages.warning(request, "Create a site in the admin to delete schedule rules.")
-        return redirect("schedule")
-    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
-    rule.delete()
+def schedule_delete(request, rule_id):
+    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=_get_active_site(request))
+    with group_services.site_admission(rule.schedule.site):
+        rule.delete()
     messages.success(request, "Schedule rule deleted.")
     return redirect("schedule")
+
+
+@login_required
+@require_POST
+def group_delete(request, rule_id):
+    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
+    with group_services.site_admission(rule.schedule.site):
+        group_services.cancel_rule(rule, "Rule deleted")
+        rule.delete()
+    messages.success(request, "Rule deleted. Any active watering is stopping.")
+    return redirect("schedule")
+
+
+@login_required
+@require_POST
+def group_stop(request, rule_id):
+    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
+    group_services.cancel_rule(rule, "Stopped by user")
+    messages.success(request, "Stopping rule; waiting for confirmed closure.")
+    return redirect("dashboard")
+
+
+@login_required
+@require_POST
+def group_run(request, rule_id):
+    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
+    try:
+        group_services.request_fixed_group(rule)
+        messages.success(request, "Run requested. The controller will execute the sequence.")
+    except (ValidationError, RuntimeError) as exc:
+        messages.error(request, str(exc))
+    return redirect("group_edit", rule_id=rule.pk)
+
+
+@login_required
+def group_preview(request, rule_id):
+    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
+    decision = None
+    error = None
+    try:
+        group_services.validate_configuration(rule)
+        if rule.mode != "SMART":
+            raise ValidationError("Preview is available for Smart rules.")
+        decision = balance.build_smart_decision(
+            rule.schedule.site, list(rule.members.select_related("valve").order_by("order")),
+            timezone.now(),
+        )
+    except (ValidationError, ValueError, RuntimeError) as exc:
+        error = str(exc)
+    watering, handover = group_services.reservation_seconds(rule)
+    return render(request, "irrigation/preview.html", {
+        "rule": rule, "decision": decision, "error": error,
+        "decision_rows": list(decision["valves"].values()) if decision else [],
+        "rain_cutoff": (
+            dt.datetime.fromisoformat(decision["rain"]["cutoff_at"])
+            if decision else None
+        ),
+        "latest_valid_weather": (
+            dt.datetime.fromisoformat(decision["temperature"]["latest_valid_at"])
+            if decision and decision["temperature"]["latest_valid_at"] else None
+        ),
+        "watering_seconds": watering, "handover_seconds": handover,
+    })
 
 
 @login_required
@@ -471,37 +621,37 @@ def schedule_new(request: HttpRequest) -> HttpResponse:
             description = form.cleaned_data.get("description", "")
             copy_current = form.cleaned_data["copy_current"]
 
-            with transaction.atomic():
-                new_schedule = Schedule.objects.create(
-                    site=site, name=name, description=description
-                )
-                if copy_current:
-                    existing_rules = list(
-                        ScheduleRule.objects.filter(schedule=active_schedule)
-                        .select_related("valve")
-                        .order_by("id")
+            try:
+                with group_services.site_admission(site):
+                    new_schedule = Schedule.objects.create(
+                        site=site, name=name, description=description
                     )
-                    cloned_rules = [
-                        ScheduleRule(
-                            schedule=new_schedule,
-                            valve=rule.valve,
-                            enabled=rule.enabled,
-                            days_of_week_mask=rule.days_of_week_mask,
-                            start_time=rule.start_time,
-                            mode=rule.mode,
-                            max_duration_seconds=rule.max_duration_seconds,
-                            note=rule.note,
-                        )
-                        for rule in existing_rules
-                    ]
-                    if cloned_rules:
-                        ScheduleRule.objects.bulk_create(cloned_rules)
-
-                site.active_schedule = new_schedule
-                site.save(update_fields=["active_schedule"])
-
-            messages.success(request, "Schedule created.")
-            return redirect("schedule")
+                    if copy_current:
+                        for source in active_schedule.rules.all():
+                            mode = normalize_rule_mode(source.mode)
+                            if mode != "FIXED":
+                                raise ValidationError("Unsupported single-valve rule mode.")
+                            source.pk = None
+                            source.schedule = new_schedule
+                            source.mode = mode
+                            source.save()
+                        for source in GroupedRule.objects.filter(schedule=active_schedule):
+                            members = list(source.members.order_by("order"))
+                            source.pk = None
+                            source.schedule = new_schedule
+                            source.save()
+                            for member in members:
+                                member.pk = None
+                                member.rule = source
+                                member.save()
+                    group_services.validate_schedule(new_schedule)
+                    group_services.cancel_site_groups(site, "Active schedule changed")
+                    site.active_schedule = new_schedule
+                    site.save(update_fields=["active_schedule"])
+                messages.success(request, "Schedule created.")
+                return redirect("schedule")
+            except (ValidationError, RuntimeError) as exc:
+                form.add_error(None, str(exc))
     else:
         form = ScheduleNewForm(schedules=schedules)
 
@@ -528,10 +678,17 @@ def schedule_load(request: HttpRequest) -> HttpResponse:
         form = ScheduleLoadForm(request.POST, schedules=schedules)
         if form.is_valid():
             schedule = form.cleaned_data["schedule"]
-            site.active_schedule = schedule
-            site.save(update_fields=["active_schedule"])
-            messages.success(request, f"Loaded schedule: {schedule.name}.")
-            return redirect("schedule")
+            try:
+                with group_services.site_admission(site):
+                    group_services.validate_schedule(schedule)
+                    if site.active_schedule_id != schedule.pk:
+                        group_services.cancel_site_groups(site, "Active schedule changed")
+                    site.active_schedule = schedule
+                    site.save(update_fields=["active_schedule"])
+                messages.success(request, f"Loaded schedule: {schedule.name}.")
+                return redirect("schedule")
+            except (ValidationError, RuntimeError) as exc:
+                form.add_error(None, str(exc))
     else:
         form = ScheduleLoadForm(
             schedules=schedules, initial={"schedule": site.active_schedule_id}
@@ -577,8 +734,15 @@ class RainwiseLoginView(LoginView):
     authentication_form = LoginForm
 
 
-def _rule_title(rule: ScheduleRule) -> str:
-    return rule.valve.name
+def _rule_card(rule):
+    grouped = isinstance(rule, GroupedRule)
+    watering, handover = (group_services.reservation_seconds(rule) if grouped
+                         else (rule.max_duration_seconds, 0))
+    return {"rule": rule, "mode": normalize_rule_mode(rule.mode).title(),
+            "members": " → ".join(m.valve.name for m in rule.members.order_by("order"))
+            if grouped else rule.valve.name,
+            "watering_seconds": watering, "handover_seconds": handover,
+            **_rule_urls(rule)}
 
 
 @login_required
@@ -599,35 +763,46 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
         "valve__relay_device",
         "valve__relay_device__site",
     )
+    rules = list(rules) + list(GroupedRule.objects.filter(
+        schedule=active_schedule
+    ).prefetch_related("members__valve"))
     events: list[dict] = []
-
+    tz = ZoneInfo(site.timezone or settings.TIME_ZONE)
     current_date = start.date()
-    end_date = end.date()
-
-    while current_date < end_date:
+    while current_date < end.date():
         for rule in rules:
-            site = rule.valve.relay_device.site
-            tz_name = site.timezone or settings.TIME_ZONE
-            tz = ZoneInfo(tz_name)
-            weekday = current_date.weekday()
-            if not rule.uses_weekday(weekday):
+            if not rule.uses_weekday(current_date.weekday()):
                 continue
-            start_dt = dt.datetime.combine(current_date, rule.start_time).replace(tzinfo=tz)
-            end_dt = start_dt + dt.timedelta(seconds=rule.max_duration_seconds)
+            start_dt = dt.datetime.combine(current_date, rule.start_time, tzinfo=tz)
+            # A gap has no corresponding local instant. A fold has one event.
+            if (isinstance(rule, GroupedRule) and
+                    start_dt.astimezone(dt.timezone.utc).astimezone(tz).replace(tzinfo=None)
+                    != start_dt.replace(tzinfo=None)):
+                continue
+            card = _rule_card(rule)
+            seconds = card["watering_seconds"] + card["handover_seconds"]
+            grouped = isinstance(rule, GroupedRule)
+            if grouped:
+                end_dt = (
+                    start_dt.astimezone(dt.timezone.utc)
+                    + dt.timedelta(seconds=seconds)
+                ).astimezone(tz)
+            else:
+                end_dt = start_dt + dt.timedelta(seconds=seconds)
             event = {
-                "title": _rule_title(rule),
-                "start": start_dt.isoformat(),
-                "end": end_dt.isoformat(),
-                "edit_url": reverse("schedule_edit", args=[rule.id]),
+                "id": f"{'group' if grouped else 'single'}-{rule.pk}-{current_date}",
+                "title": f"{card['mode']}: {card['members']}" if grouped else rule.valve.name,
+                "start": start_dt.isoformat(), "end": end_dt.isoformat(),
+                "edit_url": card["edit_url"], "mode": card["mode"],
+                "members": card["members"],
+                "watering_seconds": card["watering_seconds"],
+                "handover_seconds": card["handover_seconds"],
             }
             if not rule.enabled:
-                event.update(
-                    {
-                        "backgroundColor": "#e9ecef",
-                        "borderColor": "#ced4da",
-                        "textColor": "#6c757d",
-                    }
-                )
+                event.update({
+                    "backgroundColor": "#e9ecef", "borderColor": "#ced4da",
+                    "textColor": "#6c757d",
+                })
             events.append(event)
         current_date += dt.timedelta(days=1)
 
@@ -841,45 +1016,19 @@ def valve_status(request: HttpRequest) -> JsonResponse:
 @login_required
 @require_POST
 def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
-    site = _get_active_site(request)
-    if not site:
-        messages.warning(request, "Create a site in the admin before starting runs.")
-        return redirect("schedule")
-    rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=site)
-    now = timezone.now()
-    optimal_duration = rule.max_duration_seconds
-    if rule.mode == ScheduleRule.MODE_DYNAMIC:
-        ensure_recent_weather(
-            rule.valve.relay_device.site,
-            now=now,
-        )
-        optimal_duration = random.randint(60, rule.max_duration_seconds)
-
-    run = IrrigationRun.objects.create(
-        valve=rule.valve,
-        trigger=IrrigationRun.TRIGGER_MANUAL,
-        requested_start_at=now,
-        planned_start_at=None,
-        actual_start_at=None,
-        optimal_duration_seconds=optimal_duration,
-        max_duration_seconds=rule.max_duration_seconds,
-        status=IrrigationRun.STATUS_PLANNED,
+    rule = get_object_or_404(
+        ScheduleRule, pk=rule_id, schedule__site=_get_active_site(request)
     )
-
     try:
-        services.open_valve_for(rule.valve, optimal_duration)
-    except Exception as exc:  # noqa: BLE001 - surface hardware errors to user
-        run.status = IrrigationRun.STATUS_FAILED
-        run.stop_reason = IrrigationRun.STOP_ERROR
-        run.error_message = str(exc)
-        run.save(update_fields=["status", "stop_reason", "error_message"])
+        if normalize_rule_mode(rule.mode) != ScheduleRule.MODE_FIXED:
+            raise ValidationError("Unsupported rule mode; no valve was opened.")
+        group_services.start_single(
+            rule.valve, rule.max_duration_seconds, IrrigationRun.TRIGGER_MANUAL,
+            rule=rule,
+        )
+        messages.success(request, "Run started.")
+    except Exception as exc:
         messages.error(request, f"Failed to start run: {exc}")
-        return redirect("schedule")
-
-    run.status = IrrigationRun.STATUS_RUNNING
-    run.actual_start_at = now
-    run.save(update_fields=["status", "actual_start_at"])
-    messages.success(request, "Run started.")
     return redirect("schedule")
 
 

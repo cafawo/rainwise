@@ -62,7 +62,7 @@ class ControllerScheduleTests(TestCase):
         self.assertEqual(run.trigger, IrrigationRun.TRIGGER_SCHEDULED)
         self.assertEqual(run.status, IrrigationRun.STATUS_RUNNING)
 
-    def test_dynamic_run_opens_for_optimal_duration(self) -> None:
+    def test_residual_dynamic_runs_fixed_at_stored_maximum(self) -> None:
         now = timezone.now().astimezone(dt.timezone.utc)
         start_time = now.time().replace(second=0, microsecond=0)
 
@@ -72,28 +72,53 @@ class ControllerScheduleTests(TestCase):
             enabled=True,
             days_of_week_mask=1 << now.weekday(),
             start_time=start_time,
-            mode=ScheduleRule.MODE_DYNAMIC,
+            mode="FIXED",
             max_duration_seconds=600,
         )
 
+        ScheduleRule.objects.update(mode="DYNAMIC")
         command = Command()
         with (
-            mock.patch(
-                "apps.irrigation.services.open_valve_for"
-            ) as open_valve_for,
+            mock.patch("apps.irrigation.services.open_valve_for") as opening,
             mock.patch(
                 "apps.irrigation.management.commands.controller.ensure_recent_weather"
-            ),
-            mock.patch(
-                "apps.irrigation.management.commands.controller.random.randint",
-                return_value=123,
-            ),
+            ) as weather,
         ):
             command._start_due_runs(now)
-
         run = IrrigationRun.objects.get()
-        self.assertEqual(run.optimal_duration_seconds, 123)
-        open_valve_for.assert_called_once_with(self.valve, 123)
+        self.assertEqual(run.optimal_duration_seconds, 600)
+        opening.assert_called_once_with(self.valve, 600)
+        weather.assert_not_called()
+
+    def test_unknown_and_misrouted_smart_modes_never_open(self):
+        now = timezone.now().astimezone(dt.timezone.utc)
+        rule = ScheduleRule.objects.create(
+            schedule=self.schedule, valve=self.valve, enabled=True,
+            days_of_week_mask=1 << now.weekday(),
+            start_time=now.time().replace(second=0, microsecond=0),
+            mode="FIXED", max_duration_seconds=600,
+        )
+        with mock.patch("apps.irrigation.services.open_valve_for") as opening:
+            for invalid in ("SMART", "UNKNOWN"):
+                ScheduleRule.objects.filter(pk=rule.pk).update(mode=invalid)
+                Command()._start_due_runs(now)
+        opening.assert_not_called()
+        self.assertFalse(IrrigationRun.objects.exists())
+
+    def test_planner_failures_leave_stops_and_watchdog_operational(self):
+        command = Command()
+        with (
+            mock.patch.object(command, "_start_due_runs", side_effect=ValueError("bad rule")),
+            mock.patch.object(command, "_stop_running_runs", return_value={self.valve.pk}) as stop,
+            mock.patch.object(command, "_watchdog_close") as watchdog,
+            mock.patch("apps.irrigation.group_services.group_tick", side_effect=ValueError("bad group")),
+            mock.patch.object(command, "_refresh_weather") as weather,
+        ):
+            now = timezone.now()
+            command._tick(now)
+        stop.assert_called_once_with(now)
+        watchdog.assert_called_once_with(now, {self.valve.pk})
+        weather.assert_called_once_with(now)
 
     def test_fixed_run_stops_as_completed(self) -> None:
         now = timezone.now().astimezone(dt.timezone.utc)

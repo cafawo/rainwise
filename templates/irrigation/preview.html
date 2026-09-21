@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Smart preview | Rainwise{% endblock %}
+{% block content %}
+<h1 class="h3">Smart preview</h1>
+<p>This estimate uses cached weather and recorded delivery now. Scheduled execution saves its own decision at admission. Preview never starts watering.</p>
+<p>Calendar reservation: {{ watering_seconds }} seconds of configured maximum watering + {{ handover_seconds }} seconds handover allowance. The calculated dose does not shorten this reservation.</p>
+{% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
+{% if decision %}
+<p>Daily need {{ decision.daily_need_mm|floatformat:2 }} mm/day × {{ decision.coverage_days }} local days. Known rain credit: {{ decision.rain.credit_mm|floatformat:2 }} mm, through {{ rain_cutoff|date:"Y-m-d H:i T" }}.</p>
+<p>Temperature: {{ decision.temperature.temperature_c|floatformat:1 }} °C ({{ decision.temperature.source }}). Latest valid weather: {% if latest_valid_weather %}{{ latest_valid_weather|date:"Y-m-d H:i T" }}{% else %}Unavailable{% endif %}.</p>
+{% for warning in decision.warnings %}<div class="alert alert-warning">{{ warning }}</div>{% endfor %}
+{% include "irrigation/decision_table.html" %}
+{% endif %}
+<a class="btn btn-secondary" href="{% url 'group_edit' rule.id %}">Back to rule</a>
+{% endblock %}

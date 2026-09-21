@@ -18,10 +18,10 @@
       <div class="hero-content">
         <div>
           <p class="eyebrow">Irrigation control, simplified</p>
-          <h1>Smart scheduling with a weather-ready core.</h1>
+          <h1>Fixed schedules and Smart watering.</h1>
           <p class="lead">
             Rainwise is a lightweight Django app for managing valves, schedules,
-            and the science behind dynamic watering. Built for reliability,
+            and a rolling balance of weather and delivered water. Built for reliability,
             low resource usage, and simple deployment.
           </p>
           <div class="hero-actions">
@@ -36,7 +36,7 @@
             <li>Schedule watering by day and time</li>
             <li>Keep valves safe with max-duration failsafes</li>
             <li>Visualize daily irrigation and weather context</li>
-            <li>Calibrate an irrigation curve for dynamic control</li>
+            <li>Calibrate each zone and preview Smart demand</li>
           </ul>
         </div>
       </div>
@@ -53,10 +53,10 @@
           </p>
         </div>
         <div class="feature-card">
-          <h3>Weather-aware foundations</h3>
+          <h3>Weather and watering history</h3>
           <p>
-            Hourly weather data is stored for future optimization. The curve view
-            makes the irrigation model explicit, adjustable, and inspectable.
+            Smart rules use recent temperature, rain, and recorded watering.
+            The curve view shows demand, zone capacity, and fallback conditions.
           </p>
         </div>
         <div class="feature-card">
@@ -100,11 +100,11 @@
           </div>
         </div>
         <div class="tech-card">
-          <h3>What comes next</h3>
+          <h3>Bounded, ordered execution</h3>
           <p>
-            Dynamic irrigation will combine curve parameters, weather history,
-            and site-specific factors like soil type, wind exposure, and irrigation
-            efficiency to compute optimal run times.
+            Fixed groups water once in valve order. Smart groups use up to two
+            bounded runs per valve, with confirmed closure before advancing.
+            Calendar reservations include configured maxima and controller handovers.
           </p>
         </div>
       </div>

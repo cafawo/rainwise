@@ -25,6 +25,16 @@
     <div id="calendar"></div>
   </div>
 </div>
+<div class="row g-3">
+{% for card in rule_cards %}
+<div class="col-md-6"><div class="card"><div class="card-body">
+  <h2 class="h5"><a href="{{ card.edit_url }}">{{ card.mode }}: {{ card.members }}</a></h2>
+  <p>{{ card.rule.days_display }} at {{ card.rule.start_time }}{% if not card.rule.enabled %} · Disabled{% endif %}</p>
+  <p>Watering: {{ card.watering_seconds }} seconds. Handover allowance: {{ card.handover_seconds }} seconds.</p>
+  {% if card.rule.note %}<p>{{ card.rule.note }}</p>{% endif %}
+</div></div></div>
+{% empty %}<p>No rules yet.</p>{% endfor %}
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -40,6 +50,7 @@
         timeZone: "{{ calendar_timezone }}",
         events: "{% url 'calendar_events' %}",
         eventDidMount: function (info) {
+          info.el.title = `${info.event.extendedProps.mode}: ${info.event.extendedProps.members}. Watering ${info.event.extendedProps.watering_seconds}s + handover ${info.event.extendedProps.handover_seconds}s`;
           info.el.addEventListener("dblclick", function () {
             const editUrl = info.event.extendedProps.edit_url;
             if (editUrl) {

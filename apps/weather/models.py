@@ -11,6 +11,7 @@ class WeatherObservation(models.Model):
     temperature_c = models.FloatField(null=True, blank=True)
     precipitation_mm = models.FloatField(null=True, blank=True)
     humidity_percent = models.FloatField(null=True, blank=True)
+    retrieved_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
@@ -35,6 +36,7 @@ class WeatherImportLog(models.Model):
     site = models.ForeignKey(Site, on_delete=models.CASCADE)
     date = models.DateField()
     imported_at = models.DateTimeField(auto_now_add=True)
+    last_success_at = models.DateTimeField(null=True, blank=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES)
     error_message = models.TextField(blank=True)
 

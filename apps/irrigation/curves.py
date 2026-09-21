@@ -23,7 +23,18 @@ def daily_water_required(
     g: float = DEFAULT_G,
     m: float = DEFAULT_M,
 ) -> float:
-    return min_mm + (max_mm - min_mm) / (1 + math.exp(-g * (temp_c - m)))
+    if not all(math.isfinite(value) for value in (temp_c, min_mm, max_mm, g, m)):
+        raise ValueError("Curve inputs must be finite.")
+    if not 0 <= min_mm <= max_mm or g <= 0:
+        raise ValueError("Require 0 ≤ minimum ≤ maximum and positive growth rate.")
+    exponent = g * (temp_c - m)
+    # Equivalent sigmoid, evaluated on its bounded side to avoid overflow.
+    if exponent >= 0:
+        fraction = 1 / (1 + math.exp(-exponent))
+    else:
+        exponential = math.exp(exponent)
+        fraction = exponential / (1 + exponential)
+    return min_mm + (max_mm - min_mm) * fraction
 
 
 def generate_curve_points(

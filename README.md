@@ -5,7 +5,9 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 ## Features (MVP)
 
 - Dashboard with valve status and manual open/close.
-- Weekly schedules with fixed or dynamic durations.
+- Weekly Fixed and Smart rules with one or more ordered valves.
+- Fixed runs once per valve; Smart calculates up to two bounded runs per valve
+  and local day from temperature, rain, and recorded irrigation.
 - Multiple schedules with an active schedule switch.
 - Controller loop that enforces planned stops and hard failsafe stops.
 - Weather import (Open-Meteo) stored as hourly observations.
@@ -16,13 +18,15 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 
 ## Local Development
 
-1. Create and activate a virtual environment.
-2. Install dependencies:
+1. Create and activate the project Conda environment:
 
 ```bash
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate rainwise
 ```
 
+2. Copy `.env.example` to `.env`, configure the database, and keep
+   `RELAY_SIMULATOR=true` for development without hardware.
 3. Run migrations and create a superuser:
 
 ```bash
@@ -134,8 +138,8 @@ you can catch accidental non-persistent setups.
 
 Controller:
 
-- `CONTROLLER_INTERVAL_SECONDS` (default `30`)
-- `RELAY_POLL_INTERVAL_SECONDS` (default `30`)
+- `CONTROLLER_INTERVAL_SECONDS` (default `60`)
+- `RELAY_POLL_INTERVAL_SECONDS` (default `60`)
 - `WEATHER_REFRESH_HOURS` (default `6`)
 - `WEATHER_LOOKBACK_DAYS` (default `30`)
 - `WEATHER_RETRY_MINUTES` (default `60`)
@@ -174,7 +178,11 @@ Use the Django admin to create or edit:
 1. `Site` with timezone and lat/lon.
 2. `RelayDevice` with Modbus host/port/unit.
 3. `Valve` entries mapped to relay channels.
-4. `ScheduleRule` entries for weekly scheduling.
+4. Valve application rates and curve settings before enabling Smart rules.
+
+Create and edit rules from the schedule page. The same editor supports existing
+single-valve Fixed rules, Fixed groups, and Smart rules. Only the site's active
+schedule executes automatically.
 
 `Valve.is_active_high` (checkbox in admin) controls coil polarity:
 - Checked: coil ON means valve OPEN.
@@ -197,8 +205,213 @@ Use the Django admin to create or edit:
   expires.
 - Manual close and watchdog logic still send normal close commands for early
   cancellation and extra recovery.
-- The controller is designed for 30s cadence (no busy loops).
+- The controller and relay polling default to a 60-second cadence (no busy loops).
 
 ## Hardware Access
 
-Hardware I/O is isolated in `apps/irrigation/services.py` and is never performed in HTTP request/response code. Use `RELAY_SIMULATOR=true` for local/dev without hardware.
+Hardware I/O is isolated in `apps/irrigation/services.py`; views call services
+instead of containing hardware logic. Group sequences are executed only by the
+single controller process. Existing individual manual controls use their service
+path. Use `RELAY_SIMULATOR=true` for local/dev without hardware.
+
+## Fixed and Smart Rules
+
+Choose a mode, select and order valves at the active site, choose weekdays and
+one local start time, and set a duration for each valve. Fixed requires explicit
+weekday selection; Smart initially selects all seven days. Excluded days prevent
+scheduled execution but remain part of water history. Each Smart valve has its
+own target; grouping does not divide water between zones. Overlapping watered
+areas need a separate allocation design.
+
+Fixed runs each member once in order, with durations of 60–3276 seconds. It needs
+neither calibration nor weather. Existing single-valve Fixed rules retain their
+IDs, schedule, timing, and manual Run now behavior. A valve's default manual
+duration is not an additional ceiling on a Fixed rule.
+
+Smart runs a first pass in valve order and, when needed, a second pass. Fulfilled
+valves are skipped and a final pulse can be shortened to a whole second. It
+requires a finite positive application rate for every member, valid curve
+settings, and an explicitly configured finite fallback temperature. Each per-run
+maximum is 1–3276 seconds and must not exceed that valve's default maximum.
+There are at most two logical Smart attempts per valve/local day, including
+uncertain attempts in copied or switched schedules. Retries belong to the same
+logical attempt. A valve can belong to only one enabled Smart rule per schedule.
+
+Fixed group **Run now** submits a durable request for the controller; it requires
+an enabled rule in the active schedule and a free site. Repeating the request
+returns its pending/active occurrence. Smart has **Preview** and **Stop**, and
+starts only at its scheduled minute. There is no unscheduled Smart override.
+
+## Calibration and the Rolling Water Balance
+
+Measure each zone with catch containers. Average collected depth in millimetres
+divided by watering time in hours gives the valve's application rate in mm/hour.
+There is no assumed rate. New calibrated runs snapshot the rate; changing a
+calibration does not change historical credit. Old runs without a rate remain
+unknown. See [CSU's home lawn irrigation guidance](https://extension.colostate.edu/resource/methods-to-schedule-home-lawn-irrigation/).
+
+The curve returns daily demand in mm/day from temperature in °C. `min_mm` and
+`max_mm` are finite and satisfy `0 <= min_mm <= max_mm`; `g` is finite and positive
+and `m` is finite. `coverage_days` is an integer from 1 through 7, default 2.
+Configure a fallback temperature appropriate to the site; no universal default
+is supplied. The curve page shows inputs and capacity per configured valve.
+
+At the actual admitted decision instant, Smart applies today's demand estimate
+to the whole coverage window:
+
+```text
+target_mm = max(0, coverage_days * daily_need - rain_credit - valve_irrigation_credit)
+daily_capacity_mm = 2 * per_run_max_seconds * application_rate_mm_h / 3600
+planned_seconds = floor(min(target_mm, daily_capacity_mm) / application_rate_mm_h * 3600)
+```
+
+Rain credit covers `coverage_days` local-day periods ending at the last completed
+provider hourly boundary. At 06:30 with whole-hour weather it ends at 06:00; the
+remaining half-hour is not treated as missing. Irrigation credit covers the
+preceding `coverage_days - 1` calendar dates plus delivery earlier today. Thus a
+two-day decision on Wednesday credits Tuesday and earlier Wednesday watering;
+Monday has expired. With a one-day window only earlier irrigation today counts.
+Boundaries follow the site's IANA timezone, including 23/25-hour DST dates.
+Rain after the saved decision cutoff affects the next decision.
+
+Calibrated Fixed, manual, and Smart delivery all count for that valve. Delivery
+is estimated from the commanded duration, shortened by known early closure;
+late controller bookkeeping adds no water. Uncertain commands conservatively
+credit their nominal amount, including known command/retry time, and show an
+uncertainty warning. An interrupted command without an end time also has unknown
+extra delivery. Relay retries can restart a timer: these are estimates, not
+measurements or an exactly-once physical watering guarantee.
+
+For two independent valves each calibrated at 12 mm/hour with 900-second caps,
+each pulse delivers up to 3 mm and each valve's daily capacity is 6 mm. With two
+coverage days, no rain, and no initial credit:
+
+| Daily demand | Delivery per valve on successive days |
+| --- | --- |
+| 2 mm | 4, 0, 4, 0 mm |
+| 4 mm | 6, 2, 6, 2 mm |
+| 7 mm | 6, 6, 6, 6 mm; capacity is insufficient |
+
+For the middle example, day one runs A:3, B:3, A:3, B:3 mm; day two runs A:2,
+B:2 mm. At 2 mm daily demand, 3 mm rain reduces an initially uncredited two-day
+target to 1 mm. If demand rises from 2 to 4 mm after a 4 mm watering day, the next
+target is 4 mm before rain credit.
+
+`max_mm` limits daily demand, not a day's multi-day application. Capacity below
+`max_mm` cannot sustain peak daily demand; capacity below
+`coverage_days * max_mm` cannot cover the whole peak window in one day. These
+diagnostics do not reject a valid low-capacity setup or increase its limits.
+Zero-second doses are skipped. Unmet targets remain visible, and there is no
+separate rounding remainder. The finite window forgets old deficits/surpluses;
+outages, weather changes, and excluded days can interrupt alternating patterns.
+
+## Weather Quality
+
+Smart uses cached weather and never requests weather during actuation. The
+controller periodically imports elapsed hourly Open-Meteo model estimates.
+Temperature uses the last 24 hours' 90th percentile only with at least 18 finite
+trusted hourly values and a newest valid hour no older than the refresh interval.
+Otherwise it uses the configured fallback; the dashboard and curve page show
+the reason and latest valid weather time. A failed API call does not disable a
+valid fallback decision.
+
+An hour is trusted only when retrieval provenance shows it was fetched at or
+after its valid time. Future hours and legacy rows without provenance must be
+refreshed before use. Successful import time controls refresh freshness; retries
+are throttled. Refreshes backfill the whole rain window and temperature history,
+repair missing/untrusted interior hours, and expand when coverage increases.
+The existing weather lookback is retained when it is longer.
+
+Only known finite nonnegative precipitation is credited. Missing rain gives zero
+known credit and a separate warning; it is not evidence of dry weather and can
+lead to overwatering during an outage. Initial or incomplete irrigation history
+has its own warning. Current warnings clear after recovery; past decisions keep
+their original inputs and warnings. Open-Meteo precipitation represents the
+preceding hour, includes snow, and is not a rain-gauge measurement. Total rain
+also approximates available root-zone water: runoff and drainage are not modeled.
+
+The curve is a practical heuristic, not a soil/ET model or a universal irrigation
+recommendation. Rotation does not guarantee a soak interval, particularly for
+one-valve or short groups. Sites requiring a guaranteed soak delay need a
+separate design before using Smart; this release has no soak-delay control.
+
+## Reservations, Stops, and Recovery
+
+The calendar shows one group event with ordered members. Its reservation uses
+configured durations, including Smart maxima, regardless of the preview dose:
+
+```text
+watering_seconds = passes * sum(member_duration_seconds)
+handover_seconds = passes * valve_count * CONTROLLER_INTERVAL_SECONDS
+reservation_seconds = watering_seconds + handover_seconds
+# passes = 1 for Fixed, 2 for Smart
+```
+
+Watering and handover allowance are shown separately. This reserves worst-case
+watering and controller handovers; it does not promise exact physical closure
+time. New group windows cannot cross local midnight or overlap other automatic
+rules at the site. Existing overlaps between independent single-valve Fixed
+rules remain allowed. Revalidate reservations when cadence or limits change.
+DST repeated start times produce one occurrence per local date; nonexistent
+times are skipped and reported. Groups do not catch up outside their start minute.
+
+Admission is atomic across grouped and individual starts. A conflicting run at
+a scheduled group's start records a skipped occurrence, without a delayed start.
+A submitted Fixed request that encounters a later conflict terminates visibly.
+During a group reservation other manual/Run now starts are rejected: stop the
+group first. The controller checks cancellation, current configuration/limits,
+daily attempts, conflicts, and remaining deadline before every pulse. It persists
+the attempt before issuing the existing bounded hardware command.
+
+Fresh confirmation that the previous valve is closed is required before advancing
+to another valve. A finished database record or stale cached state is insufficient.
+Uncertain opening or closure interrupts the remaining sequence. Reservation
+deadlines stop new pulses that cannot fit with command/retry allowance; an
+overrun retains the reservation until closure is confirmed.
+
+**Stop rule** cancels pending pulses and requests closure. Closing any member of
+an active group does the same, including when another member is watering.
+Cancellation during an opening remains durable; the controller rechecks after
+the call and closes the valve. The UI shows **Stopping** until closure is
+confirmed. Disabling/deleting a group or changing the active schedule also stops
+its pending work. Stop an active occurrence before changing its mode/membership
+or converting a single-valve rule. History and saved configuration snapshots
+survive edits and deletion.
+
+After restart, unfinished occurrences are cancelled and attempted/running/
+uncertain pulses are reconciled through closure and watchdog services, including
+devices subsequently disabled. Attempted commands are never replayed and missed
+dates are not backfilled. The next eligible scheduled date starts normally;
+a new explicit Fixed request requires recovery and confirmed closure first.
+
+## Upgrade and Verification
+
+Back up the persistent database, stop the old controller, apply migrations, then
+start the upgraded web app and exactly one controller. Keep SQLite on the mounted
+`/data` volume or use Postgres; no host cron/systemd or extra worker is required.
+No deployment or hardware commissioning is part of the automated test suite.
+
+The migration converts every legacy `DYNAMIC` rule to Fixed at its stored
+maximum duration, including disabled rules and inactive schedules. IDs and all
+other configuration/history are preserved. Already-commanded pulses retain their
+original duration. Future converted runs can therefore water longer than their
+previous randomly selected duration: review those maxima before re-enabling
+automatic operation. Residual legacy values receive the same Fixed interpretation.
+
+Unconfigured controller and relay polling defaults change from 30 to 60 seconds.
+To preserve the old cadence, explicitly set both
+`CONTROLLER_INTERVAL_SECONDS=30` and `RELAY_POLL_INTERVAL_SECONDS=30` **before the
+upgrade**. Explicit settings remain supported; handovers never use faster polling.
+
+Run automated tests in the `rainwise` environment with isolated Django test
+databases and mocked hardware/weather:
+
+```bash
+env POSTGRES_HOST='' SQLITE_PATH='' RELAY_SIMULATOR=false \
+  conda run -n rainwise python manage.py test apps.irrigation apps.weather --verbosity 1
+```
+
+The empty database variables select the default SQLite configuration expected by
+the configuration-warning test; Django uses a temporary test database. For
+Postgres verification, point the same test command at a disposable local cluster
+with a dedicated test role/database. Never use production credentials for tests.

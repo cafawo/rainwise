@@ -1,0 +1,12 @@
+{% if temperature %}
+<div class="alert {% if temperature.fallback %}alert-warning{% else %}alert-info{% endif %}">
+  {% if temperature.fallback %}
+    {% if temperature.temperature_c != None %}<strong>Operating with fallback temperature {{ temperature.temperature_c|floatformat:1 }} °C</strong>{% else %}<strong>Smart temperature unavailable</strong>{% endif %}
+    <div>{{ temperature.reason }}</div>
+  {% else %}
+    <strong>Using recent 90th-percentile temperature {{ temperature.temperature_c|floatformat:1 }} °C</strong>
+  {% endif %}
+  <div>Latest valid weather: {% if temperature.latest_valid_time %}{{ temperature.latest_valid_time|date:"Y-m-d H:i T" }}{% else %}Unavailable{% endif %}.</div>
+</div>
+{% endif %}
+{% for warning in quality_warnings %}<div class="alert alert-warning">{{ warning }}</div>{% endfor %}

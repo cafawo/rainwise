@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 
 from django.conf import settings
@@ -24,7 +25,24 @@ RELAY_FLASH_MAX_DURATION_SECONDS = (
 RELAY_FLASH_MIN_DURATION_SECONDS = 1
 
 
+def normalize_rule_mode(value: str) -> str:
+    """Interpret the retired stored spelling without accepting it as a choice."""
+    return "FIXED" if value == "DYNAMIC" else value
+
+
+def validate_finite(value: float) -> None:
+    if not math.isfinite(value):
+        raise ValidationError("Enter a finite number.")
+
+
+def validate_application_rate(value: float) -> None:
+    validate_finite(value)
+    if value <= 0:
+        raise ValidationError("Application rate must be positive.")
+
+
 class Site(models.Model):
+    admission_version = models.PositiveBigIntegerField(default=0, editable=False)
     name = models.CharField(max_length=100)
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
@@ -52,11 +70,52 @@ class CurveSettings(models.Model):
     site = models.OneToOneField(
         Site, on_delete=models.CASCADE, related_name="curve_settings"
     )
-    min_mm = models.FloatField(default=DEFAULT_MIN_MM)
-    max_mm = models.FloatField(default=DEFAULT_MAX_MM)
-    g = models.FloatField(default=DEFAULT_G)
-    m = models.FloatField(default=DEFAULT_M)
+    min_mm = models.FloatField(default=DEFAULT_MIN_MM, validators=[validate_finite])
+    max_mm = models.FloatField(default=DEFAULT_MAX_MM, validators=[validate_finite])
+    g = models.FloatField(default=DEFAULT_G, validators=[validate_finite])
+    m = models.FloatField(default=DEFAULT_M, validators=[validate_finite])
+    coverage_days = models.PositiveSmallIntegerField(
+        default=2, validators=[MinValueValidator(1), MaxValueValidator(7)]
+    )
+    fallback_temperature_c = models.FloatField(
+        null=True, blank=True, validators=[validate_finite]
+    )
     updated_at = models.DateTimeField(auto_now=True)
+
+    def clean_fields(self, exclude=None):
+        if (
+            isinstance(self.coverage_days, float)
+            and not self.coverage_days.is_integer()
+        ):
+            raise ValidationError({
+                "coverage_days": "Enter a whole number from 1 to 7."
+            })
+        super().clean_fields(exclude=exclude)
+
+    def clean(self) -> None:
+        super().clean()
+        errors = {}
+        for field in ("min_mm", "max_mm", "g", "m"):
+            value = getattr(self, field)
+            if value is None or not math.isfinite(value):
+                errors[field] = "Enter a finite number."
+        if not errors:
+            if not 0 <= self.min_mm <= self.max_mm:
+                errors["min_mm"] = "Require 0 ≤ minimum ≤ maximum."
+            if self.g <= 0:
+                errors["g"] = "Growth rate must be positive."
+        if (
+            not isinstance(self.coverage_days, int)
+            or isinstance(self.coverage_days, bool)
+            or not 1 <= self.coverage_days <= 7
+        ):
+            errors["coverage_days"] = "Enter a whole number from 1 to 7."
+        if self.fallback_temperature_c is not None and not math.isfinite(
+            self.fallback_temperature_c
+        ):
+            errors["fallback_temperature_c"] = "Enter a finite number."
+        if errors:
+            raise ValidationError(errors)
 
     def __str__(self) -> str:
         return f"Curve settings ({self.site.name})"
@@ -93,6 +152,9 @@ class RelayDevice(models.Model):
 
 
 class Valve(models.Model):
+    application_rate_mm_h = models.FloatField(
+        null=True, blank=True, validators=[validate_application_rate]
+    )
     relay_device = models.ForeignKey(RelayDevice, on_delete=models.CASCADE)
     channel = models.PositiveSmallIntegerField(
         validators=[MinValueValidator(1), MaxValueValidator(8)]
@@ -141,11 +203,9 @@ class Schedule(models.Model):
 
 class ScheduleRule(models.Model):
     MODE_FIXED = "FIXED"
-    MODE_DYNAMIC = "DYNAMIC"
 
     MODE_CHOICES = [
         (MODE_FIXED, "Fixed"),
-        (MODE_DYNAMIC, "Dynamic"),
     ]
     DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -165,14 +225,29 @@ class ScheduleRule(models.Model):
     )
     note = models.CharField(max_length=255, blank=True)
 
+    def clean_fields(self, exclude=None):
+        self.mode = normalize_rule_mode(self.mode)
+        super().clean_fields(exclude=exclude)
+
     def clean(self) -> None:
         super().clean()
+        self.mode = normalize_rule_mode(self.mode)
         if self.schedule_id and self.valve_id:
             valve_site_id = self.valve.relay_device.site_id
             if self.schedule.site_id != valve_site_id:
                 raise ValidationError(
                     "Schedule and valve must belong to the same site."
                 )
+
+    def save(self, *args, **kwargs):
+        mode = normalize_rule_mode(self.mode)
+        if mode != self.mode and kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | {"mode"}
+        self.mode = mode
+        return super().save(*args, **kwargs)
+
+    def get_mode_display(self):
+        return dict(self.MODE_CHOICES).get(normalize_rule_mode(self.mode), self.mode)
 
     def uses_weekday(self, weekday: int) -> bool:
         return bool(self.days_of_week_mask & (1 << weekday))
@@ -187,6 +262,143 @@ class ScheduleRule(models.Model):
 
     def __str__(self) -> str:
         return f"{self.valve.name} @ {self.start_time}"
+
+
+class GroupedRule(models.Model):
+    MODE_FIXED = "FIXED"
+    MODE_SMART = "SMART"
+    MODE_CHOICES = [(MODE_FIXED, "Fixed"), (MODE_SMART, "Smart")]
+    DAY_LABELS = ScheduleRule.DAY_LABELS
+
+    schedule = models.ForeignKey(
+        Schedule, on_delete=models.CASCADE, related_name="grouped_rules"
+    )
+    mode = models.CharField(max_length=10, choices=MODE_CHOICES)
+    note = models.CharField(max_length=255, blank=True)
+    enabled = models.BooleanField(default=True)
+    days_of_week_mask = models.PositiveIntegerField(default=127)
+    start_time = models.TimeField()
+
+    def clean(self):
+        super().clean()
+        if not 1 <= self.days_of_week_mask <= 127:
+            raise ValidationError({"days_of_week_mask": "Select at least one weekday."})
+
+    uses_weekday = ScheduleRule.uses_weekday
+    days_display = ScheduleRule.days_display
+
+    def __str__(self):
+        return self.note or f"{self.get_mode_display()} @ {self.start_time}"
+
+
+class GroupedRuleValve(models.Model):
+    rule = models.ForeignKey(
+        GroupedRule, on_delete=models.CASCADE, related_name="members"
+    )
+    valve = models.ForeignKey(Valve, on_delete=models.CASCADE)
+    order = models.PositiveSmallIntegerField()
+    duration_seconds = models.PositiveIntegerField(
+        validators=[
+            MinValueValidator(1),
+            MaxValueValidator(RELAY_FLASH_MAX_DURATION_SECONDS),
+        ]
+    )
+
+    class Meta:
+        ordering = ["order", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule", "valve"], name="unique_group_valve"
+            ),
+            models.UniqueConstraint(
+                fields=["rule", "order"], name="unique_group_order"
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.rule_id and self.valve_id:
+            if self.rule.schedule.site_id != self.valve.relay_device.site_id:
+                errors["valve"] = "Rule and valve must belong to the same site."
+            if self.rule.mode == GroupedRule.MODE_SMART:
+                if self.duration_seconds > self.valve.default_max_duration_seconds:
+                    errors["duration_seconds"] = (
+                        "Smart maximum exceeds the valve limit."
+                    )
+                rate = self.valve.application_rate_mm_h
+                if rate is None or not math.isfinite(rate) or rate <= 0:
+                    errors["valve"] = (
+                        "Smart requires a positive measured application rate."
+                    )
+                if self.rule.enabled and GroupedRuleValve.objects.filter(
+                    valve_id=self.valve_id,
+                    rule__schedule_id=self.rule.schedule_id,
+                    rule__enabled=True,
+                    rule__mode=GroupedRule.MODE_SMART,
+                ).exclude(rule_id=self.rule_id).exists():
+                    errors["valve"] = "Valve already belongs to an enabled Smart rule."
+            elif (
+                self.rule.mode == GroupedRule.MODE_FIXED
+                and self.duration_seconds < 60
+            ):
+                errors["duration_seconds"] = (
+                    "Fixed runtime must be at least 60 seconds."
+                )
+        if errors:
+            raise ValidationError(errors)
+
+
+class RuleOccurrence(models.Model):
+    SOURCE_SCHEDULED = "SCHEDULED"
+    SOURCE_MANUAL = "MANUAL"
+    STATUS_PENDING = "PENDING"
+    STATUS_ACTIVE = "ACTIVE"
+    STATUS_STOPPING = "STOPPING"
+    STATUS_FINISHED = "FINISHED"
+    STATUS_SKIPPED = "SKIPPED"
+    STATUS_CANCELLED = "CANCELLED"
+    STATUS_FAILED = "FAILED"
+    STATUS_ZERO = "ZERO"
+    STATUS_CHOICES = [(value, value.title()) for value in (
+        "PENDING", "ACTIVE", "STOPPING", "FINISHED", "SKIPPED",
+        "CANCELLED", "FAILED", "ZERO",
+    )]
+
+    site = models.ForeignKey(Site, on_delete=models.CASCADE)
+    rule = models.ForeignKey(
+        GroupedRule, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="occurrences",
+    )
+    mode = models.CharField(max_length=10, choices=GroupedRule.MODE_CHOICES)
+    config = models.JSONField(default=dict)
+    decision = models.JSONField(default=dict)
+    scheduled_local_date = models.DateField(null=True, blank=True)
+    scheduled_at = models.DateTimeField(null=True, blank=True)
+    requested_at = models.DateTimeField()
+    decision_at = models.DateTimeField(null=True, blank=True)
+    reservation_end = models.DateTimeField(null=True, blank=True)
+    source = models.CharField(max_length=10, choices=[
+        (SOURCE_SCHEDULED, "Scheduled"), (SOURCE_MANUAL, "Manual"),
+    ])
+    status = models.CharField(
+        max_length=10, choices=STATUS_CHOICES, default=STATUS_PENDING
+    )
+    cancellation_requested = models.BooleanField(default=False)
+    outcome = models.TextField(blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["rule", "scheduled_local_date"], name="unique_rule_local_date"
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["site", "status"], name="occurrence_site_status")
+        ]
+
+    def __str__(self):
+        return f"{self.get_mode_display()} {self.requested_at} ({self.status})"
 
 
 class IrrigationRun(models.Model):
@@ -227,6 +439,18 @@ class IrrigationRun(models.Model):
     ]
 
     valve = models.ForeignKey(Valve, on_delete=models.CASCADE)
+    occurrence = models.ForeignKey(
+        RuleOccurrence, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="runs",
+    )
+    pass_number = models.PositiveSmallIntegerField(null=True, blank=True)
+    member_order = models.PositiveSmallIntegerField(null=True, blank=True)
+    attempt_started_at = models.DateTimeField(null=True, blank=True)
+    attempt_finished_at = models.DateTimeField(null=True, blank=True)
+    application_rate_mm_h = models.FloatField(null=True, blank=True)
+    delivery_uncertain = models.BooleanField(default=False)
+    closure_confirmed_at = models.DateTimeField(null=True, blank=True)
+    cancellation_requested = models.BooleanField(default=False)
     trigger = models.CharField(max_length=10, choices=TRIGGER_CHOICES)
     requested_start_at = models.DateTimeField(null=True, blank=True)
     planned_start_at = models.DateTimeField(null=True, blank=True)
@@ -253,6 +477,12 @@ class IrrigationRun(models.Model):
     error_message = models.TextField(blank=True)
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["occurrence", "valve", "pass_number"],
+                name="unique_occurrence_valve_pass",
+            )
+        ]
         indexes = [
             models.Index(fields=["status"], name="irrigation__status_idx"),
             models.Index(fields=["planned_start_at"], name="irrigation__planned_idx"),
