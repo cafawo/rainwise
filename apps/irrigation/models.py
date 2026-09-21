@@ -62,6 +62,12 @@ class Site(models.Model):
         if not is_valid_timezone_name(timezone_name):
             raise ValidationError({"timezone": "Select a valid IANA timezone."})
         self.timezone = timezone_name
+        if self.active_schedule_id and (
+            self.pk is None or self.active_schedule.site_id != self.pk
+        ):
+            raise ValidationError({
+                "active_schedule": "The active schedule must belong to this site."
+            })
 
     def __str__(self) -> str:
         return self.name
@@ -333,10 +339,6 @@ class GroupedRuleValve(models.Model):
             if self.rule.schedule.site_id != self.valve.relay_device.site_id:
                 errors["valve"] = "Rule and valve must belong to the same site."
             if self.rule.mode == GroupedRule.MODE_SMART:
-                if self.duration_seconds > self.valve.default_max_duration_seconds:
-                    errors["duration_seconds"] = (
-                        "Smart maximum exceeds the valve limit."
-                    )
                 retained_member = GroupedRuleValve.objects.filter(
                     rule_id=self.rule_id, valve_id=self.valve_id,
                     rule__mode=GroupedRule.MODE_SMART,
@@ -355,6 +357,7 @@ class GroupedRuleValve(models.Model):
                     errors["valve"] = "Valve already belongs to an enabled Smart rule."
             elif (
                 self.rule.mode == GroupedRule.MODE_FIXED
+                and isinstance(self.duration_seconds, int)
                 and self.duration_seconds < 60
             ):
                 errors["duration_seconds"] = (
@@ -417,6 +420,18 @@ class RuleOccurrence(models.Model):
 
 
 class IrrigationRun(models.Model):
+    sender_interrupted = models.BooleanField(default=False, editable=False)
+    dispatch_state = models.CharField(
+        max_length=8,
+        choices=[
+            ("LEGACY", "Legacy"),
+            ("UNSENT", "Awaiting sender"),
+            ("SENDING", "Opening in flight"),
+            ("DONE", "Sender acknowledged"),
+        ],
+        default="LEGACY",
+        editable=False,
+    )
     TRIGGER_SCHEDULED = "SCHEDULED"
     TRIGGER_MANUAL = "MANUAL"
     TRIGGER_FAILSAFE = "FAILSAFE"

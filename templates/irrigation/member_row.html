@@ -1,0 +1,36 @@
+<div class="card border mb-3 member-row" id="member-{{ member.prefix }}" data-prefix="{{ member.prefix }}">
+  <div class="card-body">
+    <div class="d-flex justify-content-between align-items-center gap-2 mb-3">
+      <span class="fw-semibold member-heading">Valve <span class="position-label">{{ position|default:"New" }}</span></span>
+      <div class="d-flex gap-2 align-items-center">
+        <button type="button" class="btn btn-sm btn-outline-secondary move-up" aria-label="Move valve up" hidden>↑</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary move-down" aria-label="Move valve down" hidden>↓</button>
+        <button type="button" class="btn btn-sm btn-outline-danger remove-member" hidden>Remove</button>
+        <label class="delete-control small">{{ member.DELETE }} Remove this row</label>
+      </div>
+    </div>
+    <div class="member-fields row g-3">
+      {% if member.non_field_errors %}<div class="text-danger">{{ member.non_field_errors }}</div>{% endif %}
+      <div class="col-lg-5">
+        <label class="form-label" for="{{ member.valve.id_for_label }}">Valve</label>
+        {{ member.valve }}
+        <div id="{{ member.valve.auto_id }}_errors" class="invalid-feedback d-block">{{ member.valve.errors }}</div>
+        <div class="invalid-feedback client-rate-error" hidden>Enter a measured watering rate or select another valve.</div>
+        <div id="{{ member.valve.auto_id }}_help" class="form-text rate-help"></div>
+      </div>
+      <div class="col-lg-5">
+        <label class="form-label duration-label" for="{{ member.duration_seconds.id_for_label }}">{% if editor_mode == 'SMART' %}Run time before a break{% else %}Runtime{% endif %} (seconds)</label>
+        <div class="input-group">{{ member.duration_seconds }}<button type="button" class="btn btn-outline-secondary use-default" hidden>Use valve default</button></div>
+        <div id="{{ member.duration_seconds.auto_id }}_errors" class="invalid-feedback d-block">{{ member.duration_seconds.errors }}</div>
+        <div id="{{ member.duration_seconds.auto_id }}_help" class="form-text duration-help">{% if editor_mode == 'SMART' %}1–3276 seconds. Blank uses the valve default at Save.{% else %}Enter 60–3276 seconds.{% endif %}</div>
+        <div class="form-text duration-description"></div>
+      </div>
+      <div class="col-lg-2">
+        <label class="form-label" for="{{ member.ORDER.id_for_label }}">Position</label>
+        {{ member.ORDER }}
+        <div id="{{ member.ORDER.auto_id }}_errors" class="invalid-feedback d-block">{{ member.ORDER.errors }}</div>
+      </div>
+      <div class="col-12 smart-metrics small text-secondary" {% if editor_mode != 'SMART' %}hidden{% endif %}></div>
+    </div>
+  </div>
+</div>

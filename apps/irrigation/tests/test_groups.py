@@ -99,15 +99,37 @@ class GroupExecutionTests(TestCase):
             cancellation_requested=False,
         ).exists())
 
-    def test_reservations_use_configured_maxima_and_selected_cadence(self):
+    def finish_occurrence(self, occurrence):
+        """Advance the mock clock through watering and durable rests."""
+        for _ in range(2 * occurrence.runs.count() + 2):
+            occurrence.refresh_from_db()
+            if occurrence.status not in ("ACTIVE", "STOPPING"):
+                return
+            running = occurrence.runs.filter(status="RUNNING").first()
+            if running:
+                stop = running.actual_start_at + dt.timedelta(
+                    seconds=running.optimal_duration_seconds,
+                )
+                self.tick(seconds=max(0, (stop - self.clock).total_seconds()),
+                          stop_finished=True)
+            else:
+                eligible = group_services.occurrence_next_eligible_at(occurrence)
+                self.tick(seconds=max(0, (eligible - self.clock).total_seconds())
+                          if eligible else 0)
+        self.fail("Mock sequence failed to finish within its finite pulse budget")
+
+    def test_reservations_use_peak_sequence_and_selected_cadence(self):
         fixed = self.rule()
-        smart = self.rule(mode="SMART", durations=(900, 600), start_time=dt.time(8))
+        smart = self.smart_rule(durations=(900, 600))
         for cadence in (30, 60):
             with self.subTest(cadence=cadence), mock.patch.dict(
                 "os.environ", {"CONTROLLER_INTERVAL_SECONDS": str(cadence)}
             ):
-                self.assertEqual(group_services.reservation_seconds(fixed), (180, 2 * cadence))
-                self.assertEqual(group_services.reservation_seconds(smart), (3000, 4 * cadence))
+                allowance = group_services.command_allowance()
+                self.assertEqual(group_services.reservation_seconds(fixed),
+                                 (180, 3 * cadence + 2 * allowance))
+                self.assertEqual(group_services.reservation_seconds(smart),
+                                 (2700, 7 * cadence + 4 * allowance))
 
     def test_fixed_needs_no_weather_calibration_or_manual_duration_ceiling(self):
         rule = self.rule(durations=(1200, 60))
@@ -318,6 +340,7 @@ class GroupExecutionTests(TestCase):
         self.tick(seconds=900, stop_finished=True)
         self.tick(seconds=900, stop_finished=True)
         self.tick(seconds=300, stop_finished=True)
+        self.tick(seconds=600)
         self.tick(seconds=300, stop_finished=True)
         self.assertEqual(self.open.call_args_list, [
             mock.call(self.valves[0], 900), mock.call(self.valves[1], 900),
@@ -363,10 +386,15 @@ class GroupExecutionTests(TestCase):
 
     def test_command_deadline_rechecked_after_claim_with_fresh_clock(self):
         rule = self.rule(durations=(60,))
+        occurrence = group_services._plan_occurrence(rule, scheduled_at=self.clock)
+        occurrence.reservation_end = self.clock + dt.timedelta(
+            seconds=60 + group_services.command_allowance() + 5,
+        )
+        occurrence.save(update_fields=["reservation_end"])
         original_send = group_services._send_claimed
 
         def delayed_send(run):
-            self.clock += dt.timedelta(seconds=100)
+            self.clock += dt.timedelta(seconds=6)
             return original_send(run)
 
         with mock.patch.object(group_services, "_send_claimed", side_effect=delayed_send):
@@ -395,7 +423,7 @@ class GroupExecutionTests(TestCase):
         rule = self.rule(durations=(60,), start_time=dt.time(6))
         ScheduleRule.objects.create(
             schedule=self.schedule, valve=self.valves[1], mode="FIXED",
-            days_of_week_mask=127, start_time=dt.time(6, 1, 40),
+            days_of_week_mask=127, start_time=dt.time(6, 2, 30),
             max_duration_seconds=60,
         )
         with mock.patch.dict("os.environ", {"CONTROLLER_INTERVAL_SECONDS": "30"}):
@@ -441,8 +469,8 @@ class GroupExecutionTests(TestCase):
         occurrence = RuleOccurrence.objects.get(rule=rule)
         self.assertTrue(occurrence.cancellation_requested)
 
-    def test_two_uncertain_attempts_on_old_schedule_prevent_a_third(self):
-        self.smart_rule(need=2, durations=(900,))
+    def test_old_uncertain_attempts_supply_credit_without_a_two_attempt_ceiling(self):
+        rule = self.smart_rule(need=2, durations=(900,))
         old_schedule = Schedule.objects.create(site=self.site, name="Old schedule")
         old_rule = GroupedRule.objects.create(
             schedule=old_schedule, mode="SMART", start_time=dt.time(4),
@@ -463,11 +491,13 @@ class GroupExecutionTests(TestCase):
                 application_rate_mm_h=12, delivery_uncertain=True,
             )
         self.tick()
-        self.open.assert_not_called()
+        self.open.assert_called_once_with(self.valves[0], 900)
         self.assertEqual(IrrigationRun.objects.filter(
             valve=self.valves[0], attempt_started_at__isnull=False,
             occurrence__mode="SMART",
-        ).count(), 2)
+        ).count(), 3)
+        decision = RuleOccurrence.objects.get(rule=rule).decision
+        self.assertGreater(decision["valves"][str(self.valves[0].pk)]["irrigation"]["credit_mm"], 0)
 
     def test_completed_delivery_earlier_in_admitted_minute_is_credited(self):
         rule = self.smart_rule(need=2)
@@ -546,6 +576,7 @@ class GroupExecutionTests(TestCase):
         self.assertEqual(self.open.call_count, 3)
         self.read.side_effect = None
         self.tick(seconds=240, stop_finished=True)
+        self.tick(seconds=600)
         self.open.assert_called_with(self.valves[1], 300)
 
     def test_legacy_running_pulse_needs_closure_confirmation_before_group_admission(self):
@@ -594,14 +625,7 @@ class GroupExecutionTests(TestCase):
             occurrence = RuleOccurrence.objects.get(
                 rule=rule, scheduled_local_date=self.clock.date(),
             )
-            for _ in range(4):
-                running = occurrence.runs.filter(status="RUNNING").first()
-                if running is None:
-                    break
-                self.tick(
-                    seconds=running.optimal_duration_seconds,
-                    stop_finished=True,
-                )
+            self.finish_occurrence(occurrence)
             occurrence.refresh_from_db()
             self.assertIn(occurrence.status, ("FINISHED", "ZERO"))
             for valve in self.valves:
@@ -616,11 +640,11 @@ class GroupExecutionTests(TestCase):
     def test_complete_multiday_sequence_alternates_four_and_zero(self):
         self.assert_daily_deliveries(2, [4, 0, 4, 0])
 
-    def test_complete_multiday_sequence_alternates_six_and_two(self):
-        self.assert_daily_deliveries(4, [6, 2, 6, 2])
+    def test_complete_multiday_sequence_alternates_eight_and_zero(self):
+        self.assert_daily_deliveries(4, [8, 0, 8, 0])
 
-    def test_complete_multiday_sequence_stays_at_capacity_for_high_demand(self):
-        self.assert_daily_deliveries(7, [6, 6, 6, 6])
+    def test_complete_multiday_sequence_alternates_fourteen_and_zero(self):
+        self.assert_daily_deliveries(7, [14, 0, 14, 0])
 
     def test_faster_calibrated_valve_is_fulfilled_and_skips_second_pass(self):
         self.smart_rule(need=2)
@@ -654,8 +678,7 @@ class GroupExecutionTests(TestCase):
         Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
         reservation = group_services.reservation_seconds(rule)
         self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=300, stop_finished=True)
+        self.finish_occurrence(RuleOccurrence.objects.get(rule=rule))
         self.assertEqual(self.open.call_args_list, [
             mock.call(self.valves[1], 900), mock.call(self.valves[1], 300),
         ])
@@ -669,8 +692,9 @@ class GroupExecutionTests(TestCase):
             valve=self.valves[0], attempt_started_at__isnull=False,
         ).exists())
         self.assertEqual(group_services.reservation_seconds(rule), reservation)
-        self.assertEqual(occurrence.config["watering_seconds"], reservation[0])
-        self.assertEqual(occurrence.config["handover_seconds"], reservation[1])
+        self.assertEqual(occurrence.config["watering_seconds"]
+                         + occurrence.config["break_seconds"], reservation[0])
+        self.assertEqual(occurrence.config["scheduling_allowance_seconds"], reservation[1])
 
     def test_all_missing_smart_rates_record_idempotent_skip_not_zero_demand(self):
         rule = self.smart_rule()
@@ -699,10 +723,7 @@ class GroupExecutionTests(TestCase):
         ).values_list("application_rate_mm_h", flat=True))
         Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=None)
         self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        self.tick()
-        self.tick(seconds=300, stop_finished=True)
-        self.tick()
+        self.finish_occurrence(occurrence)
         self.assertEqual(self.open.call_args_list, [
             mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
         ])
@@ -733,6 +754,7 @@ class GroupExecutionTests(TestCase):
         self.read.assert_any_call(self.valves[0])
         self.tick(seconds=900, stop_finished=True)
         self.tick()
+        self.tick(seconds=900)
         self.tick(seconds=300, stop_finished=True)
         self.assertEqual(self.open.call_args_list, [
             mock.call(self.valves[0], 900), mock.call(self.valves[1], 900),
@@ -751,8 +773,7 @@ class GroupExecutionTests(TestCase):
         first = RuleOccurrence.objects.get(rule=rule)
         original_decision = first.decision
         Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=12)
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=300, stop_finished=True)
+        self.finish_occurrence(first)
         first.refresh_from_db()
         self.assertEqual(first.decision, original_decision)
         self.assertFalse(first.runs.filter(valve=self.valves[0]).exists())
@@ -777,8 +798,7 @@ class GroupExecutionTests(TestCase):
         ))
         self.assertTrue(all(row["status"] == "FAILED" for row in skipped))
         Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=12)
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=300, stop_finished=True)
+        self.finish_occurrence(first)
         self.assertEqual(self.open.call_args_list, [
             mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
         ])
@@ -820,8 +840,7 @@ class GroupExecutionTests(TestCase):
         ):
             self.tick()
         self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=300, stop_finished=True)
+        self.finish_occurrence(RuleOccurrence.objects.get(rule=rule))
         self.assertEqual(self.open.call_args_list, [
             mock.call(self.valves[1], 900), mock.call(self.valves[1], 300),
         ])
@@ -844,22 +863,224 @@ class GroupExecutionTests(TestCase):
         first_decision = self.clock
         for day, invalid_rate in enumerate((0, -1, float("inf"))):
             with self.subTest(rate=invalid_rate):
-                self.clock = first_decision + dt.timedelta(days=day)
+                self.clock = first_decision + dt.timedelta(days=2 * day)
                 Valve.objects.filter(pk=self.valves[0].pk).update(
                     application_rate_mm_h=invalid_rate,
                 )
                 calls_before = self.open.call_count
                 self.tick()
-                self.tick(seconds=900, stop_finished=True)
-                self.tick(seconds=900, stop_finished=True)
                 occurrence = RuleOccurrence.objects.get(
                     rule=rule, scheduled_local_date=self.clock.date(),
                 )
+                self.finish_occurrence(occurrence)
+                occurrence.refresh_from_db()
                 self.assertEqual(occurrence.status, "FINISHED")
                 self.assertTrue(occurrence.decision["valves"][str(self.valves[0].pk)]["skipped"])
                 self.assertEqual(self.open.call_args_list[calls_before:], [
-                    mock.call(self.valves[1], 900), mock.call(self.valves[1], 900),
+                    *[mock.call(self.valves[1], 900)] * 4,
+                    mock.call(self.valves[1], 600),
                 ])
+
+
+    def test_single_valve_one_hour_target_requires_thirty_minute_break(self):
+        rule = self.smart_rule(need=3.5, durations=(1800,))
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=7)
+        start = self.clock
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.config["pulse_budget"], 2)
+        self.assertEqual(occurrence.config["watering_seconds"], 3600)
+        self.assertEqual(occurrence.config["break_seconds"], 1800)
+        self.tick(seconds=1800, stop_finished=True)
+        eligible = start + dt.timedelta(seconds=3600)
+        self.assertEqual(group_services.occurrence_next_eligible_at(occurrence), eligible)
+        first = occurrence.runs.get(pass_number=1)
+        closed = first.closure_confirmed_at
+        self.site.refresh_from_db()
+        admission_version = self.site.admission_version
+        for seconds in (60, 600, 1139):
+            self.tick(seconds=seconds)
+            first.refresh_from_db()
+            self.assertEqual(first.closure_confirmed_at, closed)
+            self.assertEqual(group_services.occurrence_next_eligible_at(occurrence), eligible)
+            self.open.assert_called_once()
+            self.site.refresh_from_db()
+            self.assertEqual(self.site.admission_version, admission_version)
+        with self.assertRaises(ValidationError):
+            group_services.start_single(self.valves[1], 60, "MANUAL")
+        self.tick(seconds=1)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 1800), mock.call(self.valves[0], 1800),
+        ])
+        self.tick(seconds=1800, stop_finished=True)
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "FINISHED")
+        self.assertEqual(self.clock, start + dt.timedelta(seconds=5400))
+
+    def test_two_day_peak_has_four_runs_three_breaks_and_finite_saved_budget(self):
+        rule = self.smart_rule(need=7, durations=(1800,))
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=7)
+        for cadence in (30, 60):
+            with mock.patch.dict("os.environ", {"CONTROLLER_INTERVAL_SECONDS": str(cadence)}):
+                peak = group_services.reservation_details(rule)
+                self.assertEqual(peak["watering_seconds"], 7200)
+                self.assertEqual(peak["break_seconds"], 5400)
+                self.assertEqual(peak["pulse_count"], 4)
+                self.assertEqual(peak["repeat_count"], 3)
+                self.assertEqual(peak["total_seconds"],
+                                 12600 + 8 * cadence + 4 * group_services.command_allowance())
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        snapshot = occurrence.config
+        self.finish_occurrence(occurrence)
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "FINISHED")
+        self.assertEqual(occurrence.config, snapshot)
+        self.assertEqual(snapshot["pulse_budget"], 4)
+        self.assertEqual(self.open.call_args_list, [mock.call(self.valves[0], 1800)] * 4)
+        self.assertEqual(list(occurrence.runs.order_by("pass_number").values_list(
+            "pass_number", flat=True,
+        )), [1, 2, 3, 4])
+
+    def test_short_intervening_valve_counts_only_its_elapsed_time_toward_break(self):
+        rule = self.smart_rule(need=7, durations=(1800, 300))
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=14)
+        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=168)
+        start = self.clock
+        self.tick()
+        self.tick(seconds=1800, stop_finished=True)
+        self.open.assert_called_with(self.valves[1], 300)
+        self.tick(seconds=300, stop_finished=True)
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(group_services.occurrence_next_eligible_at(occurrence),
+                         start + dt.timedelta(seconds=3600))
+        self.tick(seconds=1499)
+        self.assertEqual(self.open.call_count, 2)
+        self.tick(seconds=1)
+        self.open.assert_called_with(self.valves[0], 1800)
+        self.tick(seconds=1800, stop_finished=True)
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "FINISHED")
+
+    def test_late_confirmation_delays_rest_and_does_not_use_nominal_stop(self):
+        rule = self.smart_rule(need=2, durations=(900,))
+        start = self.clock
+        self.tick()
+        self.tick(seconds=960, stop_finished=True)
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(group_services.occurrence_next_eligible_at(occurrence),
+                         start + dt.timedelta(seconds=1860))
+        self.tick(seconds=840)
+        self.open.assert_called_once()
+        self.tick(seconds=60)
+        self.assertEqual(self.open.call_count, 2)
+        self.finish_occurrence(occurrence)
+
+    def test_cancellation_while_resting_releases_only_after_safe_closure(self):
+        rule = self.smart_rule(durations=(900,))
+        self.tick()
+        self.tick(seconds=900, stop_finished=True)
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertIsNotNone(group_services.occurrence_next_eligible_at(occurrence))
+        group_services.cancel_occurrence(occurrence)
+        self.tick()
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "CANCELLED")
+        self.tick(seconds=900)
+        self.open.assert_called_once()
+        self.assert_no_pending_attempts(occurrence)
+
+    def test_restart_during_rest_never_resumes_or_replays(self):
+        rule = self.smart_rule(durations=(900,))
+        self.tick()
+        self.tick(seconds=900, stop_finished=True)
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        before = occurrence.decision
+        group_services.recover_groups()
+        self.tick(seconds=1800)
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "CANCELLED")
+        self.assertEqual(occurrence.decision, before)
+        self.open.assert_called_once()
+
+    def test_late_tick_exhausts_deadline_and_reports_unmet_without_another_open(self):
+        rule = self.smart_rule(durations=(900,))
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.clock = occurrence.reservation_end
+        self.tick(stop_finished=True)
+        occurrence.refresh_from_db()
+        self.assertTrue(occurrence.cancellation_requested)
+        self.assertIn("deadline", occurrence.outcome.lower())
+        self.assertIn("unmet", occurrence.outcome.lower())
+        self.open.assert_called_once()
+
+    def test_valve_default_changes_do_not_rewrite_saved_limits_or_pending_work(self):
+        rule = self.smart_rule(durations=(900,))
+        self.tick()
+        Valve.objects.filter(pk=self.valves[0].pk).update(default_max_duration_seconds=60)
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.finish_occurrence(occurrence)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
+        ])
+        self.assertEqual(rule.members.get().duration_seconds, 900)
+
+    def test_saved_rule_limit_reduction_blocks_incompatible_pending_pulse(self):
+        rule = self.smart_rule(durations=(900,))
+        self.tick()
+        first = IrrigationRun.objects.get(status="RUNNING")
+        rule.members.update(duration_seconds=100)
+        self.tick(seconds=900, stop_finished=True)
+        self.tick(seconds=900)
+        first.refresh_from_db()
+        self.assertEqual(first.optimal_duration_seconds, 900)
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertTrue(occurrence.cancellation_requested)
+        self.assertIn("unmet", occurrence.outcome)
+        self.open.assert_called_once()
+
+    def test_unfittable_peak_is_a_visible_skip_before_any_pulse_allocation(self):
+        rule = self.smart_rule(durations=(1,))
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=1e-300)
+        with self.assertRaises(ValidationError):
+            group_services.validate_configuration(rule)
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.status, "SKIPPED")
+        self.assertIn("midnight", occurrence.outcome)
+        self.assertFalse(occurrence.runs.exists())
+        self.open.assert_not_called()
+
+    def test_zero_peak_has_no_watering_break_or_allowance(self):
+        rule = self.smart_rule(need=0)
+        peak = group_services.reservation_details(rule)
+        self.assertTrue(peak["available"])
+        self.assertEqual(peak["total_seconds"], 0)
+        self.assertEqual(peak["pulse_count"], 0)
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.status, "ZERO")
+        self.assertEqual(occurrence.reservation_end, self.clock)
+
+    def test_restored_rate_rechecks_new_peak_conflict_before_future_admission(self):
+        rule = self.smart_rule(durations=(900,))
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
+        peak = group_services.reservation_details(rule)
+        self.assertFalse(peak["available"])
+        self.assertEqual(peak["total_seconds"], 0)
+        ScheduleRule.objects.create(
+            schedule=self.schedule, valve=self.valves[1], mode="FIXED",
+            start_time=dt.time(6, 10), days_of_week_mask=127, max_duration_seconds=60,
+        )
+        group_services.validate_configuration(rule)
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=12)
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.status, "SKIPPED")
+        self.assertIn("overlaps", occurrence.outcome)
+        self.assertIn("06:10", occurrence.outcome)
+        self.open.assert_not_called()
 
 
 class GroupAdmissionRaceTests(TransactionTestCase):

@@ -1,6 +1,7 @@
 from django import forms
 from django.contrib import admin
 from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.db.models import Q
 from django.urls import reverse
 from django.utils.html import format_html
@@ -51,6 +52,21 @@ def _has_unresolved_runs(query):
     ).exists()
 
 
+def _validate_reservation_change(candidate, site):
+    """Check the proposed values without persisting a failed admin form.
+
+    The enclosing admin transaction retains admission ownership through the
+    actual save. Only the inner probe is rolled back, including on success.
+    """
+    candidate.full_clean()
+    with group_services.site_admission(site):
+        with transaction.atomic():
+            candidate.save()
+            for schedule in models.Schedule.objects.filter(site=site):
+                group_services.validate_schedule(schedule)
+            transaction.set_rollback(True)
+
+
 class RelayDeviceAdminForm(forms.ModelForm):
     class Meta:
         model = models.RelayDevice
@@ -80,6 +96,10 @@ class ValveAdminForm(forms.ModelForm):
     class Meta:
         model = models.Valve
         exclude = ("last_known_is_open", "last_polled_at")
+        labels = {
+            "default_max_duration_seconds": "Manual runtime / new rule default (seconds)",
+            "application_rate_mm_h": "Measured watering rate (mm/hour)",
+        }
 
     def clean(self):
         cleaned = super().clean()
@@ -98,6 +118,17 @@ class ValveAdminForm(forms.ModelForm):
                         "Stop watering and wait for confirmed closure before "
                         "changing valve hardware identity."
                     )
+        if (
+            not self.errors and self.instance.pk
+            and "application_rate_mm_h" in self.changed_data
+        ):
+            candidate = models.Valve.objects.select_related(
+                "relay_device__site"
+            ).get(pk=self.instance.pk)
+            site = candidate.relay_device.site
+            for name, value in cleaned.items():
+                setattr(candidate, name, value)
+            _validate_reservation_change(candidate, site)
         return cleaned
 
 
@@ -164,10 +195,14 @@ class RuleConfigurationAdmin(admin.ModelAdmin):
 class ScheduleRuleAdmin(RuleConfigurationAdmin):
     list_display = (
         "schedule", "valve", "enabled", "start_time", "fixed_mode",
-        "max_duration_seconds",
+        "runtime",
     )
     list_filter = ("enabled", "schedule")
-    exclude = ("mode",)
+    exclude = ("mode", "max_duration_seconds")
+
+    @admin.display(description="Runtime (seconds)")
+    def runtime(self, obj):
+        return obj.max_duration_seconds
 
     @admin.display(description="Mode")
     def fixed_mode(self, obj):
@@ -175,7 +210,7 @@ class ScheduleRuleAdmin(RuleConfigurationAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         fields = super().get_readonly_fields(request, obj)
-        return [field for field in fields if field != "mode"] + ["fixed_mode"]
+        return [field for field in fields if field not in {"mode", "max_duration_seconds"}] + ["fixed_mode", "runtime"]
 
 
 @admin.register(models.GroupedRule)
@@ -264,6 +299,20 @@ class CurveSettingsAdminForm(forms.ModelForm):
         value = self.cleaned_data.get("fallback_temperature_c")
         return models.DEFAULT_FALLBACK_TEMPERATURE_C if value is None else value
 
+    def clean(self):
+        cleaned = super().clean()
+        if self.errors:
+            return cleaned
+        candidate = (
+            models.CurveSettings.objects.get(pk=self.instance.pk)
+            if self.instance.pk else models.CurveSettings()
+        )
+        for name, value in cleaned.items():
+            setattr(candidate, name, value)
+        if candidate.site_id:
+            _validate_reservation_change(candidate, candidate.site)
+        return cleaned
+
 
 @admin.register(models.CurveSettings)
 class CurveSettingsAdmin(admin.ModelAdmin):
@@ -272,3 +321,6 @@ class CurveSettingsAdmin(admin.ModelAdmin):
         "site", "min_mm", "max_mm", "g", "m", "coverage_days",
         "fallback_temperature_c", "updated_at",
     )
+
+    def get_readonly_fields(self, request, obj=None):
+        return ("site",) if obj else ()

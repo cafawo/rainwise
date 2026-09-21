@@ -25,6 +25,22 @@ def _utc_timestamp(
 
 
 class WeatherImportTests(TestCase):
+    def test_new_site_without_saved_curve_backfills_default_smart_coverage(self):
+        site = Site.objects.create(
+            name="New site", latitude=52.5, longitude=13.4, timezone="UTC"
+        )
+        schedule = Schedule.objects.create(site=site, name="Summer")
+        GroupedRule.objects.create(
+            schedule=schedule, mode="SMART", start_time="06:30"
+        )
+        now = dt.datetime(2026, 7, 8, 6, 30, tzinfo=dt.timezone.utc)
+        with mock.patch("apps.weather.services.import_weather_range", return_value=48) as imported:
+            ensure_recent_weather(site, now=now, lookback_days=1)
+        imported.assert_called_once_with(
+            site, dt.date(2026, 7, 6), dt.date(2026, 7, 8), now=now
+        )
+        self.assertFalse(CurveSettings.objects.filter(site=site).exists())
+
     def test_future_hours_are_not_imported_and_legacy_provenance_is_repaired(self):
         site = Site.objects.create(name="Home", latitude=52.5, longitude=13.4, timezone="UTC")
         now = dt.datetime(2026, 7, 8, 6, 30, tzinfo=dt.timezone.utc)

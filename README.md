@@ -6,8 +6,8 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 
 - Dashboard with valve status and manual open/close.
 - Weekly Fixed and Smart rules with one or more ordered valves.
-- Fixed runs once per valve; Smart calculates up to two bounded runs per valve
-  and local day from temperature, rain, and recorded irrigation.
+- Fixed runs once per valve; Smart divides the calculated water target into
+  bounded runs with automatic breaks, using weather and recorded irrigation.
 - Multiple schedules with an active schedule switch.
 - Controller loop that enforces planned stops and hard failsafe stops.
 - Weather import (Open-Meteo) stored as hourly observations.
@@ -225,19 +225,32 @@ scheduled execution but remain part of water history. Each Smart valve has its
 own target; grouping does not divide water between zones. Overlapping watered
 areas need a separate allocation design.
 
-Fixed runs each member once in order, with durations of 60–3276 seconds. It needs
+Fixed runs each member once in order, with a **Runtime** of 60–3276 seconds. It needs
 neither calibration nor weather. Existing single-valve Fixed rules retain their
 IDs, schedule, timing, and manual Run now behavior. A valve's default manual
 duration is not an additional ceiling on a Fixed rule.
 
-Smart runs a first pass in valve order and, when needed, a second pass. Fulfilled
-valves are skipped and a final pulse can be shortened to a whole second. Newly
-selected valves require a finite positive application rate. Curve settings
-include a 25 °C fallback temperature, editable in the app. Each per-run
-maximum is 1–3276 seconds and must not exceed that valve's default maximum.
-There are at most two logical Smart attempts per valve/local day, including
-uncertain attempts in copied or switched schedules. Retries belong to the same
-logical attempt. A valve can belong to only one enabled Smart rule per schedule.
+Smart runs in rounds, preserving valve order until each finite target is met.
+Fulfilled valves are skipped and the final pulse can be shorter, to a whole
+second. **Run time before a break** limits each uninterrupted run to 1–3276
+seconds; it does not cap the total water target. Before repeating a valve, its
+off-time must be at least as long as its preceding commanded run, measured from
+confirmed closure. Other valves' watering counts toward this break. For example,
+A waters 30 minutes, B waters 5, then the controller waits another 25 before A
+repeats. No break is added after a valve's final run.
+
+New selections prefill the valve's existing default duration. An optional blank
+Smart override resolves to that default when saved; explicit overrides may be
+above or below it within the permitted range. **Use valve default** resets an
+edited input. Saved rules and copies keep their resolved durations when the valve
+default changes. That setting continues to bound individual manual Open commands.
+The relay's independent 3276-second command limit is unchanged.
+
+Newly selected Smart valves require a finite positive application rate. Curve
+settings include an editable 25 °C fallback. Each occurrence saves a finite pulse
+budget; there is no two-run limit or separate daily watering cap. Copies and
+schedule changes still credit previous calibrated delivery, including uncertain
+attempts. A valve can belong to only one enabled Smart rule per schedule.
 
 An unmeasured valve shows **N/A** for its application rate and cannot be newly
 selected for Smart. Clearing the rate of an existing Smart member preserves its
@@ -273,7 +286,7 @@ The fallback temperature defaults to 25 °C; review it for the site and change i
 on the curve page when needed. Finite overrides, including 0 °C, are supported.
 New sites receive the standard curve settings without a settings-page visit.
 No Docker or environment variable is needed for the fallback or watering rate.
-The curve page shows inputs and capacity per configured valve; uncalibrated
+The curve page shows daily demand and peak watering time per valve; uncalibrated
 valves show N/A and a warning that Smart will skip them.
 
 At the actual admitted decision instant, Smart applies today's demand estimate
@@ -281,8 +294,8 @@ to the whole coverage window:
 
 ```text
 target_mm = max(0, coverage_days * daily_need - rain_credit - valve_irrigation_credit)
-daily_capacity_mm = 2 * per_run_max_seconds * application_rate_mm_h / 3600
-planned_seconds = floor(min(target_mm, daily_capacity_mm) / application_rate_mm_h * 3600)
+planned_seconds = floor(target_mm * 3600 / application_rate_mm_h)
+peak_seconds = floor(coverage_days * max_mm * 3600 / application_rate_mm_h)
 ```
 
 Rain credit covers `coverage_days` local-day periods ending at the last completed
@@ -302,25 +315,27 @@ uncertainty warning. An interrupted command without an end time also has unknown
 extra delivery. Relay retries can restart a timer: these are estimates, not
 measurements or an exactly-once physical watering guarantee.
 
-For two independent valves each calibrated at 12 mm/hour with 900-second caps,
-each pulse delivers up to 3 mm and each valve's daily capacity is 6 mm. With two
-coverage days, no rain, and no initial credit:
+For independent valves calibrated at 12 mm/hour with 900-second run limits,
+each full pulse delivers 3 mm. With two coverage days, no rain, no initial
+credit, sufficient time in the day, and successful watering:
 
 | Daily demand | Delivery per valve on successive days |
 | --- | --- |
 | 2 mm | 4, 0, 4, 0 mm |
-| 4 mm | 6, 2, 6, 2 mm |
-| 7 mm | 6, 6, 6, 6 mm; capacity is insufficient |
+| 4 mm | 8, 0, 8, 0 mm |
+| 7 mm | 14, 0, 14, 0 mm |
 
-For the middle example, day one runs A:3, B:3, A:3, B:3 mm; day two runs A:2,
-B:2 mm. At 2 mm daily demand, 3 mm rain reduces an initially uncredited two-day
+For the middle example, day one runs A:3, B:3, A:3, B:3, A:2, B:2 mm, with
+the required off-times; neither valve waters on day two. At 2 mm daily demand,
+3 mm rain reduces an initially uncredited two-day
 target to 1 mm. If demand rises from 2 to 4 mm after a 4 mm watering day, the next
 target is 4 mm before rain credit.
 
-`max_mm` limits daily demand, not a day's multi-day application. Capacity below
-`max_mm` cannot sustain peak daily demand; capacity below
-`coverage_days * max_mm` cannot cover the whole peak window in one day. These
-diagnostics do not reject a valid low-capacity setup or increase its limits.
+`max_mm` is **Peak daily demand**, not a cap on a coverage window's catch-up
+watering. At 7 mm/hour, a 7 mm target takes one hour of watering; a two-day peak
+at 7 mm/day takes two hours, before breaks and scheduling allowance. A peak
+sequence that cannot fit before local midnight is rejected with an explanation;
+tiny rates or short caps cannot allocate an unbounded sequence.
 Zero-second doses are skipped. Unmet targets remain visible, and there is no
 separate rounding remainder. The finite window forgets old deficits/surpluses;
 outages, weather changes, and excluded days can interrupt alternating patterns.
@@ -351,29 +366,42 @@ preceding hour, includes snow, and is not a rain-gauge measurement. Total rain
 also approximates available root-zone water: runoff and drainage are not modeled.
 
 The curve is a practical heuristic, not a soil/ET model or a universal irrigation
-recommendation. Rotation does not guarantee a soak interval, particularly for
-one-valve or short groups. Sites requiring a guaranteed soak delay need a
-separate design before using Smart; this release has no soak-delay control.
+recommendation. Equal-duration breaks are a product rule and do not guarantee
+soil absorption under every condition. There is no separate soak-duration setting.
 
 ## Reservations, Stops, and Recovery
 
-The calendar shows one group event with ordered members. Its reservation uses
-configured durations, including Smart maxima, regardless of the preview dose:
+The calendar shows one group event with ordered members. Smart reservations
+simulate peak demand over the coverage window, split by each saved run limit,
+using the same valve order and repeat breaks as the actual plan. Today's rain
+or previous delivery changes the preview dose, not this peak envelope.
 
 ```text
-watering_seconds = passes * sum(member_duration_seconds)
-handover_seconds = passes * valve_count * CONTROLLER_INTERVAL_SECONDS
-reservation_seconds = watering_seconds + handover_seconds
-# passes = 1 for Fixed, 2 for Smart
+K = peak pulse count
+R = repeat pulse count (K minus valves with a nonzero peak)
+I = configured controller interval
+A = derived command/retry allowance
+scheduling_allowance = (K + R + 1) * I + K * A
+reservation_seconds = watering_seconds + break_seconds + scheduling_allowance
 ```
 
-Watering and handover allowance are shown separately. Missing valve calibration
-does not shrink the reservation: every configured maximum and handover remains
-included. This reserves worst-case watering and controller handovers; it does
-not promise exact physical closure
-time. New group windows cannot cross local midnight or overlap other automatic
+**Watering**, **Breaks**, and **Scheduling allowance** are shown separately.
+A single valve with a one-hour peak and a 30-minute run limit needs 90 minutes
+before allowance. A two-hour peak needs four runs and three breaks: 210 minutes
+before allowance. Grouped Fixed uses its one pass with no repeat breaks; a legacy
+single-valve Fixed event remains exactly its runtime. Zero pulses have no allowance.
+
+Missing Smart calibration omits that member from the flow-derived peak, with a
+named warning. If all members are unavailable, the calendar shows a start marker
+with duration N/A. Restoring a rate recalculates the envelope and requires conflict
+checks before future admission. This deliberately replaces the earlier policy of
+reserving two runs even for uncalibrated members.
+
+The allowance covers nominal tick and command timing, not arbitrary outages or
+guaranteed physical closure. New group windows cannot cross local midnight or overlap other automatic
 rules at the site. Existing overlaps between independent single-valve Fixed
-rules remain allowed. Revalidate reservations when cadence or limits change.
+rules remain allowed. Reservations are revalidated when rate, curve, coverage,
+duration, order, or cadence changes, and again at admission.
 DST repeated start times produce one occurrence per local date; nonexistent
 times are skipped and reported. Groups do not catch up outside their start minute.
 
@@ -382,7 +410,7 @@ a scheduled group's start records a skipped occurrence, without a delayed start.
 A submitted Fixed request that encounters a later conflict terminates visibly.
 During a group reservation other manual/Run now starts are rejected: stop the
 group first. The controller checks cancellation, current configuration/limits,
-daily attempts, conflicts, and remaining deadline before every pulse. It persists
+the saved pulse budget, conflicts, and remaining deadline before every pulse. It persists
 the attempt before issuing the existing bounded hardware command.
 
 Fresh confirmation that the previous valve is closed is required before advancing
@@ -390,6 +418,11 @@ to another valve. A finished database record or stale cached state is insufficie
 Uncertain opening or closure interrupts the remaining sequence. Reservation
 deadlines stop new pulses that cannot fit with command/retry allowance; an
 overrun retains the reservation until closure is confirmed.
+
+While a repeat is waiting, the dashboard shows **Resting** and its next eligible
+time. The persisted closure timestamp is stable across polls. The controller
+checks on its normal cadence and retains the site's reservation; no service or
+request sleeps to implement a break. Cancellation also works during rest.
 
 **Stop rule** cancels pending pulses and requests closure. Closing any member of
 an active group does the same, including when another member is watering.
@@ -406,9 +439,31 @@ devices subsequently disabled. Attempted commands are never replayed and missed
 dates are not backfilled. The next eligible scheduled date starts normally;
 a new explicit Fixed request requires recovery and confirmed closure first.
 
+Opening claims distinguish a sender that has not started from one whose command
+is in flight. Recovery can revoke an unsent claim atomically. An in-flight web
+sender keeps ownership until it acknowledges cancellation; an earlier closed
+read or elapsed timeout cannot prove that a surviving process will not send
+later. Scheduled senders belong to the single controller and can be reconciled
+when that controller restarts. Recent committed opening attempts are recognized
+by the watchdog, while genuine unexplained openings still receive closure.
+If closure interrupts a command still awaiting acknowledgement, the later result
+retains uncertain-delivery accounting and a warning; it cannot turn that
+interrupted watering into a reported full successful delivery.
+Cancellation received before the opening acknowledgement also keeps conservative
+credit, including when a database failure prevents recording the racing close.
+Stopping a normally acknowledged run still credits its known shortened delivery.
+
+If a web process crashes without acknowledging its opening, the site stays
+blocked conservatively. After stopping **all** old web and controller processes,
+an operator can run `python manage.py reconcile_openings --senders-stopped` from
+a maintenance container using the mounted database and normal relay connection,
+then restart the web app and one controller. This exceptional recovery command
+closes and reads valves; it never opens them. The flag confirms that no old sender
+can return. Do not use it while any old sender process may still be running.
+
 ## Upgrade and Verification
 
-Back up the persistent database, stop the old controller, apply migrations, then
+Back up the persistent database, stop the old web and controller processes, apply migrations, then
 start the upgraded web app and exactly one controller. Keep SQLite on the mounted
 `/data` volume or use Postgres; no host cron/systemd or extra worker is required.
 No deployment or hardware commissioning is part of the automated test suite.
@@ -418,6 +473,13 @@ curve settings for existing sites without a settings row. Existing temperature
 overrides are preserved. Valve rates remain nullable/N/A; no calibration or
 historical run rate is invented. Updating a Docker image requires no new
 environment configuration for these defaults.
+
+The sender-state migration adds bookkeeping without changing saved durations,
+rate snapshots, or historical decisions. Older two-pass occurrences retain their
+recorded meaning. New Smart occurrences use the revised finite sequence and
+break policy. No new dependency or environment variable is required. Docker's
+existing startup migration step applies the schema changes; keep only one
+controller and stop the old web process as part of the upgrade.
 
 The migration converts every legacy `DYNAMIC` rule to Fixed at its stored
 maximum duration, including disabled rules and inactive schedules. IDs and all

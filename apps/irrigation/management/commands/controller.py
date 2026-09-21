@@ -273,6 +273,26 @@ class Command(BaseCommand):
                 if now < max_stop:
                     continue
 
+            opening = IrrigationRun.objects.filter(
+                valve=valve, status="PLANNED", attempt_started_at__isnull=False,
+                attempt_finished_at=None,
+                dispatch_state__in=("UNSENT", "SENDING", "LEGACY"),
+            ).first()
+            if opening:
+                age = (now - opening.attempt_started_at).total_seconds()
+                allowance = (
+                    group_services.command_allowance()
+                    + group_services.controller_interval()
+                )
+                if not opening.cancellation_requested and 0 <= age <= allowance:
+                    # The committed attempt explains the open relay even while
+                    # the sender awaits acknowledgement. Do not fabricate an
+                    # early watchdog closure and later claim full delivery.
+                    continue
+                IrrigationRun.objects.filter(pk=opening.pk).update(
+                    cancellation_requested=True, delivery_uncertain=True,
+                )
+
             recent_failsafe = IrrigationRun.objects.filter(
                 valve=valve,
                 trigger__in=[
@@ -285,7 +305,11 @@ class Command(BaseCommand):
                 continue
 
             try:
-                services.close_valve(valve)
+                try:
+                    if opening:
+                        group_services.mark_sender_interrupted([opening.pk])
+                finally:
+                    services.close_valve(valve)
                 status = IrrigationRun.STATUS_FINISHED
                 stop_reason = IrrigationRun.STOP_FAILSAFE
                 error_message = ""

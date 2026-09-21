@@ -1,14 +1,21 @@
 {% extends "base.html" %}
+{% load irrigation %}
 {% block title %}Smart preview | Rainwise{% endblock %}
 {% block content %}
 <h1 class="h3">Smart preview</h1>
 <p>This estimate uses cached weather and recorded delivery now. Scheduled execution saves its own decision at admission. Preview never starts watering.</p>
-<p>Calendar reservation: {{ watering_seconds }} seconds of configured maximum watering + {{ handover_seconds }} seconds handover allowance. The calculated dose does not shorten this reservation.</p>
+<div class="card mb-3"><div class="card-body"><h2 class="h5">Peak calendar reservation</h2>
+{% if reservation.error %}<p class="text-danger">{{ reservation.error }}</p>{% endif %}
+{% if reservation.available %}<p>Watering: {{ reservation.watering_seconds|duration }} · Breaks: {{ reservation.break_seconds|duration }} · Scheduling allowance: {{ reservation.scheduling_allowance_seconds|duration }}.</p><p>Total: {{ reservation.total_seconds|duration }}. Today's rain and calculated demand do not shorten this peak reservation.</p>{% else %}<p>Duration N/A. The calendar shows the scheduled start.</p>{% endif %}
+{% for name in reservation.unavailable_valves %}<p class="text-warning-emphasis">{{ name }}: watering rate N/A; omitted from the peak reservation.</p>{% endfor %}
+</div></div>
 {% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}
 {% if decision %}
+<h2 class="h5">Calculated demand now</h2>
 <p>Daily need {{ decision.daily_need_mm|floatformat:2 }} mm/day × {{ decision.coverage_days }} local days. Known rain credit: {{ decision.rain.credit_mm|floatformat:2 }} mm, through {{ rain_cutoff|date:"Y-m-d H:i T" }}.</p>
 <p>Temperature: {{ decision.temperature.temperature_c|floatformat:1 }} °C ({{ decision.temperature.source }}). Latest valid weather: {% if latest_valid_weather %}{{ latest_valid_weather|date:"Y-m-d H:i T" }}{% else %}Unavailable{% endif %}.</p>
 {% for warning in decision.warnings %}<div class="alert alert-warning">{{ warning }}</div>{% endfor %}
+<p>Watering: {{ decision.sequence.watering_seconds|duration }} · Breaks: {{ decision.sequence.break_seconds|duration }}. {{ decision.sequence.pulse_count }} bounded runs, with each repeat following a break at least as long as that valve's previous run.</p>
 {% include "irrigation/decision_table.html" %}
 {% endif %}
 <a class="btn btn-secondary" href="{% url 'group_edit' rule.id %}">Back to rule</a>

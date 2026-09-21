@@ -84,7 +84,7 @@ class SharedRuleEditorTests(TestCase):
 
     def test_smart_requires_valid_limits_and_days(self):
         for change, text in [({"days_of_week": []}, "required"),
-                             ({"members-0-duration_seconds": "901"}, "maximum")]:
+                             ({"members-0-duration_seconds": "3277"}, "3276")]:
             with self.subTest(change=change):
                 response = self.client.post(reverse("schedule_create"), self.payload("SMART", **change))
                 self.assertEqual(response.status_code, 200)
@@ -93,12 +93,12 @@ class SharedRuleEditorTests(TestCase):
 
     def test_duplicates_and_cross_site_valves_rejected(self):
         response = self.client.post(reverse("schedule_create"), self.payload(valves=[self.a, self.a]))
-        self.assertContains(response, "only once")
+        self.assertContains(response, "already selected")
         other_site = Site.objects.create(name="Other", timezone="UTC")
         relay = RelayDevice.objects.create(site=other_site, name="Other", host="invalid")
         valve = Valve.objects.create(relay_device=relay, name="Other", channel=1)
         response = self.client.post(reverse("schedule_create"), self.payload(valves=[valve]))
-        self.assertContains(response, "valid choice")
+        self.assertContains(response, "at this site")
         self.assertFalse(ScheduleRule.objects.exists())
 
     def test_legacy_conversion_is_atomic_and_preserves_history(self):
@@ -190,17 +190,20 @@ class SharedRuleEditorTests(TestCase):
         opening.assert_not_called()
         self.assertFalse(RuleOccurrence.objects.exists())
 
-    def test_calendar_uses_maxima_and_handover_at_both_cadences(self):
+    def test_calendar_uses_peak_watering_breaks_and_allowance_at_both_cadences(self):
         rule = self.group()
         for interval in (30, 60):
             with self.subTest(interval=interval), mock.patch.dict(os.environ, {"CONTROLLER_INTERVAL_SECONDS": str(interval)}):
                 response = self.client.get(reverse("calendar_events"), {"start": "2026-09-21", "end": "2026-09-22"})
                 event, = response.json()
-                self.assertEqual(event["watering_seconds"], 3600)
-                self.assertEqual(event["handover_seconds"], 4 * interval)
+                self.assertEqual(event["watering_seconds"], 8400)
+                self.assertEqual(event["break_seconds"], 300)
+                from apps.irrigation.group_services import command_allowance
+                allowance = 19 * interval + 10 * command_allowance()
+                self.assertEqual(event["scheduling_allowance_seconds"], allowance)
                 self.assertEqual(event["edit_url"], reverse("group_edit", args=[rule.pk]))
                 elapsed = dt.datetime.fromisoformat(event["end"]) - dt.datetime.fromisoformat(event["start"])
-                self.assertEqual(elapsed.total_seconds(), 3600 + 4 * interval)
+                self.assertEqual(elapsed.total_seconds(), 8700 + allowance)
                 self.assertIn("Lawn A → Lawn B", event["title"])
 
     def test_group_window_overlap_rejected_in_both_directions(self):
@@ -541,7 +544,7 @@ class SharedRuleEditorTests(TestCase):
         )
         self.assertContains(response, "Lawn A: enter a measured watering rate")
 
-    def test_missing_rate_preview_dashboard_curve_warn_and_keep_reservation(self):
+    def test_missing_rate_preview_warns_and_omits_unavailable_peak(self):
         rule = self.group()
         Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
         response = self.client.get(reverse("group_preview", args=[rule.pk]))
@@ -551,7 +554,7 @@ class SharedRuleEditorTests(TestCase):
         self.assertFalse(decision["valves"][str(self.b.pk)]["skipped"])
         self.assertIsNone(decision["valves"][str(self.a.pk)]["target_mm"])
         self.assertContains(response, "N/A")
-        self.assertEqual(response.context["watering_seconds"], 3600)
+        self.assertEqual(response.context["reservation"]["watering_seconds"], 4200)
         for route in ("dashboard", "curve"):
             response = self.client.get(reverse(route))
             self.assertContains(response, "Lawn A: skipped in Smart")
@@ -598,3 +601,131 @@ class SharedRuleEditorTests(TestCase):
         )
         self.assertContains(self.client.get(reverse("dashboard")), reason)
         self.assertContains(self.client.get(reverse("logs")), reason)
+
+    def test_blank_smart_override_resolves_server_side_valve_default(self):
+        response = self.client.post(reverse("schedule_create"), self.payload(
+            "SMART", **{"members-0-duration_seconds": ""}
+        ))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(GroupedRuleValve.objects.get().duration_seconds, 900)
+
+    def test_smart_override_may_be_above_or_below_valve_default(self):
+        # Zero peak isolates duration bounds from same-day sequence limits.
+        self.curve.max_mm = self.curve.min_mm = 0
+        self.curve.save()
+        for seconds in (1, 3276):
+            with self.subTest(seconds=seconds):
+                response = self.client.post(reverse("schedule_create"), self.payload(
+                    "SMART", enabled="", **{"members-0-duration_seconds": str(seconds)}
+                ))
+                self.assertEqual(response.status_code, 302)
+                self.assertEqual(GroupedRuleValve.objects.order_by("-pk").first().duration_seconds, seconds)
+
+    def test_invalid_valve_default_requires_explicit_smart_override(self):
+        Valve.objects.filter(pk=self.a.pk).update(default_max_duration_seconds=5000)
+        response = self.client.post(reverse("schedule_create"), self.payload(
+            "SMART", **{"members-0-duration_seconds": ""}
+        ))
+        self.assertContains(response, "valve default is outside 1–3276")
+        self.assertContains(response, 'href="#id_members-0-duration_seconds"')
+        self.assertFalse(GroupedRule.objects.exists())
+
+    def test_saved_and_copied_duration_survive_valve_default_changes(self):
+        rule = self.group("FIXED")
+        Valve.objects.update(default_max_duration_seconds=1200)
+        response = self.client.get(reverse("group_edit", args=[rule.pk]))
+        self.assertEqual(response.context["members_formset"].forms[0]["duration_seconds"].value(), 900)
+        response = self.client.post(reverse("group_copy", args=[rule.pk]), self.payload(
+            valves=[self.a, self.b], start_time="12:00"
+        ))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(GroupedRule.objects.exclude(pk=rule.pk).get().members.first().duration_seconds, 900)
+
+    def test_invalid_save_has_summary_linked_highlighted_errors_and_preserves_input(self):
+        data = self.payload("SMART", **{
+            "members-0-duration_seconds": "not a number", "start_time": "",
+            "days_of_week": [], "note": "Keep this note",
+        })
+        response = self.client.post(reverse("schedule_create"), data)
+        self.assertContains(response, "Rule was not saved. Correct the highlighted fields.")
+        for target in ("id_start_time", "id_days_of_week", "id_members-0-duration_seconds"):
+            self.assertContains(response, f'href="#{target}"')
+        self.assertContains(response, 'aria-invalid="true"')
+        self.assertContains(response, 'is-invalid')
+        self.assertContains(response, 'value="not a number"')
+        self.assertContains(response, 'value="Keep this note"')
+        self.assertContains(response, 'novalidate')
+        self.assertContains(response, 'document.getElementById("editorErrors")?.focus()')
+        self.assertEqual(response.context["form"]["mode"].value(), "SMART")
+        self.assertEqual(response.context["form"]["days_of_week"].value(), [])
+        self.assertFalse(GroupedRule.objects.exists())
+
+    def test_blank_added_row_is_not_silently_ignored(self):
+        data = self.payload()
+        data["members-TOTAL_FORMS"] = "2"
+        response = self.client.post(reverse("schedule_create"), data)
+        self.assertContains(response, "Select a valve or remove this row.")
+        self.assertContains(response, 'href="#id_members-1-valve"')
+        self.assertFalse(ScheduleRule.objects.exists())
+
+    def test_deleted_invalid_row_does_not_block_valid_save(self):
+        data = self.payload()
+        data.update({
+            "members-TOTAL_FORMS": "2", "members-1-valve": "invalid",
+            "members-1-duration_seconds": "nonsense", "members-1-ORDER": "bad",
+            "members-1-DELETE": "on",
+        })
+        response = self.client.post(reverse("schedule_create"), data)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(ScheduleRule.objects.get().valve_id, self.a.pk)
+
+    def test_missing_management_data_has_visible_summary_and_no_partial_save(self):
+        data = self.payload()
+        del data["members-TOTAL_FORMS"]
+        response = self.client.post(reverse("schedule_create"), data)
+        self.assertContains(response, "Rule was not saved.")
+        self.assertContains(response, 'href="#memberRows"')
+        self.assertFalse(ScheduleRule.objects.exists())
+
+    def test_invalid_fixed_runtime_is_attached_to_member_field(self):
+        response = self.client.post(reverse("schedule_create"), self.payload(
+            **{"members-0-duration_seconds": "30"}
+        ))
+        self.assertContains(response, "Enter 60–3276 seconds.")
+        self.assertContains(response, "Runtime (seconds)")
+        self.assertNotContains(response, "Maximum per run")
+        self.assertContains(response, 'value="30"')
+        self.assertFalse(ScheduleRule.objects.exists())
+
+    def test_missing_rate_submission_is_preserved_visibly_in_smart_selector(self):
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
+        response = self.client.post(reverse("schedule_create"), self.payload("SMART"))
+        options = response.context["members_formset"].forms[0]["valve"].subwidgets
+        option = next(item.data for item in options if str(item.data["value"]) == str(self.a.pk))
+        self.assertTrue(option["selected"])
+        self.assertNotIn("hidden", option["attrs"])
+        self.assertNotIn("disabled", option["attrs"])
+        self.assertContains(response, 'href="#id_members-0-valve"')
+
+    def test_all_missing_rates_calendar_is_start_marker_without_fake_duration(self):
+        self.group()
+        Valve.objects.update(application_rate_mm_h=None)
+        event, = self.client.get(reverse("calendar_events"), {
+            "start": "2026-09-21", "end": "2026-09-22",
+        }).json()
+        self.assertNotIn("end", event)
+        self.assertFalse(event["available"])
+        self.assertIn("duration N/A", event["title"])
+        self.assertEqual(event["unavailable_valves"], ["Lawn A", "Lawn B"])
+
+    def test_invalid_peak_renders_actionable_calendar_error_instead_of_500(self):
+        self.group()
+        Valve.objects.update(application_rate_mm_h=0.000001)
+        response = self.client.get(reverse("schedule"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Duration N/A")
+        event, = self.client.get(reverse("calendar_events"), {
+            "start": "2026-09-21", "end": "2026-09-22",
+        }).json()
+        self.assertTrue(event["reservation_error"])
+        self.assertNotIn("end", event)

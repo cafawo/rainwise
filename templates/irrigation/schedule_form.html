@@ -1,116 +1,168 @@
 {% extends "base.html" %}
 {% block title %}Rule | Rainwise{% endblock %}
 {% block content %}
-<h1 class="h3 mb-3">{% if rule %}Edit{% else %}New{% endif %} rule</h1>
+<div class="d-flex justify-content-between align-items-center mb-3"><h1 class="h3 mb-0">{% if rule %}Edit{% else %}New{% endif %} rule</h1><a href="{% url 'schedule' %}">Back to schedule</a></div>
+{% if editor_errors %}
+<div class="alert alert-danger" id="editorErrors" role="alert" tabindex="-1">
+  <h2 class="h5">Rule was not saved. Correct the highlighted fields.</h2>
+  <ul class="mb-0">{% for error in editor_errors %}<li><a class="alert-link" href="#{{ error.target }}">{{ error.message }}</a></li>{% endfor %}</ul>
+</div>
+{% endif %}
 {% for valve in missing_rate_valves %}
 <div class="alert alert-warning">{{ valve.name }}: skipped in Smart because a finite positive watering rate is required. Enter a measured watering rate in <a href="{% url 'admin:irrigation_valve_change' valve.pk %}">valve settings</a>.</div>
 {% endfor %}
-<div class="card"><div class="card-body">
-<form method="post" id="editorForm">
+<form method="post" id="editorForm" novalidate data-submitted="{{ submitted|yesno:'true,false' }}" data-existing="{{ editing_existing|yesno:'true,false' }}">
   {% csrf_token %}
-  {{ form.non_field_errors }}
-  <div class="mb-4">
-    <label for="{{ form.mode.id_for_label }}" class="form-label">1. Mode</label>
-    {{ form.mode }}{{ form.mode.errors }}
-    <p class="form-text">Fixed runs one ordered pass. Smart calculates each zone's own target and runs up to two passes.</p>
-  </div>
-  <fieldset class="mb-4">
-    <legend class="h5">2. Valves and order</legend>
-    <p>Select valves and set their sequence order. Each valve represents a separate irrigation zone.</p>
-    <p id="smartRateHelp">Smart only offers new valves with a measured watering rate. Existing members with N/A rates are retained and skipped until a rate is entered.</p>
-    {{ members_formset.management_form }}{{ members_formset.non_form_errors }}
-    <div id="memberRows">
-    {% for member in members_formset %}
-      <div class="row g-2 mb-3 member-row">
-        {{ member.non_field_errors }}
-        <div class="col-md-5"><label class="form-label" for="{{ member.valve.id_for_label }}">Valve</label>{{ member.valve }}{{ member.valve.errors }}</div>
-        <div class="col-md-2"><label class="form-label" for="{{ member.ORDER.id_for_label }}">Order</label>{{ member.ORDER }}{{ member.ORDER.errors }}</div>
-        <div class="col-md-2"><label for="{{ member.DELETE.id_for_label }}">Remove</label>{{ member.DELETE }}</div>
-      </div>
-    {% endfor %}
+  <div class="card mb-4"><div class="card-body">
+    <div class="row align-items-center g-3">
+      <div class="col-md-4"><label for="{{ form.mode.id_for_label }}" class="form-label fw-semibold">Mode</label>{{ form.mode }}<div class="invalid-feedback d-block" id="{{ form.mode.auto_id }}_errors">{{ form.mode.errors }}</div></div>
+      <div class="col-md-8"><p class="mb-0" id="modeHelp">{% if editor_mode == 'SMART' %}Smart calculates a target for each valve and repeats bounded runs with automatic breaks.{% else %}Fixed waters each valve once, in the selected order.{% endif %}</p></div>
     </div>
-    <button class="btn btn-outline-secondary btn-sm" type="button" id="addMember">Add valve</button>
+  </div></div>
+  <fieldset class="mb-4" id="memberRowsSection">
+    <legend class="h5">Valves in watering order</legend>
+    <p class="text-secondary small">Each valve is a separate watering zone. Use the arrows or Position fields to change the order.</p>
+    {{ members_formset.management_form }}
+    <div id="memberRows" tabindex="-1">{% for member in members_formset %}{% include "irrigation/member_row.html" with position=forloop.counter %}{% endfor %}</div>
+    <button class="btn btn-outline-primary" type="button" id="addMember" hidden>Add valve</button>
+    <noscript><p>Enable JavaScript to add valve rows; current rows can be edited, reordered with Position, or removed with their checkbox.</p></noscript>
+    <p id="smartRateHelp" class="form-text" {% if editor_mode != 'SMART' %}hidden{% endif %}>Smart needs measured watering rates. Existing members with N/A rates are retained and skipped until a rate is entered.</p>
+    <p id="smartBreakHelp" class="form-text" {% if editor_mode != 'SMART' %}hidden{% endif %}>Before a valve repeats, it rests for at least as long as its preceding run. Watering other valves counts toward that break. <a href="{% url 'curve' %}">Peak daily demand: {{ peak_daily_mm }} mm/day</a> · Coverage: {{ coverage_days }} days.</p>
   </fieldset>
-  <fieldset class="mb-4">
-    <legend class="h5">3. Schedule</legend>
-    <div class="form-check mb-3">{{ form.enabled }} <label for="{{ form.enabled.id_for_label }}">Enabled</label>{{ form.enabled.errors }}</div>
-    <label class="form-label">Weekdays</label>{{ form.days_of_week }}{{ form.days_of_week.errors }}
-    <p class="form-text">{{ form.days_of_week.help_text }} Excluded days still count in Smart history.</p>
-    <div class="mb-3"><label class="form-label" for="{{ form.start_time.id_for_label }}">Start time</label>{{ form.start_time }}{{ form.start_time.errors }}<p class="form-text">{{ form.start_time.help_text }}</p></div>
-    <div class="mb-3"><label class="form-label" for="{{ form.note.id_for_label }}">Name / note</label>{{ form.note }}{{ form.note.errors }}</div>
-  </fieldset>
-  <h2 class="h5">4. Duration per valve</h2>
-  <div id="durationRows">
-  {% for member in members_formset %}
-    <div class="mb-3 duration-row" data-member-index="{{ forloop.counter0 }}"><label class="form-label duration-label" for="{{ member.duration_seconds.id_for_label }}">Duration (seconds)</label><span class="ms-2 member-name"></span>{{ member.duration_seconds }}{{ member.duration_seconds.errors }}</div>
-  {% endfor %}
-  </div>
-  <p id="durationHelp">Enter each valve's duration. Fixed: 60–3276 seconds. Smart: 1–3276 seconds per run, also within the valve's manual maximum. Smart allows at most <strong>2 attempts per valve per local day</strong>.</p>
-  <p>Smart requires measured watering rates. <a href="{% url 'curve' %}">Curve settings</a> include an editable fallback temperature of 25 °C by default. The calendar reserves all configured maximum runtimes plus one controller interval per pulse for handovers.</p>
-  <div class="d-flex gap-2 flex-wrap">
-    <button class="btn btn-primary" type="submit">Save</button>
-    <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
-    {% if rule %}
-      <a class="btn btn-outline-primary" href="{{ copy_url }}">Make copy</a>
-      {% if smart %}<a class="btn btn-outline-success" href="{{ preview_url }}">Preview</a>{% else %}<button class="btn btn-outline-success" type="submit" form="runRuleForm">Run now</button>{% endif %}
-      {% if is_group %}<button class="btn btn-outline-warning" type="submit" form="stopRuleForm">Stop rule</button>{% endif %}
-      <button class="btn btn-outline-danger" type="submit" form="deleteRuleForm">Delete rule</button>
-    {% endif %}
-  </div>
+  <fieldset class="card mb-4"><div class="card-body">
+    <legend class="h5">Schedule</legend>
+    <div class="form-check mb-3">{{ form.enabled }} <label for="{{ form.enabled.id_for_label }}">Enabled</label></div>
+    <div class="mb-3"><label class="form-label">Weekdays</label><div id="id_days_of_week" class="d-flex flex-wrap gap-3">{% for day in form.days_of_week %}<label class="form-check d-inline-flex gap-2">{{ day.tag }}{{ day.choice_label }}</label>{% endfor %}</div><div class="invalid-feedback d-block" id="id_days_of_week_errors">{{ form.days_of_week.errors }}</div></div>
+    <div class="row g-3">
+      <div class="col-md-4"><label class="form-label" for="{{ form.start_time.id_for_label }}">Start time</label>{{ form.start_time }}<div class="invalid-feedback d-block" id="id_start_time_errors">{{ form.start_time.errors }}</div><div id="id_start_time_help" class="form-text">Local start time for the whole rule.</div></div>
+      <div class="col-md-8"><label class="form-label" for="{{ form.note.id_for_label }}">Name / note</label>{{ form.note }}<div class="invalid-feedback d-block" id="id_note_errors">{{ form.note.errors }}</div></div>
+    </div>
+  </div></fieldset>
+  <div class="d-flex gap-2 mb-4"><button class="btn btn-primary" type="submit">Save</button><a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a></div>
 </form>
 {% if rule %}
-<form id="runRuleForm" method="post" action="{{ run_url }}">{% csrf_token %}</form>
-<form id="deleteRuleForm" method="post" action="{{ delete_url }}">{% csrf_token %}</form>
-{% if is_group %}<form id="stopRuleForm" method="post" action="{{ stop_url }}">{% csrf_token %}</form>{% endif %}
-{% endif %}
-<template id="emptyMember">
-<div class="row g-2 mb-3 member-row">
-  <div class="col-md-5"><label for="{{ members_formset.empty_form.valve.id_for_label }}">Valve</label>{{ members_formset.empty_form.valve }}</div>
-  <div class="col-md-2"><label for="{{ members_formset.empty_form.ORDER.id_for_label }}">Order</label>{{ members_formset.empty_form.ORDER }}</div>
-  <div class="col-md-2"><label for="{{ members_formset.empty_form.DELETE.id_for_label }}">Remove</label>{{ members_formset.empty_form.DELETE }}</div>
+<div class="border-top pt-3 d-flex flex-wrap gap-2">
+  <a class="btn btn-outline-primary" href="{{ copy_url }}">Make copy</a>
+  {% if smart %}<a class="btn btn-outline-success" href="{{ preview_url }}">Preview</a>{% else %}<form method="post" action="{{ run_url }}">{% csrf_token %}<button class="btn btn-outline-success">Run now</button></form>{% endif %}
+  {% if is_group %}<form method="post" action="{{ stop_url }}">{% csrf_token %}<button class="btn btn-outline-warning">Stop rule</button></form>{% endif %}
+  <form method="post" action="{{ delete_url }}">{% csrf_token %}<button class="btn btn-outline-danger">Delete rule</button></form>
 </div>
-</template>
-<template id="emptyDuration"><div class="mb-3 duration-row" data-member-index="__prefix__"><label class="form-label duration-label" for="{{ members_formset.empty_form.duration_seconds.id_for_label }}">Duration (seconds)</label><span class="ms-2 member-name"></span>{{ members_formset.empty_form.duration_seconds }}</div></template>
-</div></div>
+{% endif %}
+<template id="emptyMember">{% include "irrigation/member_row.html" with member=members_formset.empty_form %}</template>
+{{ peak_window_mm|json_script:"peakWindow" }}
 {% endblock %}
 {% block scripts %}
 <script>
-const modeInput = document.getElementById("id_mode");
-function showMode() {
-  const smart = modeInput.value === "SMART";
-  document.getElementById("smartRateHelp").hidden = !smart;
-  document.querySelectorAll('select[name$="-valve"]').forEach(select => {
-    for (const option of select.options) {
-      const unavailable = smart && option.dataset.smartAllowed === "false";
-      option.disabled = unavailable;
-      option.hidden = unavailable;
-      if (unavailable && option.selected) select.value = "";
-    }
-  });
-  document.querySelectorAll(".duration-row").forEach(row => {
-    const index = row.dataset.memberIndex;
-    const valve = document.getElementById(`id_members-${index}-valve`);
-    row.querySelector(".member-name").textContent = valve.selectedOptions[0]?.textContent || "";
-    row.hidden = document.getElementById(`id_members-${index}-DELETE`).checked;
-  });
-  document.querySelectorAll(".duration-label").forEach(label => label.textContent = modeInput.value === "SMART" ? "Maximum per run (seconds)" : "Fixed runtime (seconds)");
-}
-modeInput.addEventListener("change", () => {
-  if (modeInput.value === "SMART" && !document.querySelector('input[name="days_of_week"]:checked')) {
-    document.querySelectorAll('input[name="days_of_week"]').forEach(input => input.checked = true);
+(() => {
+  const form = document.getElementById("editorForm");
+  const mode = document.getElementById("id_mode");
+  const container = document.getElementById("memberRows");
+  const peak = JSON.parse(document.getElementById("peakWindow").textContent);
+  let daysEdited = form.dataset.submitted === "true" || form.dataset.existing === "true";
+  const rows = () => Array.from(container.querySelectorAll(".member-row"));
+  const field = (row, name) => document.getElementById(`id_${row.dataset.prefix}-${name}`);
+  const readable = value => {
+    if (!Number.isFinite(value) || value < 0) return "N/A";
+    const hours = Math.floor(value / 3600), minutes = Math.floor(value % 3600 / 60), seconds = value % 60;
+    return [hours ? `${hours}h` : "", minutes ? `${minutes}m` : "", seconds || (!hours && !minutes) ? `${seconds}s` : ""].filter(Boolean).join(" ");
+  };
+  function refresh() {
+    const smart = mode.value === "SMART";
+    document.getElementById("modeHelp").textContent = smart ? "Smart calculates a target for each valve and repeats bounded runs with automatic breaks." : "Fixed waters each valve once, in the selected order.";
+    document.getElementById("smartRateHelp").hidden = !smart;
+    document.getElementById("smartBreakHelp").hidden = !smart;
+    const active = rows().filter(row => !field(row, "DELETE").checked);
+    rows().forEach(row => {
+      const select = field(row, "valve"), input = field(row, "duration_seconds");
+      const deleted = field(row, "DELETE").checked;
+      for (const option of select.options) {
+        const unavailable = smart && option.dataset.smartAllowed === "false";
+        option.disabled = unavailable && !option.selected;
+        option.hidden = unavailable && !option.selected;
+      }
+      const option = select.selectedOptions[0];
+      const fallback = Number(option?.dataset.defaultSeconds);
+      const rate = Number(option?.dataset.rate);
+      const validDuration = input.value.trim() !== "" && /^\d+$/.test(input.value.trim());
+      const seconds = validDuration ? Number(input.value) : (smart && input.value.trim() === "" ? fallback : NaN);
+      row.querySelector(".member-fields").hidden = deleted;
+      row.querySelector(".member-heading").textContent = deleted ? "Removed valve row" : `Valve ${active.indexOf(row) + 1}`;
+      row.querySelector(".remove-member").textContent = deleted ? "Undo remove" : "Remove";
+      row.querySelector(".move-up").disabled = deleted || active.indexOf(row) === 0;
+      row.querySelector(".move-down").disabled = deleted || active.indexOf(row) === active.length - 1;
+      row.querySelector(".duration-label").textContent = smart ? "Run time before a break (seconds)" : "Runtime (seconds)";
+      row.querySelector(".duration-help").textContent = smart ? "1–3276 seconds. Blank uses the valve default at Save." : "Enter 60–3276 seconds.";
+      const defaultWarning = select.value && (fallback < (smart ? 1 : 60) || fallback > 3276) ? ` This valve default is outside ${smart ? "1" : "60"}–3276 seconds; enter a valid value.` : "";
+      row.querySelector(".duration-description").textContent = `Duration: ${readable(seconds)} · Valve default: ${readable(fallback)}.${defaultWarning}`;
+      row.querySelector(".use-default").disabled = !select.value;
+      const invalidRate = smart && select.value && option.dataset.smartAllowed === "false";
+      row.querySelector(".client-rate-error").hidden = !invalidRate;
+      row.querySelector(".client-rate-error").classList.toggle("d-block", Boolean(invalidRate));
+      row.querySelector(".rate-help").textContent = smart && select.value ? `Watering rate: ${rate > 0 ? `${rate} mm/hour` : "N/A — skipped in Smart"}` : "";
+      const metrics = row.querySelector(".smart-metrics");
+      metrics.hidden = !smart;
+      const peakSeconds = rate > 0 ? Math.floor(peak * 3600 / rate) : NaN;
+      metrics.textContent = `Peak watering for the coverage window: ${readable(peakSeconds)}. Run limit: ${readable(seconds)}. Breaks and scheduling allowance add elapsed time.`;
+    });
   }
-  showMode();
-});
-document.getElementById("addMember").addEventListener("click", () => {
-  const total = document.getElementById("id_members-TOTAL_FORMS");
-  const index = Number(total.value);
-  document.getElementById("memberRows").insertAdjacentHTML("beforeend", document.getElementById("emptyMember").innerHTML.replaceAll("__prefix__", String(index)));
-  document.getElementById("durationRows").insertAdjacentHTML("beforeend", document.getElementById("emptyDuration").innerHTML.replaceAll("__prefix__", String(index)));
-  document.getElementById(`id_members-${index}-ORDER`).value = index + 1;
-  total.value = index + 1;
-  showMode();
-});
-document.getElementById("memberRows").addEventListener("change", showMode);
-showMode();
+  function setup(row, isNew = false) {
+    const input = field(row, "duration_seconds");
+    input.dataset.edited = !isNew && (form.dataset.submitted === "true" || input.value !== "") ? "true" : "false";
+    row.querySelector(".delete-control").hidden = true;
+    ["move-up", "move-down", "remove-member", "use-default"].forEach(name => row.querySelector(`.${name}`).hidden = false);
+  }
+  rows().forEach(row => setup(row));
+  const initial = rows();
+  if (initial.every(row => /^\d+$/.test(field(row, "ORDER").value))) {
+    initial.sort((a, b) => Number(field(a, "ORDER").value) - Number(field(b, "ORDER").value)).forEach(row => container.append(row));
+  }
+  container.addEventListener("input", event => {
+    if (event.target.name.endsWith("-duration_seconds")) event.target.dataset.edited = "true";
+    refresh();
+  });
+  container.addEventListener("change", event => {
+    const row = event.target.closest(".member-row");
+    if (event.target.name.endsWith("-valve")) {
+      const input = field(row, "duration_seconds");
+      if (input.dataset.edited !== "true") input.value = event.target.selectedOptions[0]?.dataset.defaultSeconds || "";
+    }
+    refresh();
+  });
+  container.addEventListener("click", event => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    const row = button.closest(".member-row");
+    if (button.classList.contains("remove-member")) field(row, "DELETE").checked = !field(row, "DELETE").checked;
+    if (button.classList.contains("use-default")) {
+      const input = field(row, "duration_seconds");
+      input.value = field(row, "valve").selectedOptions[0]?.dataset.defaultSeconds || "";
+      input.dataset.edited = "false";
+    }
+    const active = rows().filter(item => !field(item, "DELETE").checked), index = active.indexOf(row);
+    if (button.classList.contains("move-up") && index > 0) container.insertBefore(row, active[index - 1]);
+    if (button.classList.contains("move-down") && index < active.length - 1) container.insertBefore(active[index + 1], row);
+    if (button.classList.contains("move-up") || button.classList.contains("move-down")) rows().filter(item => !field(item, "DELETE").checked).forEach((item, i) => field(item, "ORDER").value = i + 1);
+    refresh();
+  });
+  document.querySelectorAll('input[name="days_of_week"]').forEach(input => input.addEventListener("change", () => daysEdited = true));
+  mode.addEventListener("change", () => {
+    if (mode.value === "SMART" && !daysEdited) document.querySelectorAll('input[name="days_of_week"]').forEach(input => input.checked = true);
+    refresh();
+  });
+  const add = document.getElementById("addMember");
+  add.hidden = false;
+  add.addEventListener("click", () => {
+    const total = document.getElementById("id_members-TOTAL_FORMS"), index = Number(total.value);
+    container.insertAdjacentHTML("beforeend", document.getElementById("emptyMember").innerHTML.replaceAll("__prefix__", String(index)));
+    total.value = index + 1;
+    const row = rows().at(-1);
+    setup(row, true);
+    field(row, "ORDER").value = rows().filter(item => !field(item, "DELETE").checked).length;
+    refresh();
+    field(row, "valve").focus();
+  });
+  refresh();
+  document.getElementById("editorErrors")?.focus();
+})();
 </script>
 {% endblock %}

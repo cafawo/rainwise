@@ -1,13 +1,14 @@
+{% load irrigation %}
 <div class="table-responsive"><table class="table">
-<thead><tr><th>Valve</th><th>Earlier irrigation</th><th>Target</th><th>Capacity</th><th>Planned pulses</th><th>Estimated delivery</th><th>Unmet target</th></tr></thead>
+<thead><tr><th>Valve</th><th>Earlier irrigation</th><th>Target</th><th>Peak watering time</th><th>Planned pulses</th><th>Estimated delivery</th><th>Unmet target</th></tr></thead>
 <tbody>{% for row in decision_rows %}<tr>
 <td>{{ row.valve_name }}</td>
 {% if row.skipped %}
 <td>N/A</td><td>N/A</td><td>N/A</td><td>{{ row.skip_reason }}</td><td>N/A</td><td>N/A</td>
 {% else %}
 <td>{{ row.irrigation.credit_mm|floatformat:2 }} mm</td>
-<td>{{ row.target_mm|floatformat:2 }} mm</td><td>{{ row.capacity_mm|floatformat:2 }} mm</td>
-<td>{% for seconds in row.pulse_seconds %}{{ seconds }}s{% if not forloop.last %} + {% endif %}{% empty %}Skip: no dose{% endfor %}</td>
+<td>{{ row.target_mm|floatformat:2 }} mm</td><td>{% if row.peak_seconds != None %}{{ row.peak_seconds|duration }}{% elif row.capacity_mm != None %}Historical capacity: {{ row.capacity_mm|floatformat:2 }} mm{% else %}N/A{% endif %}</td>
+<td>{% for seconds in row.pulse_seconds %}{{ seconds|duration }}{% if not forloop.last %} + {% endif %}{% empty %}Skip: no dose{% endfor %}</td>
 <td>{{ row.estimated_delivery_mm|floatformat:2 }} mm</td><td>{{ row.unmet_mm|floatformat:2 }} mm</td>
 {% endif %}
 </tr>

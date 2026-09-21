@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% load irrigation %}
 
 {% block title %}
   {% if active_schedule %}Schedule ({{ active_schedule.name }}){% else %}Schedule{% endif %} | Rainwise
@@ -30,7 +31,9 @@
 <div class="col-md-6"><div class="card"><div class="card-body">
   <h2 class="h5"><a href="{{ card.edit_url }}">{{ card.mode }}: {{ card.members }}</a></h2>
   <p>{{ card.rule.days_display }} at {{ card.rule.start_time }}{% if not card.rule.enabled %} · Disabled{% endif %}</p>
-  <p>Watering: {{ card.watering_seconds }} seconds. Handover allowance: {{ card.handover_seconds }} seconds.</p>
+  {% if card.available %}<p>Watering: {{ card.watering_seconds|duration }} · Breaks: {{ card.break_seconds|duration }} · Scheduling allowance: {{ card.scheduling_allowance_seconds|duration }}.</p>{% else %}<p>Duration N/A — scheduled start only.</p>{% endif %}
+  {% if card.error %}<p class="text-danger">{{ card.error }}</p>{% endif %}
+  {% for name in card.unavailable_valves %}<p class="text-warning-emphasis">{{ name }}: rate N/A; omitted from reservation.</p>{% endfor %}
   {% if card.rule.note %}<p>{{ card.rule.note }}</p>{% endif %}
 </div></div></div>
 {% empty %}<p>No rules yet.</p>{% endfor %}
@@ -50,7 +53,7 @@
         timeZone: "{{ calendar_timezone }}",
         events: "{% url 'calendar_events' %}",
         eventDidMount: function (info) {
-          info.el.title = `${info.event.extendedProps.mode}: ${info.event.extendedProps.members}. Watering ${info.event.extendedProps.watering_seconds}s + handover ${info.event.extendedProps.handover_seconds}s`;
+          info.el.title = `${info.event.extendedProps.mode}: ${info.event.extendedProps.members}. Watering ${info.event.extendedProps.watering_seconds}s + breaks ${info.event.extendedProps.break_seconds}s + scheduling allowance ${info.event.extendedProps.scheduling_allowance_seconds}s. ${info.event.extendedProps.reservation_error || ""}`;
           info.el.addEventListener("dblclick", function () {
             const editUrl = info.event.extendedProps.edit_url;
             if (editUrl) {

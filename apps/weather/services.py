@@ -8,7 +8,7 @@ import requests
 from django.conf import settings
 from django.utils import timezone
 
-from apps.irrigation.models import CurveSettings, GroupedRule, Site
+from apps.irrigation.models import GroupedRule, Site, get_curve_settings
 from apps.weather.models import WeatherImportLog, WeatherObservation
 
 
@@ -122,9 +122,7 @@ def ensure_recent_weather(
     if GroupedRule.objects.filter(
         schedule__site=site, enabled=True, mode="SMART"
     ).exists():
-        curve = CurveSettings.objects.filter(site=site).first()
-        if curve:
-            coverage_days = curve.coverage_days
+        coverage_days = get_curve_settings(site).coverage_days
     lookback_days = max(1, lookback_days, coverage_days)
     start_date = local_now.date() - dt.timedelta(days=lookback_days)
     start_at = dt.datetime.combine(

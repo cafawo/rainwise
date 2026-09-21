@@ -2,8 +2,8 @@
 
 Updated 2026-09-21 after implementation review and the user's editor/timing
 feedback. This is the current design and supersedes the earlier two-pass plan.
-The existing implementation is the baseline, not a completed implementation of
-this revision. Only this planning document is being changed at this stage.
+The implementation baseline and review findings are recorded below. Section 9
+records the implementation decisions and verification for this revision.
 
 Confirmed follow-up decisions:
 
@@ -487,3 +487,114 @@ small and randomized sequences; implementation still needs the acceptance tests
 above. No live hardware commissioning or browser interaction was performed
 in that review. Preserve the existing weather/relay assumptions documented in
 README; these changes add no claim of measured rain or guaranteed soil absorption.
+
+## 9. Implementation decisions and review record
+
+Implementation started from the clean committed baseline after rereading this
+plan and AGENTS.md. The existing 172 tests passed on isolated SQLite at 60 seconds
+before edits. Independent agents handled the execution races, pure calculations
+and weather/model fixes, and editor/browser work; group integration and final
+review remained with the primary agent.
+
+- `sequence.py` supplies both actual planning and peak reservations. It validates
+  finite targets, integer pulse counts, watering/allowance lower bounds, and the
+  remaining day before allocating a bounded sequence. Smart repeats every valve
+  only after an off-time equal to its previous commanded duration. Actual
+  admission persists a finite pulse budget and `equal_previous_run_v1` policy;
+  prior occurrence JSON and pulse history are not rewritten.
+- Rest eligibility is derived from persisted pulse rows and their first safe
+  closure timestamp. It needs no new status column or repeated status writes.
+  The occurrence remains ACTIVE and owns the site while the UI shows Resting.
+  Fresh closure reads do not slide the saved timestamp. Ordinary rest ticks do
+  not take a write admission lock; readiness still triggers fresh admission and
+  deadline checks before transmission.
+- The nullable valve rate, fallback default 25 °C, saved duration fields and
+  relay transport remain unchanged. The valve duration now supplies a new
+  selection's default, with a resolved rule override; it is no longer a second
+  Smart ceiling. Manual Open retains its existing duration behavior.
+- Missing rates omit only unavailable members from future peak envelopes.
+  Entirely unavailable groups are zero-length start markers, with duration N/A,
+  and produce skipped occurrences. Review caught and fixed empty intervals
+  incorrectly overlapping another reservation. Restoring calibration rechecks
+  the enlarged envelope before admitting future watering.
+- Migration 0010 adds sender dispatch state without changing old values or
+  historical durations. New opening claims transition UNSENT → SENDING → DONE;
+  existing rows remain LEGACY. A committed UNSENT claim can be revoked before
+  transmission. A SENDING web claim cannot safely be released on a timeout or
+  pre-send closed read: a paused web process could still issue its command.
+  Recovery preserves its cancellation and ownership until acknowledgement,
+  clears obsolete closure evidence on a late result, and then confirms closure.
+  A separate `sender_interrupted` flag records an actual close racing a SENDING
+  command. Review reproduced a late acknowledgement erasing this uncertainty;
+  the acknowledgement now preserves it atomically. Ordinary cancellation after
+  an acknowledged opening still credits known shortened delivery. Failed
+  command/result persistence also attempts immediate closure while retaining
+  unresolved ownership.
+  A further independent failure-path test showed that a transient database error
+  could prevent the interruption marker from persisting even though the safety
+  close still ran. Acknowledgements therefore also retain conservative uncertainty
+  when cancellation arrived during transmission; that cancellation is committed
+  before every such close. This covers the failed-marker case without weakening
+  immediate closure or changing known stops after acknowledgement.
+- A crashed web sender with no acknowledgement deliberately retains ownership.
+  `reconcile_openings --senders-stopped` provides explicit recovery only after
+  all old web/controller processes have stopped; it closes/reads but never opens
+  valves. This is exceptional maintenance, not a new routine configuration step.
+  Controller-owned senders can be reconciled on restart under the existing
+  single-controller contract. The legacy protocol also requires stopping old
+  web senders during this upgrade. An expiring lease was rejected because it
+  would recreate the reproduced late-opening race.
+- Scheduled single rules reload inside the site admission transaction, preserving
+  separate legacy manual Run now semantics. Review extended this protection to
+  groups: refreshed weekday/start time must still match the selected minute,
+  and frozen occurrence site/schedule ownership is checked before later pulses.
+  The watchdog recognizes recent committed openings awaiting acknowledgement
+  and continues closing genuine orphan openings.
+- Weather backfill uses effective curve defaults for sites without stored
+  settings. Model validation rejects cross-site active schedules on creation
+  as well as edits. No new worker, dependency or environment variable is added.
+- Review found that admin calibration and curve edits bypassed reservation
+  validation. They now check the proposed configuration under site admission
+  using a rolled-back validation savepoint; invalid forms retain their errors
+  and cannot partially change settings. Regression tests cover rate/coverage
+  changes that create conflicts, valid saves, and removal of calibration.
+- The editor keeps raw invalid input, supplies linked inline errors and a
+  focused red summary, and uses `novalidate` so deleted rows cannot trigger
+  hidden browser validation. Browser testing found that adding a pristine row
+  after a failed submission needed its own default-fill state; this is fixed.
+  The README and public documentation page describe the revised sequence.
+
+Final verification on 2026-09-21:
+
+- Complete Django suite: **255 tests passed** on isolated SQLite with controller
+  and relay cadence 60 seconds (8.325 s).
+- Complete Django suite: **255 tests passed** on disposable PostgreSQL 17.11
+  with explicit 30-second cadences (10.248 s), including deterministic independent
+  connection interleavings. The temporary PostgreSQL cluster was stopped.
+- Fresh migrations through 0010 pass. Populated Dynamic, fallback, and dispatch
+  upgrade regressions preserve configuration/history; model drift reports no
+  changes. Django system checks and `git diff --check` pass. Relay driver,
+  container startup/configuration, dependency files and `.env.example` remain
+  unchanged.
+- Existing installed Chromium/Playwright drove an isolated Django server in the
+  `rainwise` environment with mocked relay/weather access. Add/remove/reorder,
+  mode changes, pristine defaults, explicit Use valve default, edited/invalid
+  value preservation, failed-save focus and error links, malformed deleted rows,
+  adding after an error, Fixed/Smart Save, Preview, and retained missing-rate
+  selections pass. The 390 px layout has no horizontal overflow and there were
+  no JavaScript errors. Screenshots were visually reviewed. The disposable
+  server and database were removed; review artifacts remain under
+  `/tmp/rainwise-ui-review/` for this local session.
+- Independent calculation, configuration, editor and execution reviews have
+  been incorporated; no required implementation phase remains open. Pure
+  exhaustive/randomized tests cover reduced-target peak envelopes at both
+  cadences. Controller tests cover multiple rounds, unequal caps, durable rests,
+  late confirmation/deadlines, missing rates, cancellation, restart, and the
+  unchanged rolling credit/weather/DST/safety behavior.
+
+No production data, live controller, real valve or deployment was used. Hardware
+commissioning is outside these mocked checks. Rollout still requires a database
+backup, stopping old web/controller senders, automatic startup migrations, and
+exactly one upgraded controller. No new Docker configuration is required. An
+unacknowledged crashed web sender intentionally needs the stopped-process
+reconciliation described above; elapsed time alone cannot safely release it.

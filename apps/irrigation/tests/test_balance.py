@@ -64,7 +64,9 @@ class BalanceTests(TestCase):
         WeatherObservation.objects.bulk_create(rows)
 
     def test_multiday_sequences_and_independent_zone_rates(self):
-        for daily_need, expected in ((2, [4, 0, 4, 0]), (4, [6, 2, 6, 2]), (7, [6, 6, 6, 6])):
+        for daily_need, expected in (
+            (2, [4, 0, 4, 0]), (4, [8, 0, 8, 0]), (7, [14, 0, 14, 0])
+        ):
             previous = 0
             delivered = []
             for _ in range(4):
@@ -74,11 +76,17 @@ class BalanceTests(TestCase):
             self.assertEqual(delivered, expected)
         self.assertEqual(plan_dose(2, 2, 3, 0, 12, 900)["planned_seconds"], 300)
         self.assertEqual(plan_dose(4, 2, 0, 4, 12, 900)["planned_seconds"], 1200)
-        self.assertEqual(plan_dose(2, 2, 0, 0, 6, 900)["estimated_delivery_mm"], 3)
+        self.assertEqual(plan_dose(2, 2, 0, 0, 6, 900)["estimated_delivery_mm"], 4)
         self.assertEqual(plan_dose(2, 1, 0, 0, 12, 900)["pulse_seconds"], [600])
-        self.assertEqual(plan_dose(2, 7, 0, 0, 12, 900)["unmet_mm"], 8)
+        self.assertEqual(plan_dose(2, 7, 0, 0, 12, 900)["unmet_mm"], 0)
         self.assertEqual(plan_dose(2, 2, 4, 0, 12, 900)["pulse_seconds"], [])
-        self.assertEqual(plan_dose(7, 2, 0, 0, 1.1, 1)["planned_seconds"], 2)
+        self.assertEqual(plan_dose(4, 2, 0, 0, 12, 900)["pulse_seconds"], [900, 900, 600])
+
+    def test_tiny_rates_and_one_second_caps_fail_before_large_plans(self):
+        with self.assertRaisesMessage(ValueError, "midnight"):
+            plan_dose(7, 2, 0, 0, 1e-300, 900)
+        with self.assertRaisesMessage(ValueError, "allowance"):
+            plan_dose(7, 2, 0, 0, 1.1, 1)
 
     def test_invalid_and_nonfinite_inputs_fail(self):
         for days in (0, 8, 1.5, True):
@@ -353,6 +361,24 @@ class BalanceTests(TestCase):
             irrigation_credit(self.valve, self.at, 1)["credit_mm"], 2
         )
 
+    def test_rule_limit_may_exceed_valve_default_and_peak_uses_full_window(self):
+        self.valve.default_max_duration_seconds = 300
+        self.valve.application_rate_mm_h = 7
+        self.valve.save()
+        self.curve.min_mm = self.curve.max_mm = 7
+        self.curve.save()
+        decision = build_smart_decision(
+            self.site,
+            [SimpleNamespace(valve=self.valve, order=0, duration_seconds=1800)],
+            self.at,
+        )
+        row = decision["valves"][str(self.valve.pk)]
+        self.assertEqual(row["planned_seconds"], 7200)
+        self.assertEqual(row["peak_seconds"], 7200)
+        self.assertEqual(row["pulse_seconds"], [1800] * 4)
+        self.assertEqual(decision["peak_sequence"]["break_seconds"], 5400)
+        self.assertEqual(decision["sequence"]["elapsed_seconds"], 12600)
+
 
 class GroupModelTests(TestCase):
     def setUp(self):
@@ -439,3 +465,26 @@ class GroupModelTests(TestCase):
         member.rule = self.rule
         with self.assertRaisesMessage(ValidationError, "watering rate"):
             member.full_clean()
+
+    def test_smart_rule_override_can_exceed_valve_default(self):
+        self.rule.mode = "SMART"
+        self.rule.save()
+        self.valve.default_max_duration_seconds = 60
+        self.valve.application_rate_mm_h = 12
+        self.valve.save()
+        GroupedRuleValve(
+            rule=self.rule, valve=self.valve, order=0, duration_seconds=3276
+        ).full_clean()
+
+    def test_new_and_existing_sites_reject_another_sites_active_schedule(self):
+        site = Site(name="New", active_schedule=self.schedule)
+        with self.assertRaisesMessage(ValidationError, "belong to this site"):
+            site.full_clean()
+        site.active_schedule = None
+        site.full_clean()
+        site.save()
+        site.active_schedule = self.schedule
+        with self.assertRaisesMessage(ValidationError, "belong to this site"):
+            site.full_clean()
+        self.site.active_schedule = self.schedule
+        self.site.full_clean()

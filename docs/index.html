@@ -56,7 +56,7 @@
           <h3>Weather and watering history</h3>
           <p>
             Smart rules use recent temperature, rain, and recorded watering.
-            The curve view shows demand, zone capacity, and fallback conditions.
+            The curve view shows daily demand, peak watering time, and fallback conditions.
           </p>
         </div>
         <div class="feature-card">
@@ -102,9 +102,10 @@
         <div class="tech-card">
           <h3>Bounded, ordered execution</h3>
           <p>
-            Fixed groups water once in valve order. Smart groups use up to two
-            bounded runs per valve, with confirmed closure before advancing.
-            Calendar reservations include configured maxima and controller handovers.
+            Fixed groups water once in valve order. Smart groups divide their
+            water targets into bounded runs, with confirmed closure and automatic
+            breaks before repeating a valve. Calendar reservations show peak
+            watering, breaks, and scheduling allowance separately.
           </p>
         </div>
       </div>

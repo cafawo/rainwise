@@ -114,11 +114,13 @@ class RuleEditorForm(forms.Form):
     enabled = forms.BooleanField(required=False, initial=True)
     days_of_week = forms.MultipleChoiceField(
         choices=DAY_CHOICES, widget=forms.CheckboxSelectMultiple,
-        help_text="Select at least one day. Smart defaults to every day.",
+        help_text="Smart starts with every day selected.",
+        error_messages={"required": "Select at least one weekday."},
     )
     start_time = forms.TimeField(
         widget=forms.TimeInput(attrs={"type": "time"}),
         help_text="Local start time for the entire sequence.",
+        error_messages={"required": "Enter a start time."},
     )
     note = forms.CharField(max_length=255, required=False, label="Name / note")
 
@@ -127,6 +129,8 @@ class RuleEditorForm(forms.Form):
         for name, field in self.fields.items():
             if name not in {"enabled", "days_of_week"}:
                 field.widget.attrs["class"] = "form-select" if name == "mode" else "form-control"
+        self.fields["enabled"].widget.attrs["class"] = "form-check-input"
+        self.fields["days_of_week"].widget.attrs["class"] = "form-check-input"
 
 
 class ValveSelect(forms.Select):
@@ -143,7 +147,11 @@ class ValveSelect(forms.Select):
                 valve.has_valid_application_rate or valve.pk in self.retained_ids
             )
             option["attrs"]["data-smart-allowed"] = "true" if allowed else "false"
-            if self.mode == "SMART" and not allowed:
+            option["attrs"]["data-default-seconds"] = valve.default_max_duration_seconds
+            option["attrs"]["data-rate"] = (
+                valve.application_rate_mm_h if valve.has_valid_application_rate else ""
+            )
+            if self.mode == "SMART" and not allowed and not selected:
                 option["attrs"].update(disabled=True, hidden=True)
         return option
 
@@ -174,44 +182,91 @@ class SmartValveChoiceField(forms.ModelChoiceField):
 
 class ValveMemberForm(forms.Form):
     valve = forms.ModelChoiceField(queryset=Valve.objects.none())
-    duration_seconds = forms.IntegerField(
-        min_value=1, max_value=RELAY_FLASH_MAX_DURATION_SECONDS,
-        label="Duration (seconds)",
-    )
+    duration_seconds = forms.IntegerField(required=False)
 
     def __init__(
         self, *args, site=None, mode="FIXED", retained_ids=(), **kwargs
     ):
         super().__init__(*args, **kwargs)
+        self.mode = mode
         self.fields["valve"] = SmartValveChoiceField(
             queryset=Valve.objects.filter(relay_device__site=site)
             .select_related("relay_device").order_by("name"),
             mode=mode, retained_ids=retained_ids,
             widget=ValveSelect(mode=mode, retained_ids=retained_ids),
+            error_messages={
+                "required": "Select a valve or remove this row.",
+                "invalid_choice": "Select a valve at this site or remove this row.",
+            },
+        )
+        minimum = 1 if mode == "SMART" else 60
+        label = "Run time before a break" if mode == "SMART" else "Runtime"
+        self.fields["duration_seconds"] = forms.IntegerField(
+            required=False, min_value=minimum,
+            max_value=RELAY_FLASH_MAX_DURATION_SECONDS, label=label,
+            widget=forms.TextInput(attrs={"class": "form-control", "inputmode": "numeric"}),
+            error_messages={
+                "invalid": f"Enter a whole number of seconds ({minimum}–3276).",
+                "min_value": f"Enter {minimum}–3276 seconds.",
+                "max_value": f"Enter {minimum}–3276 seconds.",
+            },
         )
         self.fields["valve"].widget.attrs["class"] = "form-select"
-        self.fields["duration_seconds"].widget.attrs["class"] = "form-control"
+
+    def clean(self):
+        cleaned = super().clean()
+        if "duration_seconds" in self.errors:
+            return cleaned
+        duration = cleaned.get("duration_seconds")
+        if duration is None:
+            valve = cleaned.get("valve")
+            if self.mode == "SMART" and valve:
+                duration = valve.default_max_duration_seconds
+                try:
+                    self.fields["duration_seconds"].run_validators(duration)
+                except forms.ValidationError:
+                    self.add_error(
+                        "duration_seconds",
+                        "The valve default is outside 1–3276 seconds. Enter a valid override.",
+                    )
+                else:
+                    cleaned["duration_seconds"] = duration
+            elif self.mode != "SMART":
+                self.add_error("duration_seconds", "Enter a runtime of 60–3276 seconds.")
+        return cleaned
 
 
 class BaseValveMemberFormSet(forms.BaseFormSet):
+    default_error_messages = {
+        "too_few_forms": "Select at least one valve. Add a complete valve row before saving.",
+        "missing_management_form": "The valve list is incomplete. Reload the editor and try again.",
+    }
+    ordering_widget = forms.TextInput(attrs={"inputmode": "numeric"})
+
+    def add_fields(self, form, index):
+        super().add_fields(form, index)
+        # Every deliberately added row must be completed or explicitly removed.
+        form.empty_permitted = False
+        if not form.is_bound and index is not None:
+            form.fields["ORDER"].initial = index + 1
+        form.fields["ORDER"].widget.attrs.update({
+            "class": "form-control form-control-sm", "min": "1",
+        })
+
     def clean(self):
-        if any(self.errors):
-            return
         seen = set()
-        count = 0
         for form in self.forms:
             values = form.cleaned_data
-            if not values or values.get("DELETE"):
+            if values.get("DELETE"):
                 continue
             valve = values.get("valve")
             if valve is None:
                 continue
             if valve.pk in seen:
-                raise forms.ValidationError("Select each valve only once.")
+                form.add_error(
+                    "valve", "This valve is already selected. Choose another valve or remove this row."
+                )
             seen.add(valve.pk)
-            count += 1
-        if not count:
-            raise forms.ValidationError("Select at least one valve.")
 
 
 ValveMemberFormSet = forms.formset_factory(
@@ -290,14 +345,14 @@ class ScheduleLoadForm(forms.Form):
 
 class CurveForm(forms.Form):
     min_mm = forms.FloatField(
-        label="Min (mm)",
+        label="Minimum daily demand (mm/day)",
         initial=0.0,
         widget=forms.NumberInput(
             attrs={"class": "form-control", "placeholder": "e.g. 0", "step": "0.1"}
         ),
     )
     max_mm = forms.FloatField(
-        label="Max (mm)",
+        label="Peak daily demand (mm/day)",
         initial=7.0,
         widget=forms.NumberInput(
             attrs={"class": "form-control", "placeholder": "e.g. 7", "step": "0.1"}

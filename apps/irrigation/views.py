@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -50,6 +51,7 @@ from apps.irrigation.models import (
     Valve,
 )
 from apps.irrigation.site_context import store_active_site
+from apps.irrigation.sequence import target_seconds
 from apps.weather.models import WeatherObservation
 
 
@@ -119,6 +121,11 @@ def _occurrence_cards(site, limit=30):
         runs = list(occurrence.runs.all())
         occurrence.progress_total = len(runs)
         occurrence.progress_finished = sum(run.status == "FINISHED" for run in runs)
+        occurrence.next_eligible_at = group_services.occurrence_next_eligible_at(occurrence, runs=runs)
+        occurrence.is_resting = bool(
+            occurrence.status == "ACTIVE" and occurrence.next_eligible_at
+            and occurrence.next_eligible_at > now
+        )
         occurrence.member_names = " → ".join(
             member.get("name", "")
             for member in occurrence.config.get("members", [])
@@ -255,18 +262,19 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         for member in GroupedRuleValve.objects.filter(
             rule__schedule=site.active_schedule, rule__mode="SMART"
         ).select_related("valve", "rule"):
-            rate = member.valve.application_rate_mm_h
-            capacity = (
-                2 * member.duration_seconds * rate / 3600
-                if member.valve.has_valid_application_rate else None
-            )
+            peak_seconds = None
+            warning = ""
+            if member.valve.has_valid_application_rate:
+                try:
+                    peak_seconds = target_seconds(
+                        user_params["coverage_days"] * user_params["max_mm"],
+                        member.valve.application_rate_mm_h,
+                    )
+                except (ValueError, ValidationError) as exc:
+                    warning = str(exc)
             capacity_rows.append({
-                "valve": member.valve, "cap": member.duration_seconds, "capacity": capacity,
-                "cannot_sustain": capacity is not None and capacity < user_params["max_mm"],
-                "cannot_cover": (
-                    capacity is not None and capacity
-                    < user_params["coverage_days"] * user_params["max_mm"]
-                ),
+                "valve": member.valve, "cap": member.duration_seconds,
+                "peak_seconds": peak_seconds, "warning": warning,
             })
 
     return render(
@@ -323,7 +331,7 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
     schedules = Schedule.objects.filter(site=site).order_by("name")
     rule_list = list(
         ScheduleRule.objects.filter(schedule=active_schedule)
-        .only("start_time", "max_duration_seconds")
+        .select_related("valve")
         .order_by("start_time")
     )
     group_list = list(
@@ -331,6 +339,7 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
         .prefetch_related("members__valve")
     )
     rule_list.extend(group_list)
+    cards = [_rule_card(rule) for rule in rule_list]
     slot_min_time = None
     slot_max_time = None
 
@@ -339,10 +348,8 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
             _time_to_seconds(rule.start_time) for rule in rule_list
         )
         max_end_seconds = max(
-            _time_to_seconds(rule.start_time) + (sum(group_services.reservation_seconds(rule))
-                                                   if isinstance(rule, GroupedRule)
-                                                   else rule.max_duration_seconds)
-            for rule in rule_list
+            _time_to_seconds(card["rule"].start_time) + card["total_seconds"]
+            for card in cards
         )
         slot_min_time = _seconds_to_time_str(_floor_to_hour(min_start_seconds))
         slot_max_time = _seconds_to_time_str(_ceil_to_hour(max_end_seconds))
@@ -356,7 +363,7 @@ def schedule_view(request: HttpRequest) -> HttpResponse:
             "schedules": schedules,
             "slot_min_time": slot_min_time,
             "slot_max_time": slot_max_time,
-            "rule_cards": [_rule_card(rule) for rule in rule_list],
+            "rule_cards": cards,
         },
     )
 
@@ -405,6 +412,34 @@ def _rule_urls(rule):
     return {action + "_url": reverse(prefix + "_" + action, args=[rule.pk])
             for action in ("edit", "copy", "delete", "run", "stop", "preview")
             if prefix == "group" or action not in {"stop", "preview"}}
+
+
+def _editor_errors(form, formset):
+    """Build a linked summary and accessible, visible field errors."""
+    errors = []
+    for current, target in [(form, "editorForm"), (formset.management_form, "memberRows")]:
+        for name, messages_list in current.errors.items():
+            if name == "__all__" or current is formset.management_form:
+                errors.extend({"target": target, "message": str(message)} for message in messages_list)
+            else:
+                field = current[name]
+                errors.extend({"target": field.auto_id, "message": str(message)} for message in messages_list)
+    errors.extend({"target": "memberRows", "message": str(message)} for message in formset.non_form_errors())
+    for index, member in enumerate(formset.forms, 1):
+        if member.cleaned_data.get("DELETE"):
+            continue
+        for name, messages_list in member.errors.items():
+            target = f"member-{member.prefix}" if name == "__all__" else member[name].auto_id
+            errors.extend({"target": target, "message": f"Valve row {index}: {message}"} for message in messages_list)
+    for current in [form, *formset.forms]:
+        for name in current.errors:
+            if name in current.fields:
+                field = current[name]
+                attrs = current.fields[name].widget.attrs
+                attrs["class"] = attrs.get("class", "") + " is-invalid"
+                attrs["aria-invalid"] = "true"
+                attrs["aria-describedby"] = f"{field.auto_id}_errors"
+    return errors
 
 
 def _edit_rule(request, rule=None, copying=False):
@@ -529,7 +564,14 @@ def _edit_rule(request, rule=None, copying=False):
                     if isinstance(exc, ValidationError) else str(exc)
                 )
                 form.add_error(None, error)
+    curve = get_curve_settings(site)
     context = {"form": form, "members_formset": members_formset,
+               "editor_errors": _editor_errors(form, members_formset) if data is not None else [],
+               "submitted": data is not None,
+               "editor_mode": editor_mode,
+               "peak_window_mm": curve.coverage_days * curve.max_mm,
+               "coverage_days": curve.coverage_days,
+               "peak_daily_mm": curve.max_mm,
                "rule": None if copying else rule, "is_group": is_group,
                "editing_existing": bool(rule and not copying),
                "missing_rate_valves": [
@@ -629,7 +671,7 @@ def group_preview(request, rule_id):
         )
     except (ValidationError, ValueError, RuntimeError) as exc:
         error = str(exc)
-    watering, handover = group_services.reservation_seconds(rule)
+    reservation = _rule_card(rule)
     return render(request, "irrigation/preview.html", {
         "rule": rule, "decision": decision, "error": error,
         "decision_rows": list(decision["valves"].values()) if decision else [],
@@ -641,7 +683,7 @@ def group_preview(request, rule_id):
             dt.datetime.fromisoformat(decision["temperature"]["latest_valid_at"])
             if decision and decision["temperature"]["latest_valid_at"] else None
         ),
-        "watering_seconds": watering, "handover_seconds": handover,
+        "reservation": reservation,
     })
 
 
@@ -757,11 +799,11 @@ def _time_to_seconds(value: dt.time) -> int:
 
 
 def _floor_to_hour(seconds: int) -> int:
-    return (seconds // 3600) * 3600
+    return math.floor(seconds / 3600) * 3600
 
 
 def _ceil_to_hour(seconds: int) -> int:
-    return ((seconds + 3599) // 3600) * 3600
+    return math.ceil(seconds / 3600) * 3600
 
 
 def _seconds_to_time_str(seconds: int) -> str:
@@ -777,13 +819,27 @@ class RainwiseLoginView(LoginView):
 
 def _rule_card(rule):
     grouped = isinstance(rule, GroupedRule)
-    watering, handover = (group_services.reservation_seconds(rule) if grouped
-                         else (rule.max_duration_seconds, 0))
+    if grouped:
+        members = list(rule.members.select_related("valve").order_by("order"))
+        try:
+            details = group_services.reservation_details(rule, members=members)
+        except (ValidationError, ValueError) as exc:
+            details = {
+                "watering_seconds": 0, "break_seconds": 0,
+                "scheduling_allowance_seconds": 0, "total_seconds": 0,
+                "available": False, "error": str(exc), "unavailable_valves": [],
+            }
+        names = " → ".join(member.valve.name for member in members)
+    else:
+        details = {
+            "watering_seconds": rule.max_duration_seconds, "break_seconds": 0,
+            "scheduling_allowance_seconds": 0,
+            "total_seconds": rule.max_duration_seconds,
+            "available": True, "unavailable_valves": [],
+        }
+        names = rule.valve.name
     return {"rule": rule, "mode": normalize_rule_mode(rule.mode).title(),
-            "members": " → ".join(m.valve.name for m in rule.members.order_by("order"))
-            if grouped else rule.valve.name,
-            "watering_seconds": watering, "handover_seconds": handover,
-            **_rule_urls(rule)}
+            "members": names, **details, **_rule_urls(rule)}
 
 
 @login_required
@@ -807,11 +863,12 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
     rules = list(rules) + list(GroupedRule.objects.filter(
         schedule=active_schedule
     ).prefetch_related("members__valve"))
+    cards = [(rule, _rule_card(rule)) for rule in rules]
     events: list[dict] = []
     tz = ZoneInfo(site.timezone or settings.TIME_ZONE)
     current_date = start.date()
     while current_date < end.date():
-        for rule in rules:
+        for rule, card in cards:
             if not rule.uses_weekday(current_date.weekday()):
                 continue
             start_dt = dt.datetime.combine(current_date, rule.start_time, tzinfo=tz)
@@ -820,8 +877,7 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
                     start_dt.astimezone(dt.timezone.utc).astimezone(tz).replace(tzinfo=None)
                     != start_dt.replace(tzinfo=None)):
                 continue
-            card = _rule_card(rule)
-            seconds = card["watering_seconds"] + card["handover_seconds"]
+            seconds = card["total_seconds"]
             grouped = isinstance(rule, GroupedRule)
             if grouped:
                 end_dt = (
@@ -837,8 +893,16 @@ def calendar_events(request: HttpRequest) -> JsonResponse:
                 "edit_url": card["edit_url"], "mode": card["mode"],
                 "members": card["members"],
                 "watering_seconds": card["watering_seconds"],
-                "handover_seconds": card["handover_seconds"],
+                "break_seconds": card["break_seconds"],
+                "scheduling_allowance_seconds": card["scheduling_allowance_seconds"],
+                "total_seconds": card["total_seconds"],
+                "unavailable_valves": card["unavailable_valves"],
+                "available": card["available"],
+                "reservation_error": card.get("error", ""),
             }
+            if not seconds:
+                event.pop("end")
+                event["title"] += " — duration N/A" if not card["available"] else " — no peak watering"
             if not rule.enabled:
                 event.update({
                     "backgroundColor": "#e9ecef", "borderColor": "#ced4da",

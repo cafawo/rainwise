@@ -8,7 +8,6 @@ from __future__ import annotations
 import datetime as dt
 import math
 import os
-from decimal import Decimal, ROUND_FLOOR
 from zoneinfo import ZoneInfo
 
 from django.core.exceptions import ValidationError
@@ -18,6 +17,7 @@ from apps.irrigation.curves import daily_water_required, percentile
 from apps.irrigation.models import (
     IrrigationRun, RuleOccurrence, get_curve_settings,
 )
+from apps.irrigation.sequence import plan_sequence, target_seconds
 from apps.weather.models import WeatherObservation
 
 
@@ -257,7 +257,11 @@ def irrigation_credit(valve, at: dt.datetime, coverage_days: int) -> dict:
     }
 
 
-def plan_dose(daily_need, coverage_days, rain_mm, irrigation_mm, rate, run_cap) -> dict:
+def plan_dose(
+    daily_need, coverage_days, rain_mm, irrigation_mm, rate, run_cap,
+    *, available_seconds=86400, controller_interval_seconds=60,
+    command_allowance_seconds=0,
+) -> dict:
     validate_coverage_days(coverage_days)
     if not all(_finite(value) for value in (daily_need, rain_mm, irrigation_mm, rate)):
         raise ValueError("Water-balance inputs must be finite.")
@@ -271,32 +275,52 @@ def plan_dose(daily_need, coverage_days, rain_mm, irrigation_mm, rate, run_cap) 
     ):
         raise ValueError("Run cap must be a whole number from 1 to 3276 seconds.")
     target = max(0, coverage_days * daily_need - rain_mm - irrigation_mm)
-    capacity = 2 * run_cap * rate / 3600
-    planned = min(target, capacity)
-    if not all(math.isfinite(value) for value in (target, capacity, planned)):
+    if not math.isfinite(target):
         raise ValueError("Water-balance result must be finite.")
-    # Cap in seconds after flooring the requested dose. This avoids losing a
-    # second when a fractional rate rounds capacity just below its exact value.
-    seconds = int(
-        (Decimal(str(target)) * 3600 / Decimal(str(rate))).to_integral_value(
-            rounding=ROUND_FLOOR
-        )
+    seconds = target_seconds(target, rate, available_seconds)
+    sequence = plan_sequence(
+        [{"valve_id": 0, "order": 0, "total_seconds": seconds,
+          "run_cap_seconds": run_cap}],
+        available_seconds=available_seconds,
+        controller_interval_seconds=controller_interval_seconds,
+        command_allowance_seconds=command_allowance_seconds,
     )
-    seconds = min(seconds, 2 * run_cap)
-    pulses = [min(seconds, run_cap), max(0, seconds - run_cap)]
-    delivered = seconds * rate / 3600
+    delivered = seconds / 3600 * rate
+    if not math.isfinite(delivered):
+        raise ValueError("Water-balance result must be finite.")
     return {
         "target_mm": target,
-        "capacity_mm": capacity,
-        "planned_mm": planned,
+        "planned_mm": target,
         "planned_seconds": seconds,
         "estimated_delivery_mm": delivered,
-        "pulse_seconds": [value for value in pulses if value],
+        "pulse_seconds": [pulse["duration_seconds"] for pulse in sequence["pulses"]],
+        "pulse_count": sequence["pulse_count"],
         "unmet_mm": max(0, target - delivered),
     }
 
 
-def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
+def build_smart_decision(
+    site, members, decision_at: dt.datetime, *, available_seconds=None,
+    controller_interval_seconds=None, command_allowance_seconds=None,
+) -> dict:
+    if available_seconds is None:
+        local = decision_at.astimezone(ZoneInfo(site.timezone))
+        midnight = dt.datetime.combine(
+            local.date() + dt.timedelta(days=1), dt.time.min, local.tzinfo
+        )
+        available_seconds = (_utc(midnight) - _utc(decision_at)).total_seconds()
+    if controller_interval_seconds is None or command_allowance_seconds is None:
+        from apps.irrigation.group_services import command_allowance, controller_interval
+
+        if controller_interval_seconds is None:
+            controller_interval_seconds = controller_interval()
+        if command_allowance_seconds is None:
+            command_allowance_seconds = command_allowance()
+    sequence_options = {
+        "available_seconds": available_seconds,
+        "controller_interval_seconds": controller_interval_seconds,
+        "command_allowance_seconds": command_allowance_seconds,
+    }
     settings = get_curve_settings(site)
     settings.full_clean()
     temperature = temperature_selection(site, decision_at, settings=settings)
@@ -308,6 +332,8 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
     )
     rain = rain_credit(site, decision_at, settings.coverage_days)
     decisions = {}
+    peak_members = []
+    actual_members = []
     warnings = []
     if temperature["fallback"]:
         warnings.append(
@@ -339,25 +365,25 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
                 "run_cap_seconds": member.duration_seconds,
                 "planned_seconds": 0,
                 "pulse_seconds": [],
+                "pulse_count": 0,
+                "peak_seconds": None,
+                "peak_mm": None,
+                "peak_pulse_count": None,
                 "target_mm": None,
-                "capacity_mm": None,
                 "planned_mm": None,
                 "estimated_delivery_mm": None,
                 "unmet_mm": None,
                 "irrigation": None,
-                "cannot_sustain_peak": None,
-                "cannot_cover_peak_window": None,
             }
             warnings.append(reason)
             continue
-        if member.duration_seconds > valve.default_max_duration_seconds:
-            raise ValidationError(
-                f"{valve.name}: Smart maximum exceeds the valve safety limit."
-            )
+        peak_mm = settings.coverage_days * settings.max_mm
+        peak_seconds = target_seconds(peak_mm, rate, available_seconds)
         credit = irrigation_credit(valve, decision_at, settings.coverage_days)
         dose = plan_dose(
             daily_need, settings.coverage_days, rain["credit_mm"],
             credit["credit_mm"], rate, member.duration_seconds,
+            **sequence_options,
         )
         dose.update({
             "skipped": False,
@@ -368,12 +394,22 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
             "application_rate_mm_h": rate,
             "run_cap_seconds": member.duration_seconds,
             "irrigation": credit,
-            "cannot_sustain_peak": dose["capacity_mm"] < settings.max_mm,
-            "cannot_cover_peak_window": (
-                dose["capacity_mm"] < settings.coverage_days * settings.max_mm
+            "peak_mm": peak_mm,
+            "peak_seconds": peak_seconds,
+            "peak_pulse_count": (
+                (peak_seconds + member.duration_seconds - 1)
+                // member.duration_seconds
             ),
         })
         decisions[str(valve.pk)] = dose
+        sequence_member = {
+            "valve_id": valve.pk, "order": member.order,
+            "run_cap_seconds": member.duration_seconds,
+        }
+        actual_members.append({
+            **sequence_member, "total_seconds": dose["planned_seconds"],
+        })
+        peak_members.append({**sequence_member, "total_seconds": peak_seconds})
         if credit["incomplete_history"]:
             warnings.append(
                 f"{valve.name}: incomplete calibrated irrigation history; "
@@ -395,6 +431,8 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
                 "uncertain earlier command extends beyond the decision cutoff; "
                 "this is nominal credit, not confirmed physical delivery."
             )
+    peak_sequence = plan_sequence(peak_members, **sequence_options)
+    sequence = plan_sequence(actual_members, **sequence_options)
     return {
         "decision_at": _utc(decision_at).isoformat(),
         "coverage_days": settings.coverage_days,
@@ -402,5 +440,7 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
         "temperature": temperature,
         "rain": rain,
         "valves": decisions,
+        "sequence": sequence,
+        "peak_sequence": peak_sequence,
         "warnings": warnings,
     }
