@@ -250,22 +250,19 @@ class IrrigationRunAdmin(admin.ModelAdmin):
 
 
 class CurveSettingsAdminForm(forms.ModelForm):
+    fallback_temperature_c = forms.FloatField(
+        required=False, initial=models.DEFAULT_FALLBACK_TEMPERATURE_C,
+        label="Fallback temperature (°C)",
+        help_text="Leave blank for the default of 25 °C.",
+    )
+
     class Meta:
         model = models.CurveSettings
         fields = "__all__"
 
-    def clean(self):
-        cleaned = super().clean()
-        site = cleaned.get("site")
-        if (site and cleaned.get("fallback_temperature_c") is None
-                and models.GroupedRule.objects.filter(
-                    schedule__site=site, mode="SMART", enabled=True
-                ).exists()):
-            self.add_error(
-                "fallback_temperature_c",
-                "Enabled Smart rules require a finite fallback temperature.",
-            )
-        return cleaned
+    def clean_fallback_temperature_c(self):
+        value = self.cleaned_data.get("fallback_temperature_c")
+        return models.DEFAULT_FALLBACK_TEMPERATURE_C if value is None else value
 
 
 @admin.register(models.CurveSettings)

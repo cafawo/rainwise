@@ -37,6 +37,8 @@ from apps.irrigation.forms import (
 )
 from apps.irrigation.models import (
     CurveSettings,
+    DEFAULT_FALLBACK_TEMPERATURE_C,
+    get_curve_settings,
     GroupedRule,
     GroupedRuleValve,
     RuleOccurrence,
@@ -129,9 +131,15 @@ def _occurrence_cards(site, limit=30):
             row["execution_estimated_mm"] = sum(
                 estimate["estimated_mm"] or 0 for estimate in estimates
             )
-            row["execution_unmet_mm"] = max(
-                0, row["target_mm"] - row["execution_estimated_mm"]
+            row["execution_unmet_mm"] = (
+                max(0, row["target_mm"] - row["execution_estimated_mm"])
+                if row["target_mm"] is not None else None
             )
+            row["execution_messages"] = list(dict.fromkeys(
+                run.error_message for run in runs
+                if run.valve_id == row["valve_id"] and run.error_message
+                and run.attempt_started_at is None
+            ))
             row["execution_uncertain"] = any(estimate["uncertain"] for estimate in estimates)
             occurrence.decision_rows.append(row)
     return occurrences
@@ -178,9 +186,10 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         "g": DEFAULT_G, "m": DEFAULT_M,
     }
     site = _get_active_site(request)
-    settings_obj = CurveSettings.objects.filter(site=site).first() if site else None
+    settings_obj = get_curve_settings(site) if site else None
     stored_params = {
-        **default_params, "coverage_days": 2, "fallback_temperature_c": None,
+        **default_params, "coverage_days": 2,
+        "fallback_temperature_c": DEFAULT_FALLBACK_TEMPERATURE_C,
     }
     if settings_obj:
         stored_params.update({key: getattr(settings_obj, key) for key in stored_params})
@@ -189,8 +198,11 @@ def curve_view(request: HttpRequest) -> HttpResponse:
         data = request.POST.copy()
         if "reset_defaults" in data:
             data.update({**stored_params, **default_params})
-        elif "coverage_days" not in data:
-            data["coverage_days"] = stored_params["coverage_days"]
+        else:
+            if "coverage_days" not in data:
+                data["coverage_days"] = stored_params["coverage_days"]
+            if "fallback_temperature_c" not in data:
+                data["fallback_temperature_c"] = stored_params["fallback_temperature_c"]
         form = CurveForm(data)
         if form.is_valid():
             if not site:
@@ -244,7 +256,10 @@ def curve_view(request: HttpRequest) -> HttpResponse:
             rule__schedule=site.active_schedule, rule__mode="SMART"
         ).select_related("valve", "rule"):
             rate = member.valve.application_rate_mm_h
-            capacity = 2 * member.duration_seconds * rate / 3600 if rate else None
+            capacity = (
+                2 * member.duration_seconds * rate / 3600
+                if member.valve.has_valid_application_rate else None
+            )
             capacity_rows.append({
                 "valve": member.valve, "cap": member.duration_seconds, "capacity": capacity,
                 "cannot_sustain": capacity is not None and capacity < user_params["max_mm"],
@@ -417,9 +432,15 @@ def _edit_rule(request, rule=None, copying=False):
         }]
     data = _editor_data(request)
     form = RuleEditorForm(data, initial=initial)
+    editor_mode = data.get("mode") if data is not None else initial["mode"]
+    retained_ids = set()
+    if is_group and rule.mode == "SMART" and not copying:
+        retained_ids = set(rule.members.values_list("valve_id", flat=True))
     members_formset = ValveMemberFormSet(
         data, prefix="members", initial=members_initial if data is None else None,
-        form_kwargs={"site": site}
+        form_kwargs={
+            "site": site, "mode": editor_mode, "retained_ids": retained_ids,
+        }
     )
     if request.method == "POST":
         valid_form = form.is_valid()
@@ -444,6 +465,21 @@ def _edit_rule(request, rule=None, copying=False):
                         )
                         for key, value in attributes.items():
                             setattr(candidate, key, value)
+                        current_retained_ids = set()
+                        if existing and is_group and existing.mode == "SMART":
+                            current_retained_ids = set(
+                                existing.members.values_list("valve_id", flat=True)
+                            )
+                        for row in selected:
+                            valve = row["valve"]
+                            valve.refresh_from_db(fields=["application_rate_mm_h"])
+                            if (candidate.mode == "SMART"
+                                    and not valve.has_valid_application_rate
+                                    and valve.pk not in current_retained_ids):
+                                raise ValidationError(
+                                    f"{valve.name}: enter a measured watering rate "
+                                    "before selecting this valve for Smart."
+                                )
                         members = [GroupedRuleValve(
                             rule=candidate, valve=row["valve"], order=index,
                             duration_seconds=row["duration_seconds"],
@@ -495,7 +531,12 @@ def _edit_rule(request, rule=None, copying=False):
                 form.add_error(None, error)
     context = {"form": form, "members_formset": members_formset,
                "rule": None if copying else rule, "is_group": is_group,
-               "editing_existing": bool(rule and not copying)}
+               "editing_existing": bool(rule and not copying),
+               "missing_rate_valves": [
+                   valve for valve in Valve.objects.filter(pk__in=retained_ids)
+                   if not valve.has_valid_application_rate
+               ] if editor_mode == "SMART" else [],
+               }
     if rule and not copying:
         context.update(_rule_urls(rule))
         context["smart"] = normalize_rule_mode(rule.mode) == "SMART"

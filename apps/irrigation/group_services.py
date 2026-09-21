@@ -19,12 +19,14 @@ from django.utils import timezone
 
 from apps.irrigation import services
 from apps.irrigation.models import (
-    CurveSettings, GroupedRule, GroupedRuleValve, IrrigationRun,
-    RuleOccurrence, ScheduleRule, Site, Valve, normalize_rule_mode,
+    GroupedRule, GroupedRuleValve, IrrigationRun,
+    RuleOccurrence, ScheduleRule, Site, Valve, get_curve_settings,
+    normalize_rule_mode,
 )
 
 logger = logging.getLogger(__name__)
 RESERVED_STATUSES = ("PENDING", "ACTIVE", "STOPPING")
+MISSING_RATE_SKIP = "Skipped in Smart: enter a valid watering rate for this valve."
 UTC = dt.timezone.utc
 
 
@@ -87,7 +89,11 @@ def _overlaps(left, left_duration, right, right_duration):
 
 
 def validate_configuration(rule, members=None, exclude_rule=None):
-    """Validate ownership, bounds and automatic reservations without I/O."""
+    """Validate ownership, bounds and automatic reservations without I/O.
+
+    Existing Smart members may lose their rate and remain configured. Execution
+    skips those members; the editor separately checks newly selected members.
+    """
     grouped = isinstance(rule, GroupedRule)
     if grouped:
         rule.full_clean()
@@ -100,13 +106,8 @@ def validate_configuration(rule, members=None, exclude_rule=None):
             raise ValidationError("Valves and their order must be unique.")
         if rule.mode not in ("FIXED", "SMART"):
             raise ValidationError("Unsupported rule mode.")
-        curve = None
         if rule.mode == "SMART" and rule.enabled:
-            curve = CurveSettings.objects.filter(site=rule.schedule.site).first()
-            if curve is None or curve.fallback_temperature_c is None:
-                raise ValidationError(
-                    "Configure curve and fallback temperature before enabling Smart."
-                )
+            curve = get_curve_settings(rule.schedule.site)
             curve.full_clean()
         for member in members:
             valve = member.valve
@@ -118,13 +119,9 @@ def validate_configuration(rule, members=None, exclude_rule=None):
                     or not minimum <= duration <= 3276):
                 raise ValidationError(f"Duration must be {minimum}–3276 whole seconds.")
             if rule.mode == "SMART":
-                if duration > valve.default_max_duration_seconds:
+                if (valve.has_valid_application_rate
+                        and duration > valve.default_max_duration_seconds):
                     raise ValidationError("Smart duration exceeds the valve's maximum.")
-                rate = valve.application_rate_mm_h
-                if rule.enabled and (rate is None or not math.isfinite(rate) or rate <= 0):
-                    raise ValidationError(
-                        "Every Smart valve needs a finite positive application rate."
-                    )
         water, handover = reservation_seconds(rule, members)
         duration = water + handover
         if _seconds(rule.start_time) + duration > 86400:
@@ -262,6 +259,20 @@ def _send_claimed(run):
     """Transmit one already committed logical attempt; never replay it."""
     run.refresh_from_db()
     occurrence = run.occurrence
+    if (occurrence and occurrence.mode == "SMART"
+            and not run.valve.has_valid_application_rate):
+        # The claim exists, but this call has not transmitted anything. This
+        # particular transition must not consume an attempt or create credit.
+        with site_admission(occurrence.site):
+            IrrigationRun.objects.filter(
+                pk=run.pk, status="PLANNED", actual_start_at=None,
+            ).update(
+                attempt_started_at=None, attempt_finished_at=None,
+                delivery_uncertain=False,
+            )
+            _skip_uncalibrated_pulses(occurrence, valve_id=run.valve_id)
+        run.refresh_from_db()
+        return run
     if run.cancellation_requested or (occurrence and occurrence.cancellation_requested):
         IrrigationRun.objects.filter(pk=run.pk).update(
             status="FAILED", attempt_started_at=None, attempt_finished_at=timezone.now(),
@@ -395,18 +406,20 @@ def _snapshot(rule, members):
         "controller_interval_seconds": controller_interval(),
         "members": [{"valve_id": m.valve_id, "name": m.valve.name,
                      "order": m.order, "duration_seconds": m.duration_seconds,
-                     "application_rate_mm_h": m.valve.application_rate_mm_h}
+                     "application_rate_mm_h": (
+                         m.valve.application_rate_mm_h
+                         if m.valve.has_valid_application_rate else None
+                     )}
                     for m in members],
     }
     if rule.mode == "SMART":
-        curve = CurveSettings.objects.filter(site=rule.schedule.site).first()
-        if curve:
-            config["curve"] = {
-                name: getattr(curve, name) for name in (
-                    "min_mm", "max_mm", "g", "m", "coverage_days",
-                    "fallback_temperature_c",
-                )
-            }
+        curve = get_curve_settings(rule.schedule.site)
+        config["curve"] = {
+            name: getattr(curve, name) for name in (
+                "min_mm", "max_mm", "g", "m", "coverage_days",
+                "fallback_temperature_c",
+            )
+        }
     return config
 
 
@@ -538,10 +551,23 @@ def _plan_occurrence(rule, scheduled_at=None, pending=None, now=None):
             occurrence.decision = decision
             occurrence.decision_at = now
             occurrence.reservation_end = end
-            occurrence.status = "ACTIVE" if plans else "ZERO"
-            occurrence.outcome = (
-                "Planned" if plans else "No whole-second watering dose planned"
+            skipped = any(
+                row.get("skipped") for row in decision.get("valves", {}).values()
             )
+            if plans:
+                occurrence.status = "ACTIVE"
+                occurrence.outcome = (
+                    "Planned; some Smart valves skipped because they need a watering rate"
+                    if skipped else "Planned"
+                )
+            elif skipped:
+                occurrence.status = "SKIPPED"
+                occurrence.outcome = (
+                    "No pulses planned; unavailable Smart valves need a watering rate"
+                )
+            else:
+                occurrence.status = "ZERO"
+                occurrence.outcome = "No whole-second watering dose planned"
         except (ValidationError, ValueError) as exc:
             occurrence.status = "SKIPPED"
             occurrence.outcome = str(exc)
@@ -559,6 +585,35 @@ def _attempts_today(valve, site, now):
         valve=valve, occurrence__mode="SMART",
         attempt_started_at__gte=start, attempt_started_at__lt=end,
     ).count()
+
+
+def _skip_uncalibrated_pulses(occurrence, valve_id=None):
+    """Permanently skip unattempted work; never modify a commanded pulse."""
+    if occurrence.mode != "SMART":
+        return
+    pending = IrrigationRun.objects.filter(
+        occurrence=occurrence, status="PLANNED", attempt_started_at=None,
+    ).select_related("valve")
+    unavailable = [
+        run.pk for run in pending
+        if run.valve_id == valve_id or not run.valve.has_valid_application_rate
+    ]
+    if not unavailable:
+        return
+    with site_admission(occurrence.site):
+        changed = IrrigationRun.objects.filter(
+            pk__in=unavailable, status="PLANNED", attempt_started_at=None,
+        ).update(
+            status="FAILED", stop_reason="ERROR",
+            error_message=MISSING_RATE_SKIP,
+        )
+        if changed:
+            RuleOccurrence.objects.filter(pk=occurrence.pk, status="ACTIVE").update(
+                outcome=(
+                    "Some Smart valves skipped: enter their watering rates "
+                    "for future Smart watering"
+                )
+            )
 
 
 def _progress(occurrence, fresh_closed):
@@ -581,6 +636,7 @@ def _progress(occurrence, fresh_closed):
         cancel_occurrence(occurrence, "Rule disabled, deleted, or active schedule changed")
         reconcile_attempts()
         return
+    _skip_uncalibrated_pulses(occurrence)
     if any(not member.valve.relay_device.enabled for member in members_for(current_rule)):
         cancel_occurrence(occurrence, "Relay disabled; remaining target unmet")
         reconcile_attempts()
@@ -607,8 +663,17 @@ def _progress(occurrence, fresh_closed):
         return
     pending = next((r for r in runs if r.status == "PLANNED" and not r.attempt_started_at), None)
     if pending is None:
+        skipped = (
+            any(run.error_message == MISSING_RATE_SKIP for run in runs)
+            or any(row.get("skipped") for row in
+                   occurrence.decision.get("valves", {}).values())
+        )
         RuleOccurrence.objects.filter(pk=occurrence.pk, status="ACTIVE").update(
-            status="FINISHED", outcome="Completed planned watering"
+            status="SKIPPED" if skipped and not attempted else "FINISHED",
+            outcome=(
+                "Completed available watering; some Smart valves skipped for missing rates"
+                if skipped else "Completed planned watering"
+            ),
         )
         return
     with site_admission(occurrence.site):
@@ -627,6 +692,10 @@ def _progress(occurrence, fresh_closed):
                 raise ValidationError("Conflicting watering interrupted the group")
             pending.valve.refresh_from_db()
             pending.valve.relay_device.refresh_from_db()
+            if (occurrence.mode == "SMART"
+                    and not pending.valve.has_valid_application_rate):
+                _skip_uncalibrated_pulses(occurrence)
+                return
             if not pending.valve.relay_device.enabled:
                 raise ValidationError("Relay disabled")
             member = GroupedRuleValve.objects.filter(rule=rule, valve=pending.valve).first()

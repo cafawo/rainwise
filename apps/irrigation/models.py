@@ -23,6 +23,7 @@ RELAY_FLASH_MAX_DURATION_SECONDS = (
     RELAY_FLASH_MAX_TICKS // RELAY_FLASH_TICKS_PER_SECOND
 )
 RELAY_FLASH_MIN_DURATION_SECONDS = 1
+DEFAULT_FALLBACK_TEMPERATURE_C = 25.0
 
 
 def normalize_rule_mode(value: str) -> str:
@@ -78,7 +79,7 @@ class CurveSettings(models.Model):
         default=2, validators=[MinValueValidator(1), MaxValueValidator(7)]
     )
     fallback_temperature_c = models.FloatField(
-        null=True, blank=True, validators=[validate_finite]
+        default=DEFAULT_FALLBACK_TEMPERATURE_C, validators=[validate_finite]
     )
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -110,7 +111,7 @@ class CurveSettings(models.Model):
             or not 1 <= self.coverage_days <= 7
         ):
             errors["coverage_days"] = "Enter a whole number from 1 to 7."
-        if self.fallback_temperature_c is not None and not math.isfinite(
+        if self.fallback_temperature_c is None or not math.isfinite(
             self.fallback_temperature_c
         ):
             errors["fallback_temperature_c"] = "Enter a finite number."
@@ -119,6 +120,11 @@ class CurveSettings(models.Model):
 
     def __str__(self) -> str:
         return f"Curve settings ({self.site.name})"
+
+
+def get_curve_settings(site: Site) -> CurveSettings:
+    """Use application defaults for new sites without writing on read paths."""
+    return CurveSettings.objects.filter(site=site).first() or CurveSettings(site=site)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -181,6 +187,11 @@ class Valve(models.Model):
 
     def __str__(self) -> str:
         return f"{self.name} (Ch {self.channel})"
+
+    @property
+    def has_valid_application_rate(self) -> bool:
+        rate = self.application_rate_mm_h
+        return rate is not None and math.isfinite(rate) and rate > 0
 
 
 class Schedule(models.Model):
@@ -326,10 +337,14 @@ class GroupedRuleValve(models.Model):
                     errors["duration_seconds"] = (
                         "Smart maximum exceeds the valve limit."
                     )
-                rate = self.valve.application_rate_mm_h
-                if rate is None or not math.isfinite(rate) or rate <= 0:
+                retained_member = GroupedRuleValve.objects.filter(
+                    rule_id=self.rule_id, valve_id=self.valve_id,
+                    rule__mode=GroupedRule.MODE_SMART,
+                ).exists()
+                if not self.valve.has_valid_application_rate and not retained_member:
                     errors["valve"] = (
-                        "Smart requires a positive measured application rate."
+                        "New Smart selections require a positive measured "
+                        "watering rate."
                     )
                 if self.rule.enabled and GroupedRuleValve.objects.filter(
                     valve_id=self.valve_id,

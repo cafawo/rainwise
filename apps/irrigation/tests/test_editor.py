@@ -82,17 +82,13 @@ class SharedRuleEditorTests(TestCase):
         self.assertEqual(GroupedRule.objects.get().mode, "SMART")
         self.assertFalse(ScheduleRule.objects.exists())
 
-    def test_smart_requires_curve_fallback_rate_and_days(self):
+    def test_smart_requires_valid_limits_and_days(self):
         for change, text in [({"days_of_week": []}, "required"),
                              ({"members-0-duration_seconds": "901"}, "maximum")]:
             with self.subTest(change=change):
                 response = self.client.post(reverse("schedule_create"), self.payload("SMART", **change))
                 self.assertEqual(response.status_code, 200)
                 self.assertContains(response, text)
-        self.curve.fallback_temperature_c = None
-        self.curve.save()
-        response = self.client.post(reverse("schedule_create"), self.payload("SMART"))
-        self.assertContains(response, "fallback")
         self.assertFalse(GroupedRule.objects.exists())
 
     def test_duplicates_and_cross_site_valves_rejected(self):
@@ -295,10 +291,10 @@ class SharedRuleEditorTests(TestCase):
             with self.subTest(change=change):
                 self.assertFalse(CurveForm({**data, **change}).is_valid())
 
-    def test_curve_cannot_remove_fallback_from_enabled_smart(self):
+    def test_curve_blank_fallback_uses_default_with_enabled_smart(self):
         self.group()
         response = self.client.post(reverse("curve"), {"min_mm": 0, "max_mm": 7, "g": 0.2, "m": 25, "coverage_days": 2, "fallback_temperature_c": ""})
-        self.assertContains(response, "before enabling Smart")
+        self.assertContains(response, "Curve saved.")
         self.curve.refresh_from_db()
         self.assertEqual(self.curve.fallback_temperature_c, 25)
 
@@ -451,3 +447,154 @@ class SharedRuleEditorTests(TestCase):
             self.assertFalse(model_admin.has_add_permission(None))
             self.assertFalse(model_admin.has_change_permission(None))
             self.assertFalse(model_admin.has_delete_permission(None))
+
+    def test_smart_uses_default_fallback_without_a_settings_page_visit(self):
+        self.curve.delete()
+        response = self.client.post(reverse("schedule_create"), self.payload("SMART"))
+        self.assertEqual(response.status_code, 302)
+        response = self.client.get(reverse("group_preview", args=[GroupedRule.objects.get().pk]))
+        self.assertContains(response, "fallback temperature 25")
+        self.assertEqual(response.context["decision"]["temperature"]["temperature_c"], 25)
+
+    def test_curve_default_override_zero_and_reset_preserve_setting(self):
+        self.curve.delete()
+        response = self.client.get(reverse("curve"))
+        self.assertEqual(response.context["form"].initial["fallback_temperature_c"], 25)
+        self.assertContains(response, "Operating with fallback temperature 25.0")
+        self.client.post(reverse("curve"), {
+            "min_mm": 0, "max_mm": 7, "g": 0.2, "m": 25,
+            "coverage_days": 2, "fallback_temperature_c": 0,
+        })
+        self.assertEqual(CurveSettings.objects.get(site=self.site).fallback_temperature_c, 0)
+        response = self.client.post(reverse("curve"), {"reset_defaults": "1"})
+        self.assertContains(response, "Operating with fallback temperature 0.0")
+        self.assertEqual(CurveSettings.objects.get(site=self.site).fallback_temperature_c, 0)
+        self.client.post(reverse("curve"), {
+            "min_mm": 0, "max_mm": 6, "g": 0.2, "m": 25,
+        })
+        self.assertEqual(CurveSettings.objects.get(site=self.site).fallback_temperature_c, 0)
+
+    def test_new_smart_member_needs_rate_even_when_disabled(self):
+        for rate in (None, 0, -1, float("inf")):
+            for enabled in ("on", ""):
+                with self.subTest(rate=rate, enabled=enabled):
+                    Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=rate)
+                    response = self.client.post(
+                        reverse("schedule_create"), self.payload("SMART", enabled=enabled)
+                    )
+                    self.assertContains(response, "enter a measured watering rate")
+                    self.assertFalse(GroupedRule.objects.exists())
+
+    def test_smart_selector_retains_missing_member_and_hides_new_missing_valve(self):
+        rule = self.group()
+        other = Valve.objects.create(
+            relay_device=self.a.relay_device, name="Unmeasured", channel=3,
+        )
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
+        response = self.client.get(reverse("group_edit", args=[rule.pk]))
+        self.assertContains(response, "Lawn A: skipped in Smart")
+        self.assertContains(response, "N/A — skipped in Smart")
+        options = response.context["members_formset"].forms[0]["valve"].subwidgets
+        by_id = {str(option.data["value"]): option.data for option in options}
+        self.assertNotIn("disabled", by_id[str(self.a.pk)]["attrs"])
+        self.assertTrue(by_id[str(other.pk)]["attrs"]["disabled"])
+        self.assertTrue(by_id[str(other.pk)]["attrs"]["hidden"])
+        self.assertIn(str(self.b.pk), by_id)
+        self.assertContains(response, 'option.disabled = unavailable')
+
+    def test_retaining_missing_member_and_loading_copying_schedule_remain_possible(self):
+        rule = self.group()
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
+        response = self.client.post(
+            reverse("group_edit", args=[rule.pk]),
+            self.payload("SMART", [self.a, self.b], note="Keep membership"),
+        )
+        self.assertEqual(response.status_code, 302)
+        rule.refresh_from_db()
+        self.assertEqual(rule.note, "Keep membership")
+        self.assertEqual(rule.members.count(), 2)
+        self.assertEqual(self.client.post(
+            reverse("schedule_load"), {"schedule": self.schedule.pk}
+        ).status_code, 302)
+        response = self.client.post(reverse("schedule_new"), {
+            "name": "Summer without rate", "copy_current": "on",
+        })
+        self.assertEqual(response.status_code, 302)
+        copy = GroupedRule.objects.get(schedule__name="Summer without rate")
+        self.assertEqual(list(copy.members.order_by("order").values_list("valve_id", flat=True)), [self.a.pk, self.b.pk])
+
+    def test_new_missing_member_cannot_be_added_to_existing_smart_or_converted_fixed(self):
+        rule = self.group()
+        other = Valve.objects.create(
+            relay_device=self.a.relay_device, name="Unmeasured", channel=3,
+        )
+        response = self.client.post(
+            reverse("group_edit", args=[rule.pk]),
+            self.payload("SMART", [self.a, self.b, other]),
+        )
+        self.assertContains(response, "Unmeasured: enter a measured watering rate")
+        rule.mode = "FIXED"
+        rule.save()
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
+        response = self.client.post(
+            reverse("group_edit", args=[rule.pk]), self.payload("SMART", [self.a, self.b])
+        )
+        self.assertContains(response, "Lawn A: enter a measured watering rate")
+
+    def test_missing_rate_preview_dashboard_curve_warn_and_keep_reservation(self):
+        rule = self.group()
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
+        response = self.client.get(reverse("group_preview", args=[rule.pk]))
+        self.assertContains(response, "Lawn A: skipped in Smart")
+        decision = response.context["decision"]
+        self.assertTrue(decision["valves"][str(self.a.pk)]["skipped"])
+        self.assertFalse(decision["valves"][str(self.b.pk)]["skipped"])
+        self.assertIsNone(decision["valves"][str(self.a.pk)]["target_mm"])
+        self.assertContains(response, "N/A")
+        self.assertEqual(response.context["watering_seconds"], 3600)
+        for route in ("dashboard", "curve"):
+            response = self.client.get(reverse(route))
+            self.assertContains(response, "Lawn A: skipped in Smart")
+            self.assertContains(response, "Enter a measured watering rate")
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=12)
+        for route in ("dashboard", "curve"):
+            response = self.client.get(reverse(route))
+            self.assertNotContains(response, "Lawn A: skipped in Smart")
+
+    def test_all_missing_rates_render_skipped_decisions_and_preserve_historical_warning(self):
+        rule = self.group()
+        Valve.objects.update(application_rate_mm_h=None)
+        response = self.client.get(reverse("group_preview", args=[rule.pk]))
+        self.assertContains(response, "Lawn A: skipped in Smart")
+        self.assertContains(response, "Lawn B: skipped in Smart")
+        self.assertNotContains(response, "Skip: no dose")
+        occurrence = self.occurrence(rule)
+        occurrence.status = "SKIPPED"
+        occurrence.outcome = "All members are skipped because watering rates are unavailable."
+        occurrence.decision = response.context["decision"]
+        occurrence.save()
+        response = self.client.get(reverse("logs"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Lawn A: skipped in Smart")
+        self.assertContains(response, "N/A")
+        Valve.objects.update(application_rate_mm_h=12)
+        response = self.client.get(reverse("dashboard"))
+        self.assertFalse(any("skipped in Smart" in warning for warning in response.context["quality_warnings"]))
+        self.assertContains(self.client.get(reverse("logs")), "Lawn A: skipped in Smart")
+
+    def test_runtime_unattempted_skip_reason_shows_in_occurrence_history(self):
+        from apps.irrigation import balance
+
+        rule = self.group()
+        occurrence = self.occurrence(rule)
+        occurrence.decision = balance.build_smart_decision(
+            self.site, list(rule.members.select_related("valve")), timezone.now()
+        )
+        occurrence.save()
+        reason = "Lawn A: skipped in Smart. Enter a measured watering rate."
+        IrrigationRun.objects.create(
+            occurrence=occurrence, valve=self.a, pass_number=1, trigger="SCHEDULED",
+            status="FAILED", max_duration_seconds=900, error_message=reason,
+        )
+        self.assertContains(self.client.get(reverse("dashboard")), reason)
+        self.assertContains(self.client.get(reverse("logs")), reason)

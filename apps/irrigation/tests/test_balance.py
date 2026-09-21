@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,7 @@ from apps.irrigation.balance import (
 from apps.irrigation.curves import daily_water_required
 from apps.irrigation.models import (
     CurveSettings,
+    DEFAULT_FALLBACK_TEMPERATURE_C,
     GroupedRule,
     GroupedRuleValve,
     IrrigationRun,
@@ -28,6 +30,7 @@ from apps.irrigation.models import (
     Schedule,
     ScheduleRule,
     Site,
+    get_curve_settings,
 )
 from apps.weather.models import WeatherObservation
 
@@ -249,10 +252,106 @@ class BalanceTests(TestCase):
         self.assertTrue(decision["rain"]["warning"])
         self.assertTrue(decision["valves"][str(self.valve.pk)]["irrigation"]["incomplete_history"])
         self.assertGreater(decision["valves"][str(self.valve.pk)]["planned_seconds"], 0)
-        self.curve.fallback_temperature_c = None
+        self.curve.fallback_temperature_c = float("inf")
         self.curve.save()
         with self.assertRaises(ValidationError):
             build_smart_decision(self.site, members, self.at)
+
+    def test_missing_curve_row_uses_defaults_without_writes(self):
+        self.curve.delete()
+        settings = get_curve_settings(self.site)
+        self.assertIsNone(settings.pk)
+        self.assertEqual(settings.fallback_temperature_c, 25)
+        self.assertEqual(settings.coverage_days, 2)
+        selection = temperature_selection(self.site, self.at)
+        self.assertEqual(selection["temperature_c"], 25)
+        decision = build_smart_decision(
+            self.site,
+            [SimpleNamespace(valve=self.valve, order=0, duration_seconds=900)],
+            self.at,
+        )
+        self.assertEqual(decision["temperature"]["temperature_c"], 25)
+        self.assertGreater(
+            decision["valves"][str(self.valve.pk)]["planned_seconds"], 0
+        )
+        self.assertFalse(CurveSettings.objects.filter(site=self.site).exists())
+
+    def test_new_site_and_saved_fallback_overrides_include_zero(self):
+        site = Site.objects.create(name="New garden", timezone="UTC")
+        self.assertEqual(
+            get_curve_settings(site).fallback_temperature_c,
+            DEFAULT_FALLBACK_TEMPERATURE_C,
+        )
+        self.assertEqual(
+            temperature_selection(site, self.at)["temperature_c"], 25
+        )
+        self.assertFalse(CurveSettings.objects.filter(site=site).exists())
+        settings = CurveSettings.objects.create(site=site)
+        self.assertEqual(settings.fallback_temperature_c, 25)
+        for value in (0, 18.5, -5):
+            settings.fallback_temperature_c = value
+            settings.full_clean()
+            settings.save()
+            self.assertEqual(
+                temperature_selection(site, self.at)["temperature_c"], value
+            )
+            self.assertEqual(get_curve_settings(site).pk, settings.pk)
+
+    def test_missing_rate_skips_only_affected_member_and_restoration_clears_warning(self):
+        other = self.valve.relay_device.valve_set.create(
+            name="Uncalibrated", channel=2
+        )
+        members = [
+            SimpleNamespace(valve=other, order=0, duration_seconds=900),
+            SimpleNamespace(valve=self.valve, order=1, duration_seconds=900),
+        ]
+        decision = build_smart_decision(self.site, members, self.at)
+        skipped = decision["valves"][str(other.pk)]
+        self.assertTrue(skipped["skipped"])
+        self.assertEqual(skipped["planned_seconds"], 0)
+        self.assertEqual(skipped["pulse_seconds"], [])
+        self.assertIsNone(skipped["target_mm"])
+        self.assertIsNone(skipped["application_rate_mm_h"])
+        self.assertIn("watering rate", skipped["skip_reason"])
+        calibrated = decision["valves"][str(self.valve.pk)]
+        self.assertFalse(calibrated["skipped"])
+        self.assertGreater(calibrated["planned_seconds"], 0)
+        self.assertEqual(calibrated["order"], 1)
+        other.application_rate_mm_h = 12
+        other.save()
+        restored = build_smart_decision(self.site, members, self.at)
+        self.assertFalse(restored["valves"][str(other.pk)]["skipped"])
+        self.assertFalse(any(
+            "watering rate is required" in value
+            for value in restored["warnings"]
+        ))
+        self.assertTrue(decision["valves"][str(other.pk)]["skipped"])
+
+    def test_all_missing_or_invalid_rates_produce_json_safe_skip_decisions(self):
+        members = [
+            SimpleNamespace(valve=self.valve, order=0, duration_seconds=900)
+        ]
+        for rate in (None, 0, -1, float("inf"), float("nan")):
+            with self.subTest(rate=rate):
+                self.valve.application_rate_mm_h = rate
+                self.assertFalse(self.valve.has_valid_application_rate)
+                decision = build_smart_decision(self.site, members, self.at)
+                self.assertTrue(all(
+                    item["skipped"] for item in decision["valves"].values()
+                ))
+                json.dumps(decision, allow_nan=False)
+
+    def test_clearing_current_rate_preserves_calibrated_delivery_history(self):
+        run = self.run_record(self.at - dt.timedelta(minutes=20), 600)
+        self.valve.application_rate_mm_h = None
+        self.valve.full_clean()
+        self.valve.save()
+        run.refresh_from_db()
+        self.assertEqual(run.application_rate_mm_h, 12)
+        self.assertEqual(delivery_estimate(run)["estimated_mm"], 2)
+        self.assertEqual(
+            irrigation_credit(self.valve, self.at, 1)["credit_mm"], 2
+        )
 
 
 class GroupModelTests(TestCase):
@@ -304,4 +403,39 @@ class GroupModelTests(TestCase):
         self.rule.mode = "SMART"
         self.rule.save()
         with self.assertRaises(ValidationError):
+            member.full_clean()
+
+    def test_existing_smart_membership_survives_missing_rate_but_new_selection_fails(self):
+        self.rule.mode = "SMART"
+        self.rule.save()
+        member = GroupedRuleValve(
+            rule=self.rule, valve=self.valve, order=0, duration_seconds=900
+        )
+        with self.assertRaisesMessage(ValidationError, "watering rate"):
+            member.full_clean()
+        self.valve.application_rate_mm_h = 12
+        self.valve.save()
+        member.full_clean()
+        member.save()
+        self.valve.application_rate_mm_h = None
+        self.valve.full_clean()
+        self.valve.save()
+        member.duration_seconds = 600
+        member.full_clean()
+        member.save()
+        self.assertEqual(
+            GroupedRuleValve.objects.get(pk=member.pk).valve_id, self.valve.pk
+        )
+        other = self.device.valve_set.create(name="No rate", channel=2)
+        member.valve = other
+        with self.assertRaisesMessage(ValidationError, "watering rate"):
+            member.full_clean()
+
+    def test_fixed_membership_conversion_requires_calibration(self):
+        member = GroupedRuleValve.objects.create(
+            rule=self.rule, valve=self.valve, order=0, duration_seconds=600
+        )
+        self.rule.mode = "SMART"
+        member.rule = self.rule
+        with self.assertRaisesMessage(ValidationError, "watering rate"):
             member.full_clean()

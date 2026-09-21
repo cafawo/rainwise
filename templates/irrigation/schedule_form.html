@@ -2,6 +2,9 @@
 {% block title %}Rule | Rainwise{% endblock %}
 {% block content %}
 <h1 class="h3 mb-3">{% if rule %}Edit{% else %}New{% endif %} rule</h1>
+{% for valve in missing_rate_valves %}
+<div class="alert alert-warning">{{ valve.name }}: skipped in Smart because a finite positive watering rate is required. Enter a measured watering rate in <a href="{% url 'admin:irrigation_valve_change' valve.pk %}">valve settings</a>.</div>
+{% endfor %}
 <div class="card"><div class="card-body">
 <form method="post" id="editorForm">
   {% csrf_token %}
@@ -14,6 +17,7 @@
   <fieldset class="mb-4">
     <legend class="h5">2. Valves and order</legend>
     <p>Select valves and set their sequence order. Each valve represents a separate irrigation zone.</p>
+    <p id="smartRateHelp">Smart only offers new valves with a measured watering rate. Existing members with N/A rates are retained and skipped until a rate is entered.</p>
     {{ members_formset.management_form }}{{ members_formset.non_form_errors }}
     <div id="memberRows">
     {% for member in members_formset %}
@@ -42,7 +46,7 @@
   {% endfor %}
   </div>
   <p id="durationHelp">Enter each valve's duration. Fixed: 60–3276 seconds. Smart: 1–3276 seconds per run, also within the valve's manual maximum. Smart allows at most <strong>2 attempts per valve per local day</strong>.</p>
-  <p>Smart requires measured application rates and configured <a href="{% url 'curve' %}">curve and fallback settings</a>. The calendar reserves all configured maximum runtimes plus one controller interval per pulse for handovers.</p>
+  <p>Smart requires measured watering rates. <a href="{% url 'curve' %}">Curve settings</a> include an editable fallback temperature of 25 °C by default. The calendar reserves all configured maximum runtimes plus one controller interval per pulse for handovers.</p>
   <div class="d-flex gap-2 flex-wrap">
     <button class="btn btn-primary" type="submit">Save</button>
     <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
@@ -73,6 +77,16 @@
 <script>
 const modeInput = document.getElementById("id_mode");
 function showMode() {
+  const smart = modeInput.value === "SMART";
+  document.getElementById("smartRateHelp").hidden = !smart;
+  document.querySelectorAll('select[name$="-valve"]').forEach(select => {
+    for (const option of select.options) {
+      const unavailable = smart && option.dataset.smartAllowed === "false";
+      option.disabled = unavailable;
+      option.hidden = unavailable;
+      if (unavailable && option.selected) select.value = "";
+    }
+  });
   document.querySelectorAll(".duration-row").forEach(row => {
     const index = row.dataset.memberIndex;
     const valve = document.getElementById(`id_members-${index}-valve`);

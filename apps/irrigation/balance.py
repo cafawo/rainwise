@@ -15,7 +15,9 @@ from django.core.exceptions import ValidationError
 from django.db.models import Q
 
 from apps.irrigation.curves import daily_water_required, percentile
-from apps.irrigation.models import CurveSettings, IrrigationRun, RuleOccurrence
+from apps.irrigation.models import (
+    IrrigationRun, RuleOccurrence, get_curve_settings,
+)
 from apps.weather.models import WeatherObservation
 
 
@@ -62,7 +64,7 @@ def accounting_windows(site, at: dt.datetime, coverage_days: int) -> dict:
 def temperature_selection(site, at: dt.datetime, settings=None) -> dict:
     at = _utc(at)
     if settings is None:
-        settings = CurveSettings.objects.filter(site=site).first()
+        settings = get_curve_settings(site)
     rows = WeatherObservation.objects.filter(
         site=site, timestamp__gt=at - dt.timedelta(hours=24), timestamp__lte=at,
         retrieved_at__lte=at,
@@ -94,7 +96,7 @@ def temperature_selection(site, at: dt.datetime, settings=None) -> dict:
         )
     elif at - latest > dt.timedelta(hours=refresh_hours):
         reason = "Latest valid temperature is older than the weather refresh interval."
-    fallback = settings.fallback_temperature_c if settings else None
+    fallback = settings.fallback_temperature_c
     selected = fallback if reason else percentile(
         [row.temperature_c for row in valid], 0.9
     )
@@ -295,16 +297,8 @@ def plan_dose(daily_need, coverage_days, rain_mm, irrigation_mm, rate, run_cap) 
 
 
 def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
-    settings = CurveSettings.objects.filter(site=site).first()
-    if settings is None:
-        raise ValidationError(
-            "Configure curve settings and fallback temperature before enabling Smart."
-        )
+    settings = get_curve_settings(site)
     settings.full_clean()
-    if settings.fallback_temperature_c is None:
-        raise ValidationError(
-            "Configure a finite fallback temperature before enabling Smart."
-        )
     temperature = temperature_selection(site, decision_at, settings=settings)
     if temperature["temperature_c"] is None:
         raise ValidationError(temperature["reason"])
@@ -330,10 +324,32 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
         rate = valve.application_rate_mm_h
         if valve.relay_device.site_id != site.pk:
             raise ValidationError("Every valve must belong to the same site.")
-        if not _finite(rate) or rate <= 0:
-            raise ValidationError(
-                f"{valve.name}: configure a positive measured application rate."
+        if not valve.has_valid_application_rate:
+            reason = (
+                f"{valve.name}: skipped in Smart because a finite positive "
+                "watering rate is required. Enter a measured watering rate."
             )
+            decisions[str(valve.pk)] = {
+                "skipped": True,
+                "skip_reason": reason,
+                "valve_id": valve.pk,
+                "valve_name": valve.name,
+                "order": member.order,
+                "application_rate_mm_h": None,
+                "run_cap_seconds": member.duration_seconds,
+                "planned_seconds": 0,
+                "pulse_seconds": [],
+                "target_mm": None,
+                "capacity_mm": None,
+                "planned_mm": None,
+                "estimated_delivery_mm": None,
+                "unmet_mm": None,
+                "irrigation": None,
+                "cannot_sustain_peak": None,
+                "cannot_cover_peak_window": None,
+            }
+            warnings.append(reason)
+            continue
         if member.duration_seconds > valve.default_max_duration_seconds:
             raise ValidationError(
                 f"{valve.name}: Smart maximum exceeds the valve safety limit."
@@ -344,6 +360,8 @@ def build_smart_decision(site, members, decision_at: dt.datetime) -> dict:
             credit["credit_mm"], rate, member.duration_seconds,
         )
         dose.update({
+            "skipped": False,
+            "skip_reason": "",
             "valve_id": valve.pk,
             "valve_name": valve.name,
             "order": member.order,

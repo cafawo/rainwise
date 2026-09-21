@@ -4,7 +4,7 @@ Current design for the next Rainwise release, consolidated on 2026-09-21.
 This document replaces the previous MVP checklist and intermediate proposals.
 Application implementation is complete as of 2026-09-21. Follow this plan as
 the current source of truth; update it explicitly if behavior changes. The
-implementation and verification record is in section 10 below.
+implementation and verification records are in sections 10 and 11 below.
 
 ## 1. Goal and compatibility contract
 
@@ -82,7 +82,7 @@ Editor order:
 | Mode | Duration and sequence | Weather requirements |
 | --- | --- | --- |
 | Fixed | One ordered pass; each valve runs its configured duration once. | None. Calibration/fallback settings are not required. |
-| Smart | First pass in valve order, then a second pass if needed; skip fulfilled valves and shorten the final pulse. | Calibrated rates, curve settings, and configured fallback temperature. |
+| Smart | First pass in valve order, then a second pass if needed; skip fulfilled valves and shorten the final pulse. | Measured valve rates; curve settings and an overridable 25 °C fallback default. |
 
 - Existing Fixed rules display with their one valve selected. Do not merge
   independent existing rules into groups automatically or change their days.
@@ -152,8 +152,8 @@ No second pulse-log model or general-purpose job queue is needed.
 | --- | --- |
 | Existing `min_mm`, `max_mm`, `g`, `m` | `CurveSettings`; retain the curve. Validate finite values, `0 <= min_mm <= max_mm`, and positive `g`. |
 | `coverage_days` | `CurveSettings`; default 2, supported integers 1–7. This is a product scope limit, not a scientific soil-storage limit. |
-| Fallback temperature (°C) | `CurveSettings`; explicitly configured and finite before enabling Smart. No invented universal fallback default. |
-| Application rate (mm/hour) | `Valve`; optional for Fixed/manual use, measured, finite, and positive for Smart. No arbitrary default. |
+| Fallback temperature (°C) | `CurveSettings`; finite, defaults to 25 °C, editable in the app. Existing null values become 25 °C; preserve overrides. No Docker/environment setting is required. |
+| Application rate (mm/hour) | `Valve`; nullable and displayed as N/A until measured. New Smart selections require a finite positive rate. Existing Smart members that lose their rate are skipped individually with a warning; other members continue. |
 | Fixed runtime | Existing rule or group membership; preserve existing Fixed validation, 60–3276 seconds. |
 | Smart per-run maximum | Group membership; integer 1–3276 seconds, also no greater than `Valve.default_max_duration_seconds`. |
 | Smart attempts per valve/local day | Fixed at 2, displayed read-only. Include uncertain attempts across copied/switched schedules. Driver retries belong to the same logical attempt. |
@@ -246,8 +246,8 @@ Display distinct diagnostics without rejecting a valid low-capacity setup:
 
 ## 6. Weather resilience and irrigation estimates
 
-An API failure must not disable Smart temperature decisions when fallback is
-configured. Missing weather must be visible.
+An API failure must not disable Smart temperature decisions. Use the configured
+fallback (25 °C by default). Missing weather must be visible.
 
 - Use only elapsed hourly values. Fix the current curve query's missing upper
   time bound and the importer's ability to store today's future forecast hours.
@@ -454,7 +454,8 @@ Research informs the scope, not universal watering promises:
    helpers. No group actuation at this stage.
 3. **Editor and preview:** mode-first editor, ordered membership, copy/load,
    conversion, calendar reservation/conflict validation, curve explanations,
-   warnings, and previews. Smart cannot be enabled without valid configuration.
+   warnings, and previews. New Smart members require valid watering rates;
+   missing rates on existing members cause individual skips, not group failure.
 4. **Controller integration:** shared Fixed/Smart sequencing, durable claims,
    fresh closure confirmation, cancellation, conflict guards, daily Smart attempt
    accounting, Fixed group manual requests, and restart interruption.
@@ -560,6 +561,87 @@ requests/rendering, and hardware/weather are mocked throughout. No live
 controller was launched, production data changed, or deployment performed.
 Deployment still requires a database backup, stopping the old controller,
 applying migrations before starting exactly one upgraded controller, and
-measured application rates plus a configured fallback before enabling Smart.
+measured application rates for valves selected into Smart. The fallback now
+defaults to 25 °C as specified in the user-approved follow-up below.
 Pin both cadence settings to 30 before upgrading if the old cadence is desired;
 otherwise the defaults are 60 seconds. See README for the operational steps.
+
+
+## 11. User-approved follow-up: defaults and missing valve rates (2026-09-21)
+
+The user explicitly revised the earlier no-fallback-default requirement:
+Docker clients should update the image without adding configuration. This
+follow-up is complete with the following behavior:
+
+- Fallback temperature defaults to 25 °C and remains editable on the curve page.
+  Forward migrations fill only missing fallback values and supply default
+  curve settings for existing sites without a row; existing overrides survive.
+  New sites also use standard curve defaults and 25 °C without requiring a
+  settings-page visit. This is an application/model default, not a new Docker
+  variable. Numeric overrides, including 0 °C, remain valid.
+- The existing nullable `Valve.application_rate_mm_h` migration already supplies
+  the requested N/A default. Do not invent a rate or backfill historical pulse
+  snapshots. Fixed/manual watering continues to accept uncalibrated valves.
+- Only valves with a finite positive rate can be newly selected for Smart.
+  Existing membership remains when its rate is cleared, allowing correction
+  without recreating the schedule. Preserve that membership when editing or
+  loading an existing schedule, and show which valves need a rate entered.
+- At a scheduled decision, skip missing/invalid-rate members individually,
+  preserve a visible per-valve decision reason, and plan the calibrated members
+  in their normal order. If every member is unavailable, record a skipped
+  occurrence, not a zero-demand result. Calendar reservations still include all
+  configured maxima and handovers; missing calibration does not shrink them.
+- Recheck rates before claiming and sending every Smart pulse. If a rate is
+  cleared after planning, skip all unattempted pulses for that valve in that
+  occurrence, keep its history/snapshots, and continue the other valves after
+  confirming any prior pulse is closed. Skips consume no logical attempts.
+  Already-commanded bounded pulses retain their duration, stop, and rate snapshot.
+  Restoring a rate allows the next scheduled decision to include the valve;
+  skipped work is not replayed during the old occurrence.
+- Dashboard, editor, curve, preview, and execution history warn that affected
+  valves require a watering rate and are skipped in Smart. Current warnings
+  clear after a valid rate is restored; historical skip reasons remain.
+
+Initial findings: the valve field/default migration was already present, but
+fallback was nullable with no default and missing calibration invalidated the
+entire Smart rule. Both behaviors have been changed by this follow-up.
+
+Review decisions and findings:
+
+- Migration `0008` backfills null fallbacks and missing settings rows; `0009`
+  applies the non-null field and 25 °C model default. PostgreSQL testing with
+  existing data caught deferred foreign-key trigger events blocking a schema
+  alteration after the inserts in the same transaction. Separate ordinary
+  migrations resolve that upgrade failure; both execute automatically through
+  the existing Docker entrypoint.
+- New-site reads use an unsaved default settings instance rather than creating
+  database rows in dashboards or previews. Explicitly blank fallback input uses
+  25 °C; an omitted field or resetting curve parameters preserves an existing
+  fallback override, including 0 °C.
+- Model/form validation rejects newly selected uncalibrated Smart valves, while
+  runtime validation accepts retained members so each can be skipped separately.
+  The editor checks new selections again inside the admission transaction.
+- Missing and invalid rates (including non-finite values from existing/bypassed
+  validation data) are unavailable. Decision/configuration JSON uses null for
+  those rates so an invalid numeric value cannot prevent the other valves from
+  being planned. Missing target/capacity values display N/A, not zero demand.
+- A previously planned pulse skipped before transmission remains in history as
+  `FAILED` with an explicit "Skipped in Smart" reason and no attempt timestamp.
+  This reuses the existing pulse states, consumes no attempt, and gives no
+  irrigation credit. All of that valve's pending passes are skipped together;
+  restoring its rate does not resurrect them. Active pulses and saved decision,
+  duration, and application-rate snapshots are untouched.
+- Current warnings identify unavailable valves and clear on correction. Saved
+  decision warnings and pulse skip reasons remain visible in execution history.
+  Reservations continue to include every configured member's maximum duration
+  and handover allowance, including members currently missing a rate.
+
+Verification: the pre-change baseline was 145 passing tests. The final complete
+Django suite passes all **172 tests** on isolated SQLite at 60-second cadence
+and PostgreSQL 17.11 at explicit 30-second cadence. Populated upgrade/reverse
+migration tests and standalone migration checks pass on both databases;
+`makemigrations --check --dry-run` reports no changes. Hardware and weather remain
+mocked, and the temporary PostgreSQL server was stopped after testing. No Docker
+configuration, dependencies, hardware driver, production data, or deployment was
+changed. Live hardware commissioning and browser interaction remain outside this
+automated verification.

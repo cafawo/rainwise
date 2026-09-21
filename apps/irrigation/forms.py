@@ -7,6 +7,7 @@ from django.contrib.auth.forms import AuthenticationForm
 
 from apps.irrigation.models import (
     RELAY_FLASH_MAX_DURATION_SECONDS,
+    DEFAULT_FALLBACK_TEMPERATURE_C,
     Schedule,
     ScheduleRule,
     GroupedRule,
@@ -128,6 +129,49 @@ class RuleEditorForm(forms.Form):
                 field.widget.attrs["class"] = "form-select" if name == "mode" else "form-control"
 
 
+class ValveSelect(forms.Select):
+    def __init__(self, *args, mode="FIXED", retained_ids=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mode = mode
+        self.retained_ids = set(retained_ids)
+
+    def create_option(self, name, value, label, selected, index, **kwargs):
+        option = super().create_option(name, value, label, selected, index, **kwargs)
+        if value:
+            valve = value.instance
+            allowed = (
+                valve.has_valid_application_rate or valve.pk in self.retained_ids
+            )
+            option["attrs"]["data-smart-allowed"] = "true" if allowed else "false"
+            if self.mode == "SMART" and not allowed:
+                option["attrs"].update(disabled=True, hidden=True)
+        return option
+
+
+class SmartValveChoiceField(forms.ModelChoiceField):
+    def __init__(self, *args, mode="FIXED", retained_ids=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mode = mode
+        self.retained_ids = set(retained_ids)
+
+    def label_from_instance(self, valve):
+        if valve.has_valid_application_rate:
+            return f"{valve.name} ({valve.application_rate_mm_h:g} mm/hour)"
+        suffix = "N/A — skipped in Smart" if valve.pk in self.retained_ids else "N/A"
+        return f"{valve.name} (watering rate: {suffix})"
+
+    def clean(self, value):
+        valve = super().clean(value)
+        if (valve and self.mode == "SMART"
+                and not valve.has_valid_application_rate
+                and valve.pk not in self.retained_ids):
+            raise forms.ValidationError(
+                f"{valve.name}: enter a measured watering rate before selecting "
+                "this valve for Smart."
+            )
+        return valve
+
+
 class ValveMemberForm(forms.Form):
     valve = forms.ModelChoiceField(queryset=Valve.objects.none())
     duration_seconds = forms.IntegerField(
@@ -135,11 +179,16 @@ class ValveMemberForm(forms.Form):
         label="Duration (seconds)",
     )
 
-    def __init__(self, *args, site=None, **kwargs):
+    def __init__(
+        self, *args, site=None, mode="FIXED", retained_ids=(), **kwargs
+    ):
         super().__init__(*args, **kwargs)
-        self.fields["valve"].queryset = Valve.objects.filter(
-            relay_device__site=site
-        ).select_related("relay_device").order_by("name")
+        self.fields["valve"] = SmartValveChoiceField(
+            queryset=Valve.objects.filter(relay_device__site=site)
+            .select_related("relay_device").order_by("name"),
+            mode=mode, retained_ids=retained_ids,
+            widget=ValveSelect(mode=mode, retained_ids=retained_ids),
+        )
         self.fields["valve"].widget.attrs["class"] = "form-select"
         self.fields["duration_seconds"].widget.attrs["class"] = "form-control"
 
@@ -274,10 +323,15 @@ class CurveForm(forms.Form):
         widget=forms.NumberInput(attrs={"class": "form-control"}),
     )
     fallback_temperature_c = forms.FloatField(
-        required=False, label="Fallback temperature (°C)",
-        help_text="Set a finite site-specific value before enabling Smart.",
+        required=False, initial=DEFAULT_FALLBACK_TEMPERATURE_C,
+        label="Fallback temperature (°C)",
+        help_text="Defaults to 25 °C. Enter a site-specific value, or leave blank for 25 °C.",
         widget=forms.NumberInput(attrs={"class": "form-control", "step": "0.1"}),
     )
+
+    def clean_fallback_temperature_c(self):
+        value = self.cleaned_data.get("fallback_temperature_c")
+        return DEFAULT_FALLBACK_TEMPERATURE_C if value is None else value
 
     def clean(self) -> dict:
         cleaned = super().clean()

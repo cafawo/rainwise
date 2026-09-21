@@ -178,7 +178,9 @@ Use the Django admin to create or edit:
 1. `Site` with timezone and lat/lon.
 2. `RelayDevice` with Modbus host/port/unit.
 3. `Valve` entries mapped to relay channels.
-4. Valve application rates and curve settings before enabling Smart rules.
+4. Measured valve application rates before selecting valves for Smart rules.
+   Curve settings are available automatically, including a 25 °C fallback
+   temperature that can be changed on the curve page.
 
 Create and edit rules from the schedule page. The same editor supports existing
 single-valve Fixed rules, Fixed groups, and Smart rules. Only the site's active
@@ -229,13 +231,27 @@ IDs, schedule, timing, and manual Run now behavior. A valve's default manual
 duration is not an additional ceiling on a Fixed rule.
 
 Smart runs a first pass in valve order and, when needed, a second pass. Fulfilled
-valves are skipped and a final pulse can be shortened to a whole second. It
-requires a finite positive application rate for every member, valid curve
-settings, and an explicitly configured finite fallback temperature. Each per-run
+valves are skipped and a final pulse can be shortened to a whole second. Newly
+selected valves require a finite positive application rate. Curve settings
+include a 25 °C fallback temperature, editable in the app. Each per-run
 maximum is 1–3276 seconds and must not exceed that valve's default maximum.
 There are at most two logical Smart attempts per valve/local day, including
 uncertain attempts in copied or switched schedules. Retries belong to the same
 logical attempt. A valve can belong to only one enabled Smart rule per schedule.
+
+An unmeasured valve shows **N/A** for its application rate and cannot be newly
+selected for Smart. Clearing the rate of an existing Smart member preserves its
+membership and skips that valve with a warning; the calibrated members continue
+in their configured order. An occurrence with no calibrated members is recorded
+as skipped, rather than zero demand. Fixed and manual watering remain available
+without calibration.
+
+The controller rechecks the rate before each Smart pulse. If a rate is cleared
+after planning, all unattempted pulses for that valve are skipped without using
+an attempt. An already-commanded pulse retains its bounded duration, stop, and
+saved rate. Restoring the rate includes the valve at the next scheduled decision;
+it does not replay skipped work in an existing occurrence. Current warnings clear
+after correction, while historical skip reasons and delivery snapshots remain.
 
 Fixed group **Run now** submits a durable request for the controller; it requires
 an enabled rule in the active schedule and a free site. Repeating the request
@@ -253,8 +269,12 @@ unknown. See [CSU's home lawn irrigation guidance](https://extension.colostate.e
 The curve returns daily demand in mm/day from temperature in °C. `min_mm` and
 `max_mm` are finite and satisfy `0 <= min_mm <= max_mm`; `g` is finite and positive
 and `m` is finite. `coverage_days` is an integer from 1 through 7, default 2.
-Configure a fallback temperature appropriate to the site; no universal default
-is supplied. The curve page shows inputs and capacity per configured valve.
+The fallback temperature defaults to 25 °C; review it for the site and change it
+on the curve page when needed. Finite overrides, including 0 °C, are supported.
+New sites receive the standard curve settings without a settings-page visit.
+No Docker or environment variable is needed for the fallback or watering rate.
+The curve page shows inputs and capacity per configured valve; uncalibrated
+valves show N/A and a warning that Smart will skip them.
 
 At the actual admitted decision instant, Smart applies today's demand estimate
 to the whole coverage window:
@@ -311,9 +331,9 @@ Smart uses cached weather and never requests weather during actuation. The
 controller periodically imports elapsed hourly Open-Meteo model estimates.
 Temperature uses the last 24 hours' 90th percentile only with at least 18 finite
 trusted hourly values and a newest valid hour no older than the refresh interval.
-Otherwise it uses the configured fallback; the dashboard and curve page show
-the reason and latest valid weather time. A failed API call does not disable a
-valid fallback decision.
+Otherwise it uses the configured fallback (25 °C by default); the dashboard and
+curve page show the reason and latest valid weather time. A failed API call does
+not disable a valid fallback decision.
 
 An hour is trusted only when retrieval provenance shows it was fetched at or
 after its valid time. Future hours and legacy rows without provenance must be
@@ -347,8 +367,10 @@ reservation_seconds = watering_seconds + handover_seconds
 # passes = 1 for Fixed, 2 for Smart
 ```
 
-Watering and handover allowance are shown separately. This reserves worst-case
-watering and controller handovers; it does not promise exact physical closure
+Watering and handover allowance are shown separately. Missing valve calibration
+does not shrink the reservation: every configured maximum and handover remains
+included. This reserves worst-case watering and controller handovers; it does
+not promise exact physical closure
 time. New group windows cannot cross local midnight or overlap other automatic
 rules at the site. Existing overlaps between independent single-valve Fixed
 rules remain allowed. Revalidate reservations when cadence or limits change.
@@ -390,6 +412,12 @@ Back up the persistent database, stop the old controller, apply migrations, then
 start the upgraded web app and exactly one controller. Keep SQLite on the mounted
 `/data` volume or use Postgres; no host cron/systemd or extra worker is required.
 No deployment or hardware commissioning is part of the automated test suite.
+
+The fallback migration fills missing temperatures with 25 °C and adds standard
+curve settings for existing sites without a settings row. Existing temperature
+overrides are preserved. Valve rates remain nullable/N/A; no calibration or
+historical run rate is invented. Updating a Docker image requires no new
+environment configuration for these defaults.
 
 The migration converts every legacy `DYNAMIC` rule to Fixed at its stored
 maximum duration, including disabled rules and inactive schedules. IDs and all

@@ -22,6 +22,7 @@
         <thead>
           <tr>
             <th>Valve</th>
+            <th>Watering rate</th>
             <th>Relay</th>
             <th>Channel</th>
             <th>Last Known</th>
@@ -34,6 +35,7 @@
           {% for valve in valves %}
             <tr>
               <td>{{ valve.name }}</td>
+              <td>{% if valve.has_valid_application_rate %}{{ valve.application_rate_mm_h }} mm/hour{% else %}N/A{% endif %}</td>
               <td>{{ valve.relay_device.name }}</td>
               <td>{{ valve.channel }}</td>
               <td>
@@ -70,7 +72,7 @@
             </tr>
           {% empty %}
             <tr>
-              <td colspan="7" class="text-muted">No valves configured yet.</td>
+              <td colspan="8" class="text-muted">No valves configured yet.</td>
             </tr>
           {% endfor %}
         </tbody>

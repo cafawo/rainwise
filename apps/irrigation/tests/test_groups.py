@@ -649,6 +649,218 @@ class GroupExecutionTests(TestCase):
         self.assertEqual(attempted.optimal_duration_seconds, 60)
         self.assertEqual(attempted.application_rate_mm_h, 12)
 
+    def test_missing_smart_rate_skips_only_affected_member(self):
+        rule = self.smart_rule()
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
+        reservation = group_services.reservation_seconds(rule)
+        self.tick()
+        self.tick(seconds=900, stop_finished=True)
+        self.tick(seconds=300, stop_finished=True)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[1], 900), mock.call(self.valves[1], 300),
+        ])
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.status, "FINISHED")
+        missing = occurrence.decision["valves"][str(self.valves[0].pk)]
+        self.assertTrue(missing["skipped"])
+        self.assertEqual(missing["planned_seconds"], 0)
+        self.assertTrue(occurrence.decision["warnings"])
+        self.assertFalse(occurrence.runs.filter(
+            valve=self.valves[0], attempt_started_at__isnull=False,
+        ).exists())
+        self.assertEqual(group_services.reservation_seconds(rule), reservation)
+        self.assertEqual(occurrence.config["watering_seconds"], reservation[0])
+        self.assertEqual(occurrence.config["handover_seconds"], reservation[1])
+
+    def test_all_missing_smart_rates_record_idempotent_skip_not_zero_demand(self):
+        rule = self.smart_rule()
+        Valve.objects.filter(pk__in=[valve.pk for valve in self.valves]).update(
+            application_rate_mm_h=None,
+        )
+        self.tick()
+        self.tick()
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.status, "SKIPPED")
+        self.assertFalse(occurrence.runs.exists())
+        self.assertEqual(len(occurrence.decision["valves"]), 2)
+        self.assertTrue(all(
+            row["skipped"] for row in occurrence.decision["valves"].values()
+        ))
+        self.open.assert_not_called()
+
+    def test_rate_removed_after_planning_preserves_snapshot_and_other_members(self):
+        rule = self.smart_rule()
+        occurrence = group_services._plan_occurrence(
+            rule, scheduled_at=self.clock,
+        )
+        original_snapshot = occurrence.config
+        planned_rates = list(occurrence.runs.filter(
+            valve=self.valves[1],
+        ).values_list("application_rate_mm_h", flat=True))
+        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=None)
+        self.tick()
+        self.tick(seconds=900, stop_finished=True)
+        self.tick()
+        self.tick(seconds=300, stop_finished=True)
+        self.tick()
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
+        ])
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "FINISHED")
+        self.assertEqual(occurrence.config, original_snapshot)
+        self.assertEqual(list(occurrence.runs.filter(
+            valve=self.valves[1],
+        ).values_list("application_rate_mm_h", flat=True)), planned_rates)
+        self.assertFalse(occurrence.runs.filter(
+            valve=self.valves[1], attempt_started_at__isnull=False,
+        ).exists())
+
+    def test_rate_cleared_during_active_pulse_does_not_rewrite_or_extend_it(self):
+        rule = self.smart_rule()
+        self.tick()
+        active = IrrigationRun.objects.get(status="RUNNING")
+        original_start = active.actual_start_at
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
+        self.tick(seconds=60)
+        active.refresh_from_db()
+        self.assertEqual(active.status, "RUNNING")
+        self.assertEqual(active.actual_start_at, original_start)
+        self.assertEqual(active.optimal_duration_seconds, 900)
+        self.assertEqual(active.application_rate_mm_h, 12)
+        self.close.assert_not_called()
+        self.tick(seconds=840, stop_finished=True)
+        self.read.assert_any_call(self.valves[0])
+        self.tick(seconds=900, stop_finished=True)
+        self.tick()
+        self.tick(seconds=300, stop_finished=True)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 900), mock.call(self.valves[1], 900),
+            mock.call(self.valves[1], 300),
+        ])
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertEqual(occurrence.status, "FINISHED")
+        self.assertEqual(occurrence.runs.filter(
+            valve=self.valves[0], attempt_started_at__isnull=False,
+        ).count(), 1)
+
+    def test_rate_restoration_applies_next_decision_without_replaying_old_skip(self):
+        rule = self.smart_rule()
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
+        self.tick()
+        first = RuleOccurrence.objects.get(rule=rule)
+        original_decision = first.decision
+        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=12)
+        self.tick(seconds=900, stop_finished=True)
+        self.tick(seconds=300, stop_finished=True)
+        first.refresh_from_db()
+        self.assertEqual(first.decision, original_decision)
+        self.assertFalse(first.runs.filter(valve=self.valves[0]).exists())
+        self.assertEqual(self.open.call_count, 2)
+        self.clock = self.clock.replace(hour=6, minute=0) + dt.timedelta(days=1)
+        self.tick()
+        self.open.assert_called_with(self.valves[0], 900)
+        next_occurrence = RuleOccurrence.objects.exclude(pk=first.pk).get(rule=rule)
+        self.assertFalse(next_occurrence.decision["valves"][str(self.valves[0].pk)].get(
+            "skipped", False,
+        ))
+
+    def test_restoration_does_not_reactivate_pulses_skipped_after_planning(self):
+        rule = self.smart_rule()
+        first_decision = self.clock
+        self.tick()
+        first = RuleOccurrence.objects.get(rule=rule)
+        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=None)
+        self.tick()
+        skipped = list(first.runs.filter(valve=self.valves[1]).values(
+            "pk", "status", "error_message", "attempt_started_at",
+        ))
+        self.assertTrue(all(row["status"] == "FAILED" for row in skipped))
+        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=12)
+        self.tick(seconds=900, stop_finished=True)
+        self.tick(seconds=300, stop_finished=True)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
+        ])
+        self.assertEqual(list(first.runs.filter(valve=self.valves[1]).values(
+            "pk", "status", "error_message", "attempt_started_at",
+        )), skipped)
+        self.clock = first_decision + dt.timedelta(days=1)
+        self.tick()
+        self.open.assert_called_with(self.valves[1], 900)
+
+    def test_all_rates_removed_after_planning_records_skip_without_attempts(self):
+        rule = self.smart_rule()
+        occurrence = group_services._plan_occurrence(
+            rule, scheduled_at=self.clock,
+        )
+        Valve.objects.filter(pk__in=[valve.pk for valve in self.valves]).update(
+            application_rate_mm_h=None,
+        )
+        self.tick()
+        occurrence.refresh_from_db()
+        self.assertEqual(occurrence.status, "SKIPPED")
+        self.assertEqual(occurrence.runs.count(), 4)
+        self.assertFalse(occurrence.runs.filter(
+            attempt_started_at__isnull=False,
+        ).exists())
+        self.open.assert_not_called()
+
+    def test_rate_removed_between_claim_and_send_consumes_no_attempt(self):
+        rule = self.smart_rule()
+        original_send = group_services._send_claimed
+
+        def clear_rate_before_transmission(run):
+            if run.valve_id == self.valves[0].pk:
+                Valve.objects.filter(pk=run.valve_id).update(application_rate_mm_h=None)
+            return original_send(run)
+
+        with mock.patch.object(
+            group_services, "_send_claimed", side_effect=clear_rate_before_transmission,
+        ):
+            self.tick()
+        self.tick()
+        self.tick(seconds=900, stop_finished=True)
+        self.tick(seconds=300, stop_finished=True)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[1], 900), mock.call(self.valves[1], 300),
+        ])
+        occurrence = RuleOccurrence.objects.get(rule=rule)
+        self.assertFalse(occurrence.runs.filter(
+            valve=self.valves[0], attempt_started_at__isnull=False,
+        ).exists())
+
+    def test_fixed_group_ignores_missing_rates_before_and_during_execution(self):
+        self.rule()
+        self.tick()
+        self.tick(seconds=60, stop_finished=True)
+        self.tick(seconds=120, stop_finished=True)
+        self.assertEqual(self.open.call_args_list, [
+            mock.call(self.valves[0], 60), mock.call(self.valves[1], 120),
+        ])
+
+    def test_invalid_stored_smart_rates_do_not_abort_calibrated_members(self):
+        rule = self.smart_rule(need=7)
+        first_decision = self.clock
+        for day, invalid_rate in enumerate((0, -1, float("inf"))):
+            with self.subTest(rate=invalid_rate):
+                self.clock = first_decision + dt.timedelta(days=day)
+                Valve.objects.filter(pk=self.valves[0].pk).update(
+                    application_rate_mm_h=invalid_rate,
+                )
+                calls_before = self.open.call_count
+                self.tick()
+                self.tick(seconds=900, stop_finished=True)
+                self.tick(seconds=900, stop_finished=True)
+                occurrence = RuleOccurrence.objects.get(
+                    rule=rule, scheduled_local_date=self.clock.date(),
+                )
+                self.assertEqual(occurrence.status, "FINISHED")
+                self.assertTrue(occurrence.decision["valves"][str(self.valves[0].pk)]["skipped"])
+                self.assertEqual(self.open.call_args_list[calls_before:], [
+                    mock.call(self.valves[1], 900), mock.call(self.valves[1], 900),
+                ])
+
 
 class GroupAdmissionRaceTests(TransactionTestCase):
     """Independent DB connections see the committed claim before hardware I/O."""
