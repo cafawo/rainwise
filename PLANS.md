@@ -109,7 +109,8 @@ count, or independently configured soak duration.
 
 Use existing Bootstrap styles, spacing, cards, controls and button conventions.
 No visual framework, drag-and-drop library, wizard or new scheduling UI is
-needed. Keep Mode first, followed by ordered valves and then the schedule.
+needed. Keep Mode and the schedule options together in one card above the
+ordered valves. Omit the general mode description beside the selector.
 
 - Put each valve selector, its mode-specific duration, sequence controls and
   Remove action together in one responsive row/card. Remove the distant second
@@ -127,8 +128,9 @@ needed. Keep Mode first, followed by ordered valves and then the schedule.
   enabled Smart rule per schedule; independent Fixed/manual watering still
   contributes irrigation credit. Members represent separate watering zones,
   not overlapping areas sharing one water allocation.
-- Keep the principal Save and Cancel actions clear. Preview is for Smart;
-  Fixed retains Run now. Stop and Delete must remain distinguishable actions.
+- Keep Save, Cancel and the available rule actions in one row, wrapping on small
+  screens. Preview is for Smart; Fixed retains Run now. Stop and Delete must
+  remain distinguishable actions.
 - Use short mode-specific help. Fixed shows its runtime. Smart shows the valve
   rate, per-run limit, peak watering time for the selected coverage window,
   and the meaning of automatic breaks. Do not show two editable maxima in the
