@@ -270,8 +270,9 @@ manual watering remain available without calibration.
 
 Edits to a rule, valve rate, run limit, watering order or curve take effect on the
 next execution. A running sequence retains its admitted configuration and rates.
-**Disable rule** stops future scheduled executions until the rule is re-enabled;
-the controller also stops the current sequence on its next tick. Groups have no
+Clear **Enabled** in the rule editor and click **Save** to stop future scheduled
+executions until the rule is re-enabled; the controller also stops the current
+sequence on its next tick. Groups have no
 **Run now** action. Smart keeps **Preview**, and existing single-valve Fixed rules
 keep their immediate **Run now** action.
 
@@ -427,13 +428,15 @@ completion and starts the rest interval. No additional read-back is required
 before the next pulse after that deadline. Uncertain delivery cancels the
 remaining sequence and retains conservative water credit.
 
-**Disable rule** saves the rule as disabled until it is explicitly re-enabled.
+Clear **Enabled** in the rule editor and click **Save** to disable the rule until
+it is explicitly re-enabled.
 On its next tick the controller discards future pulses and attempts an ordinary
 early close of the current pulse. Deleting the rule or switching the active
 schedule also stops the sequence. If early close fails, the relay's existing
 timeout ends watering. Editing other settings applies to the next execution.
 Closing the currently watering valve ends the remaining sequence at the next
-controller check. During a break, use **Disable rule** because no pulse is active.
+controller check. During a break, clear **Enabled** and click **Save** because no
+pulse is active.
 
 Restarting the controller abandons unfinished sequences; they are not rebuilt or
 resumed. Attempted watering logs remain, and recorded attempts prevent replaying

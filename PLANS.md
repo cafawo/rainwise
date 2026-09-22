@@ -88,8 +88,10 @@ configuration edits on the next execution. Preserve v0.1.4 valve controls.
 
 - Remove occurrence history, detailed group progress and persisted zero/skip
   decisions. Actual watering logs remain; Smart Preview remains.
-- Group Stop becomes explicitly Disable rule, saving existing enabled=False.
-  Controller observes it on its next tick. Re-enable for future schedules.
+- Disable a group by clearing Enabled in the rule editor and clicking Save,
+  saving existing enabled=False. No separate Disable rule button is needed.
+  The controller stops the sequence on its next tick. Future scheduled
+  executions remain disabled until Enabled is selected and saved again.
 - Keep single-valve Fixed Run now. Remove grouped Run now rather than replacing
   its deleted occurrence handoff with another queue. Groups run on schedule.
 - Show one useful fallback-temperature warning. Do not run watering planners

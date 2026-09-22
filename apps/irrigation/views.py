@@ -386,7 +386,7 @@ def _editor_data(request):
 def _rule_urls(rule):
     prefix = "group" if isinstance(rule, GroupedRule) else "schedule"
     actions = ("edit", "copy", "delete")
-    actions += ("stop", "preview") if prefix == "group" else ("run",)
+    actions += ("preview",) if prefix == "group" else ("run",)
     return {action + "_url": reverse(prefix + "_" + action, args=[rule.pk])
             for action in actions}
 
@@ -597,20 +597,6 @@ def group_delete(request, rule_id):
     with transaction.atomic():
         rule.delete()
     messages.success(request, "Rule deleted.")
-    return redirect("schedule")
-
-
-@login_required
-@require_POST
-def group_stop(request, rule_id):
-    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
-    rule.enabled = False
-    rule.save(update_fields=["enabled"])
-    messages.success(
-        request,
-        "Rule disabled. The controller stops its sequence on the next tick. "
-        "Re-enable the rule to resume future schedules.",
-    )
     return redirect("schedule")
 
 

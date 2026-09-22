@@ -218,7 +218,7 @@ class SharedRuleEditorTests(TestCase):
         rule = self.group("FIXED")
         response = self.client.get(reverse("group_edit", args=[rule.pk]))
         self.assertNotContains(response, ">Run now<")
-        self.assertContains(response, ">Disable rule<")
+        self.assertNotContains(response, ">Disable rule<")
         with self.assertRaises(NoReverseMatch):
             reverse("group_run", args=[rule.pk])
         self.assertEqual(self.client.post(f"/schedule/group/{rule.pk}/run/").status_code, 404)
@@ -275,26 +275,27 @@ class SharedRuleEditorTests(TestCase):
         self.assertFalse(GroupedRule.objects.exists())
 
 
-    def test_disabling_group_saves_configuration_without_hardware_io(self):
-        rule = self.group("FIXED")
-        data = self.payload(valves=[self.a, self.b])
-        data.pop("enabled")
-        with mock.patch("apps.irrigation.services.close_valve") as closing:
-            response = self.client.post(reverse("group_edit", args=[rule.pk]), data)
-        self.assertEqual(response.status_code, 302)
-        rule.refresh_from_db()
-        self.assertFalse(rule.enabled)
-        closing.assert_not_called()
-
-    def test_disable_rule_action_is_explicit_and_persists_enabled_flag(self):
-        rule = self.group()
-        with mock.patch("apps.irrigation.services.close_valve") as closing:
-            response = self.client.post(reverse("group_stop", args=[rule.pk]), follow=True)
-        self.assertContains(response, "Rule disabled.")
-        rule.refresh_from_db()
-        self.assertFalse(rule.enabled)
-        closing.assert_not_called()
-        self.assertNotContains(self.client.get(reverse("group_edit", args=[rule.pk])), ">Disable rule<")
+    def test_enabled_checkbox_controls_fixed_and_smart_groups(self):
+        for mode in ("FIXED", "SMART"):
+            with self.subTest(mode=mode):
+                rule = self.group(mode)
+                url = reverse("group_edit", args=[rule.pk])
+                response = self.client.get(url)
+                self.assertContains(response, 'name="enabled"')
+                self.assertNotContains(response, ">Disable rule<")
+                data = self.payload(mode, valves=[self.a, self.b])
+                data.pop("enabled")
+                with mock.patch("apps.irrigation.services.close_valve") as closing:
+                    response = self.client.post(url, data)
+                self.assertEqual(response.status_code, 302)
+                rule.refresh_from_db()
+                self.assertFalse(rule.enabled)
+                closing.assert_not_called()
+                data["enabled"] = "on"
+                self.assertEqual(self.client.post(url, data).status_code, 302)
+                rule.refresh_from_db()
+                self.assertTrue(rule.enabled)
+                rule.delete()
 
     def test_group_mode_change_and_delete_preserve_actual_watering(self):
         rule = self.group("FIXED")
@@ -341,8 +342,9 @@ class SharedRuleEditorTests(TestCase):
         self.client.post(reverse("site_select"), {"site_id": other.pk})
         for route in ("group_edit", "group_copy", "group_preview"):
             self.assertEqual(self.client.get(reverse(route, args=[rule.pk])).status_code, 404)
-        for route in ("group_stop", "group_delete"):
-            self.assertEqual(self.client.post(reverse(route, args=[rule.pk])).status_code, 404)
+        self.assertEqual(
+            self.client.post(reverse("group_delete", args=[rule.pk])).status_code, 404,
+        )
 
     def test_curve_rejects_invalid_windows_and_nonfinite_settings(self):
         data = {"min_mm": 0, "max_mm": 7, "g": 0.2, "m": 25, "coverage_days": 2, "fallback_temperature_c": 25}
