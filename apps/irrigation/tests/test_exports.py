@@ -10,6 +10,7 @@ from django.db import connection
 from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils.html import escape
 
 from apps.irrigation.balance import delivery_estimate
 from apps.irrigation.exports import iter_logs
@@ -260,6 +261,26 @@ class LogsExportTests(TestCase):
         self.assertContains(response, "Download logs")
         self.assertContains(response, "Download extended logs")
         self.assertContains(response, "all recorded history for the selected site")
+
+    def test_admin_history_does_not_fetch_appendices(self):
+        self.user.is_staff = True
+        self.user.is_superuser = True
+        self.user.save(update_fields=["is_staff", "is_superuser"])
+        self.create_run(appendix={"evidence": "stored"})
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                reverse("admin:irrigation_irrigationrun_changelist"),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, escape(self.valve.name))
+        run_queries = [
+            query["sql"] for query in queries
+            if 'FROM "irrigation_irrigationrun"' in query["sql"]
+        ]
+        self.assertTrue(run_queries)
+        self.assertTrue(all('"appendix"' not in sql for sql in run_queries))
 
 
 @skipUnless(connection.vendor == "sqlite", "SQLite reader/writer lock regression")

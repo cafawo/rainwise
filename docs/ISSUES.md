@@ -43,7 +43,7 @@ checks do not establish physical relay or production-container behavior.
 ## Upgrade boundary
 
 Back up the database, stop old web/controller processes and let timed watering
-finish before applying migrations through 0013. The forward cleanup deliberately
+finish before applying migrations through 0014. The forward cleanup deliberately
 removes occurrence-only history and never-attempted future pulse rows. It preserves
 rule configuration and actual/attempted watering records. Do not rewrite migrations
 already applied to a user's database merely to reduce the migration-file count.

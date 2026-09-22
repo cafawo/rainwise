@@ -65,9 +65,20 @@ The independent finite relay timer remains the physical stop mechanism. Shared
 database/disk failures can still delay software actions; this feature does not
 claim complete availability isolation or physical relay commissioning.
 
-The export correction is implemented. The recovery-log exception guard is a
-tested, reviewable working change awaiting specific approval under the protected
-valve-control instructions added during this review; no deployment was changed.
+The export correction is implemented. On 2026-09-22, after the guard's behavior
+and lack of schema changes were explained, the user approved proceeding with
+the recovery-log exception guard already implemented in the controller. Its
+scope is limited to catching recovery-context/log-write errors after a close
+attempt so the watchdog continues checking the remaining valves. Relay commands,
+durations, retries and restart behavior are unchanged. No additional model,
+migration or controller redesign is authorized; no deployment was changed.
+
+Review follow-up approved on 2026-09-22: omit appendix data from ordinary admin
+history queries using Django's standard deferred-field support, and align the
+upgrade note with migration 0014. These changes are implemented.
+Validation: all 42 focused admin, export and appendix/failure tests passed in
+the rainwise environment. Independent diff review and whitespace checks passed.
+This follow-up changed no protected production code, models or migrations.
 
 Implemented with migration `0014_irrigationrun_appendix`. Validation: all 265
 Django tests passed in the rainwise environment on isolated SQLite, including

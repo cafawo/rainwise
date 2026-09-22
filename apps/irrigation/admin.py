@@ -176,6 +176,9 @@ class IrrigationRunAdmin(admin.ModelAdmin):
     list_filter = ("status", "trigger", "stop_reason")
     actions = None
 
+    def get_queryset(self, request):
+        return super().get_queryset(request).defer("appendix")
+
     def has_add_permission(self, request):
         return False
 
