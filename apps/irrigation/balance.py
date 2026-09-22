@@ -14,9 +14,7 @@ from django.core.exceptions import ValidationError
 from django.db.models import Q
 
 from apps.irrigation.curves import daily_water_required, percentile
-from apps.irrigation.models import (
-    IrrigationRun, RuleOccurrence, get_curve_settings,
-)
+from apps.irrigation.models import IrrigationRun, get_curve_settings
 from apps.irrigation.sequence import plan_sequence, target_seconds
 from apps.weather.models import WeatherObservation
 
@@ -239,18 +237,13 @@ def irrigation_credit(valve, at: dt.datetime, coverage_days: int) -> dict:
         )
     if not math.isfinite(credit):
         raise ValueError("Irrigation credit must be finite.")
-    recording_started = RuleOccurrence.objects.filter(
-        site=site, decision_at__lte=start
-    ).exists()
     return {
         "credit_mm": credit,
         "start_at": start.isoformat(),
         "cutoff_at": end.isoformat(),
         "known_runs": known,
         "uncalibrated_runs": uncalibrated,
-        "incomplete_history": bool(
-            uncalibrated or (not known and not recording_started)
-        ),
+        "incomplete_history": bool(uncalibrated),
         "uncertain": uncertain,
         "unknown_extra_delivery": unknown_extra,
         "nominal_allowance_beyond_cutoff": nominal_beyond_cutoff,

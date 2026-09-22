@@ -16,7 +16,6 @@ urlpatterns = [
     path("schedule/group/<int:rule_id>/edit/", views.group_edit, name="group_edit"),
     path("schedule/group/<int:rule_id>/copy/", views.group_copy, name="group_copy"),
     path("schedule/group/<int:rule_id>/delete/", views.group_delete, name="group_delete"),
-    path("schedule/group/<int:rule_id>/run/", views.group_run, name="group_run"),
     path("schedule/group/<int:rule_id>/stop/", views.group_stop, name="group_stop"),
     path("schedule/group/<int:rule_id>/preview/", views.group_preview, name="group_preview"),
     path("schedule/new-schedule/", views.schedule_new, name="schedule_new"),

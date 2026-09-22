@@ -9,7 +9,7 @@
 
 {% block content %}
 <h1 class="h3">Smart preview</h1>
-<p>This estimate uses cached weather and recorded delivery now. Scheduled execution saves its own decision at admission. Preview never starts watering.</p>
+<p>This estimate uses cached weather and recorded delivery now. Scheduled execution calculates demand when the rule starts. Preview never starts watering.</p>
 <div class="card mb-3"><div class="card-body"><h2 class="h5">Peak calendar reservation</h2>
 {% if reservation.available %}<p>Watering: {{ reservation.watering_seconds|duration }} · Breaks: {{ reservation.break_seconds|duration }} · Scheduling allowance: {{ reservation.scheduling_allowance_seconds|duration }}.</p><p>Total: {{ reservation.total_seconds|duration }}. Today's rain and calculated demand do not shorten this peak reservation.</p>{% else %}<p>Duration N/A. The calendar shows the scheduled start.</p>{% endif %}
 {% for name in reservation.unavailable_valves %}<p class="text-warning-emphasis">{{ name }}: watering rate N/A; omitted from the peak reservation.</p>{% endfor %}

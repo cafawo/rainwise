@@ -9,7 +9,6 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from apps.irrigation import group_services
 from apps.irrigation.models import (
     CurveSettings,
     IrrigationRun,
@@ -158,10 +157,10 @@ class DashboardViewTests(TestCase):
             response = self.client.post(reverse("valve_open", args=[self.valve.id]))
 
         self.assertEqual(response.status_code, 302)
-        open_valve_for.assert_not_called()
+        open_valve_for.assert_called_once_with(self.valve, 123)
         run = IrrigationRun.objects.get()
-        self.assertEqual(run.status, IrrigationRun.STATUS_PLANNED)
-        self.assertEqual(run.dispatch_state, "QUEUED")
+        self.assertEqual(run.status, IrrigationRun.STATUS_RUNNING)
+        self.assertIsNotNone(run.actual_start_at)
         self.assertEqual(run.max_duration_seconds, 123)
 
     def test_manual_close_still_closes_running_valve_early(self) -> None:
@@ -181,17 +180,37 @@ class DashboardViewTests(TestCase):
             response = self.client.post(reverse("valve_close", args=[self.valve.id]))
 
         self.assertEqual(response.status_code, 302)
-        close_valve.assert_not_called()
-        run.refresh_from_db()
-        self.assertTrue(run.cancellation_requested)
-        with (
-            mock.patch("apps.irrigation.services.close_valve"),
-            mock.patch("apps.irrigation.services.read_valve_state", return_value=False),
-        ):
-            group_services.reconcile_attempts()
+        close_valve.assert_called_once_with(self.valve)
         run.refresh_from_db()
         self.assertEqual(run.status, IrrigationRun.STATUS_FINISHED)
         self.assertEqual(run.stop_reason, IrrigationRun.STOP_MANUAL)
+
+    def test_failed_manual_open_return_shows_error_instead_of_success(self):
+        run = IrrigationRun.objects.create(
+            valve=self.valve, trigger="MANUAL", status="FAILED",
+            max_duration_seconds=600, error_message="Relay unreachable",
+        )
+        self.client.login(username="tester", password="password")
+        with mock.patch(
+            "apps.irrigation.group_services.start_single", return_value=run,
+        ):
+            response = self.client.post(
+                reverse("valve_open", args=[self.valve.pk]), follow=True,
+            )
+        self.assertContains(response, "Failed to open valve: Relay unreachable")
+        self.assertNotContains(response, "Valve opened.")
+
+    def test_failed_manual_close_surfaces_service_error(self):
+        self.client.login(username="tester", password="password")
+        with mock.patch(
+            "apps.irrigation.group_services.close_member",
+            side_effect=RuntimeError("Relay unreachable"),
+        ):
+            response = self.client.post(
+                reverse("valve_close", args=[self.valve.pk]), follow=True,
+            )
+        self.assertContains(response, "Failed to close valve: Relay unreachable")
+        self.assertNotContains(response, "Valve closed.")
 
 
 class ActiveSiteSelectionTests(TestCase):

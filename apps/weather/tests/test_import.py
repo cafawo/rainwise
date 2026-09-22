@@ -58,63 +58,140 @@ class WeatherImportTests(TestCase):
         self.assertEqual(row.temperature_c, 20)
         self.assertEqual(row.retrieved_at, now)
 
-    def test_full_seven_day_backfill_despite_newer_rows_and_retry_throttle(self):
-        site = Site.objects.create(name="Home", latitude=52.5, longitude=13.4, timezone="UTC")
-        settings = CurveSettings.objects.create(site=site, coverage_days=7, fallback_temperature_c=20)
+    def test_coverage_changes_apply_on_normal_refresh(self):
+        site = Site.objects.create(
+            name="Home", latitude=52.5, longitude=13.4, timezone="UTC",
+        )
+        settings = CurveSettings.objects.create(
+            site=site, coverage_days=7, fallback_temperature_c=20,
+        )
         schedule = Schedule.objects.create(site=site, name="Summer")
-        GroupedRule.objects.create(schedule=schedule, mode="SMART", start_time="06:30")
+        GroupedRule.objects.create(
+            schedule=schedule, mode="SMART", start_time="06:30",
+        )
         now = dt.datetime(2026, 7, 8, 6, 30, tzinfo=dt.timezone.utc)
+        # An observation alone is not evidence of a successful elapsed-data import.
         WeatherObservation.objects.create(
             site=site, timestamp=now.replace(minute=0), retrieved_at=now,
             temperature_c=20, precipitation_mm=0,
         )
-        with mock.patch("apps.weather.services.import_weather_range", return_value=168) as imported:
+        with mock.patch(
+            "apps.weather.services.import_weather_range", return_value=168,
+        ) as imported:
             ensure_recent_weather(site, now=now, lookback_days=2)
-            imported.assert_called_once_with(site, dt.date(2026, 7, 1), dt.date(2026, 7, 8), now=now)
-            ensure_recent_weather(site, now=now + dt.timedelta(minutes=10), lookback_days=2)
+            imported.assert_called_once_with(
+                site, dt.date(2026, 7, 1), dt.date(2026, 7, 8), now=now,
+            )
+            ensure_recent_weather(site, now=now + dt.timedelta(minutes=10))
             self.assertEqual(imported.call_count, 1)
+
         settings.coverage_days = 2
         settings.save()
-        later = now + dt.timedelta(hours=1)
-        with mock.patch("apps.weather.services.import_weather_range", return_value=48) as imported:
-            ensure_recent_weather(site, now=later, lookback_days=2)
-            self.assertEqual(imported.call_args.args[1], dt.date(2026, 7, 6))
+        later = now + dt.timedelta(hours=6)
+        with mock.patch(
+            "apps.weather.services.import_weather_range", return_value=48,
+        ) as imported:
+            ensure_recent_weather(site, now=later, lookback_days=30)
+            imported.assert_called_once_with(
+                site, dt.date(2026, 7, 6), dt.date(2026, 7, 8), now=later,
+            )
+
         settings.coverage_days = 7
         settings.save()
-        later += dt.timedelta(hours=1)
-        with mock.patch("apps.weather.services.import_weather_range", return_value=168) as imported:
-            ensure_recent_weather(site, now=later, lookback_days=2)
-            self.assertEqual(imported.call_args.args[1], dt.date(2026, 7, 1))
+        with mock.patch(
+            "apps.weather.services.import_weather_range", return_value=168,
+        ) as imported:
+            ensure_recent_weather(site, now=later + dt.timedelta(hours=1))
+            imported.assert_not_called()
+            next_refresh = later + dt.timedelta(hours=6)
+            ensure_recent_weather(site, now=next_refresh)
+            imported.assert_called_once_with(
+                site, dt.date(2026, 7, 1), dt.date(2026, 7, 8), now=next_refresh,
+            )
 
-    def test_success_time_and_interior_gap_control_refresh_not_future_observation(self):
-        site = Site.objects.create(name="Home", latitude=52.5, longitude=13.4, timezone="UTC")
+    def test_missing_observations_do_not_trigger_extra_archive_imports(self):
+        site = Site.objects.create(
+            name="Fixed only", latitude=52.5, longitude=13.4, timezone="UTC",
+        )
         now = dt.datetime(2026, 7, 8, 6, 30, tzinfo=dt.timezone.utc)
-        start = dt.datetime(2026, 7, 7, tzinfo=dt.timezone.utc)
-        rows = []
-        instant = start
-        while instant <= now:
-            rows.append(WeatherObservation(site=site, timestamp=instant, retrieved_at=now, temperature_c=20, precipitation_mm=0))
-            instant += dt.timedelta(hours=1)
-        WeatherObservation.objects.bulk_create(rows)
-        log = WeatherImportLog.objects.create(site=site, date=now.date(), status="SUCCESS", last_success_at=now - dt.timedelta(hours=2))
-        WeatherImportLog.objects.filter(pk=log.pk).update(imported_at=now - dt.timedelta(hours=2))
-        with mock.patch("apps.weather.services.import_weather_range", return_value=30) as imported:
-            ensure_recent_weather(site, now=now, lookback_days=1)
+        succeeded = now - dt.timedelta(hours=2)
+        log = WeatherImportLog.objects.create(
+            site=site, date=now.date(), status="SUCCESS", last_success_at=succeeded,
+        )
+        WeatherImportLog.objects.filter(pk=log.pk).update(imported_at=succeeded)
+        # Even an empty cache waits for the regular cadence, not a gap-repair loop.
+        with mock.patch(
+            "apps.weather.services.import_weather_range", return_value=24,
+        ) as imported:
+            ensure_recent_weather(site, now=now, lookback_days=30)
+            ensure_recent_weather(site, now=now + dt.timedelta(hours=1), lookback_days=30)
             imported.assert_not_called()
-            ensure_recent_weather(site, now=now + dt.timedelta(hours=1), lookback_days=1)
-            imported.assert_not_called()
-            WeatherObservation.objects.filter(timestamp=start + dt.timedelta(hours=4)).update(retrieved_at=None)
-            ensure_recent_weather(site, now=now, lookback_days=1)
-            imported.assert_called_once()
-        WeatherObservation.objects.create(site=site, timestamp=now + dt.timedelta(days=1), temperature_c=50)
-        later = now + dt.timedelta(hours=6)
-        with mock.patch("apps.weather.services.import_weather_range", side_effect=RuntimeError("Offline")) as imported:
-            ensure_recent_weather(site, now=later, lookback_days=1)
-            ensure_recent_weather(site, now=later + dt.timedelta(minutes=30), lookback_days=1)
+            due = succeeded + dt.timedelta(hours=6)
+            ensure_recent_weather(site, now=due, lookback_days=30)
+            imported.assert_called_once_with(
+                site, dt.date(2026, 7, 7), dt.date(2026, 7, 8), now=due,
+            )
+
+    def test_initial_backfill_then_recent_refresh_preserves_old_archive(self):
+        site = Site.objects.create(
+            name="Home", latitude=52.5, longitude=13.4, timezone="UTC",
+        )
+        now = dt.datetime(2026, 7, 8, 6, 30, tzinfo=dt.timezone.utc)
+        archived = WeatherObservation.objects.create(
+            site=site, timestamp=now - dt.timedelta(days=29),
+            retrieved_at=now - dt.timedelta(days=28),
+            temperature_c=18, precipitation_mm=1.5,
+        )
+        with mock.patch(
+            "apps.weather.services.import_weather_range", return_value=720,
+        ) as imported:
+            ensure_recent_weather(site, now=now, lookback_days=30)
+            imported.assert_called_once_with(
+                site, dt.date(2026, 6, 8), dt.date(2026, 7, 8), now=now,
+            )
+            due = now + dt.timedelta(hours=6)
+            ensure_recent_weather(site, now=due, lookback_days=30)
+            self.assertEqual(imported.call_count, 2)
+            self.assertEqual(imported.call_args, mock.call(
+                site, dt.date(2026, 7, 7), dt.date(2026, 7, 8), now=due,
+            ))
+        archived.refresh_from_db()
+        self.assertEqual(archived.precipitation_mm, 1.5)
+        self.assertEqual(archived.temperature_c, 18)
+
+    def test_failed_refresh_retries_without_resetting_success_freshness(self):
+        site = Site.objects.create(
+            name="Home", latitude=52.5, longitude=13.4, timezone="UTC",
+        )
+        now = dt.datetime(2026, 7, 8, 6, 30, tzinfo=dt.timezone.utc)
+        succeeded = now - dt.timedelta(hours=6)
+        log = WeatherImportLog.objects.create(
+            site=site, date=now.date(), status="SUCCESS", last_success_at=succeeded,
+        )
+        WeatherImportLog.objects.filter(pk=log.pk).update(imported_at=succeeded)
+        WeatherObservation.objects.create(
+            site=site, timestamp=now + dt.timedelta(days=1), temperature_c=50,
+        )
+        with mock.patch(
+            "apps.weather.services.import_weather_range", side_effect=RuntimeError("Offline"),
+        ) as imported:
+            ensure_recent_weather(site, now=now, lookback_days=30)
+            ensure_recent_weather(site, now=now + dt.timedelta(minutes=30), lookback_days=30)
             self.assertEqual(imported.call_count, 1)
         log.refresh_from_db()
         self.assertEqual(log.status, "FAILED")
-        self.assertEqual(log.last_success_at, now)
+        self.assertEqual(log.last_success_at, succeeded)
+        retry_at = now + dt.timedelta(hours=1)
+        with mock.patch(
+            "apps.weather.services.import_weather_range", return_value=24,
+        ) as imported:
+            ensure_recent_weather(site, now=retry_at, lookback_days=30)
+            imported.assert_called_once_with(
+                site, dt.date(2026, 7, 7), dt.date(2026, 7, 8), now=retry_at,
+            )
+        log.refresh_from_db()
+        self.assertEqual(log.status, "SUCCESS")
+        self.assertEqual(log.last_success_at, retry_at)
 
     def test_import_yesterday_weather(self) -> None:
         site = Site.objects.create(

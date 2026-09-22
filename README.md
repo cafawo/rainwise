@@ -211,19 +211,19 @@ schedule executes automatically.
 
 ## Hardware Access
 
-Hardware I/O is isolated in `apps/irrigation/services.py` and performed only by
-the single controller. HTTP actions persist database requests/cancellations and
-never open, close, or read a relay. Use `RELAY_SIMULATOR=true` for local/dev
-without hardware.
+Hardware I/O is isolated in `apps/irrigation/services.py`. Manual **Open**,
+**Close**, and single-valve Fixed **Run now** execute immediately through that
+service layer, as in the previous release. The single controller handles
+scheduled watering, group progression, normal stops, watchdog recovery and
+weather imports. Use `RELAY_SIMULATOR=true` for local development without hardware.
 
-Manual **Open**, **Close**, and single Fixed **Run now** execute on the normal
-controller tick, every 60 seconds by default. Saving a request does not confirm
-physical opening or closure. The dashboard/status API show **Queued** or
-**Stopping** until execution/confirmation, and display execution errors beside
-the valve. Refresh to see the result; there is no additional polling loop.
-**Last Known** is the last observed relay state, or **Unknown** before a read.
-Repeated pending requests coalesce. Close also works for an unexpectedly open
-valve with no active watering record, including a disabled relay device.
+Grouped rules run only at their scheduled time. Manual valve controls do not use
+a command queue. The dashboard/status API display current activity and execution
+errors beside the valve. Refresh to see the result; there is no additional polling
+loop. **Last Known** is the last observed relay state, or **Unknown** before a
+read. Close also works for a valve with no active watering record.
+`GET /api/valve-status/` retains its existing cached-state fields and adds
+`action_status` and `action_error`.
 
 ## Fixed and Smart Rules
 
@@ -245,8 +245,8 @@ Fulfilled valves are skipped and the final pulse can be shorter, to a whole
 second. **Run time before a break** limits each uninterrupted run to 1–3276
 seconds; it does not cap the total water target. Before repeating a valve, its
 off-time must be at least as long as its preceding commanded run, measured from
-confirmed closure. Other valves' watering counts toward this break. For example,
-A waters 30 minutes, B waters 5, then the controller waits another 25 before A
+the conservative relay expiry. Other valves' watering counts toward this break.
+For example, A waters 30 minutes, B waters 5, then the controller waits another 25 before A
 repeats. No break is added after a valve's final run.
 
 New selections prefill the valve's existing default duration. An optional blank
@@ -257,29 +257,23 @@ default changes. That setting continues to bound individual manual Open commands
 The relay's independent 3276-second command limit is unchanged.
 
 Newly selected Smart valves require a finite positive application rate. Curve
-settings include an editable 25 °C fallback. Each occurrence saves a finite pulse
-budget; there is no two-run limit or separate daily watering cap. Copies and
-schedule changes still credit previous calibrated delivery, including uncertain
-attempts. A valve can belong to only one enabled Smart rule per schedule.
+settings include an editable 25 °C fallback. Each execution calculates a finite
+pulse budget; there is no two-run limit or separate daily watering cap. Copies
+and schedule changes still credit previous calibrated delivery, including
+uncertain attempts. A valve can belong to only one enabled Smart rule per schedule.
 
 An unmeasured valve shows **N/A** for its application rate and cannot be newly
-selected for Smart. Clearing the rate of an existing Smart member preserves its
-membership and skips that valve with a warning; the calibrated members continue
-in their configured order. An occurrence with no calibrated members is recorded
-as skipped, rather than zero demand. Fixed and manual watering remain available
-without calibration.
+selected for Smart. Clearing the rate of an existing member preserves its
+membership; the next execution skips that valve while calibrated members
+continue. Preview explains missing rates and other unavailable inputs. Fixed and
+manual watering remain available without calibration.
 
-The controller rechecks the rate before each Smart pulse. If a rate is cleared
-after planning, all unattempted pulses for that valve are skipped without using
-an attempt. An already-commanded pulse retains its bounded duration, stop, and
-saved rate. Restoring the rate includes the valve at the next scheduled decision;
-it does not replay skipped work in an existing occurrence. Current warnings clear
-after correction, while historical skip reasons and delivery snapshots remain.
-
-Fixed group **Run now** submits a durable request for the controller; it requires
-an enabled rule in the active schedule and a free site. Repeating the request
-returns its pending/active occurrence. Smart has **Preview** and **Stop**, and
-starts only at its scheduled minute. There is no unscheduled Smart override.
+Edits to a rule, valve rate, run limit, watering order or curve take effect on the
+next execution. A running sequence retains its admitted configuration and rates.
+**Disable rule** stops future scheduled executions until the rule is re-enabled;
+the controller also stops the current sequence on its next tick. Groups have no
+**Run now** action. Smart keeps **Preview**, and existing single-valve Fixed rules
+keep their immediate **Run now** action.
 
 ## Calibration and the Rolling Water Balance
 
@@ -322,7 +316,7 @@ preceding `coverage_days - 1` calendar dates plus delivery earlier today. Thus a
 two-day decision on Wednesday credits Tuesday and earlier Wednesday watering;
 Monday has expired. With a one-day window only earlier irrigation today counts.
 Boundaries follow the site's IANA timezone, including 23/25-hour DST dates.
-Rain after the saved decision cutoff affects the next decision.
+Rain after the current decision cutoff affects the next execution.
 
 Calibrated Fixed, manual, and Smart delivery all count for that valve. Delivery
 is estimated from the commanded duration, shortened by known early closure;
@@ -372,24 +366,28 @@ not disable a valid fallback decision.
 
 An hour is trusted only when retrieval provenance shows it was fetched at or
 after its valid time. Future hours and legacy rows without provenance must be
-refreshed before use. Successful import time controls refresh freshness; retries
-are throttled. Refreshes backfill the whole rain window and temperature history,
-repair missing/untrusted interior hours, and expand when coverage increases.
-The existing weather lookback is retained when it is longer.
+refreshed before use. Successful import time controls the normal refresh cadence;
+failed attempts use the existing retry throttle. The initial import backfills the
+configured history (30 days by default), or the Smart coverage window if longer.
+Later imports refresh the recent temperature/Smart coverage window and retain
+older history. Increasing coverage takes effect at the next regular refresh.
+Individual archive gaps do not trigger extra imports.
 
 Only known finite nonnegative precipitation is credited. Missing rain gives zero
-known credit and a separate warning; it is not evidence of dry weather and can
-lead to overwatering during an outage. Initial or incomplete irrigation history
-has its own warning. Current warnings clear after recovery; past decisions keep
-their original inputs and warnings. Open-Meteo precipitation represents the
-preceding hour, includes snow, and is not a rain-gauge measurement. Total rain
-also approximates available root-zone water: runoff and drainage are not modeled.
+known credit; it is not evidence of dry weather and can lead to overwatering during
+an outage. Smart Preview explains missing weather and uncalibrated historical
+watering. The dashboard and Curve page use one fallback-temperature banner rather
+than running watering calculations to produce additional warnings. Logs contain
+actual attempted watering, not saved zero-demand or skipped decisions.
+Open-Meteo precipitation represents the preceding hour, includes snow, and is not
+a rain-gauge measurement. Total rain also approximates available root-zone water:
+runoff and drainage are not modeled.
 
 The curve is a practical heuristic, not a soil/ET model or a universal irrigation
 recommendation. Equal-duration breaks are a product rule and do not guarantee
 soil absorption under every condition. There is no separate soak-duration setting.
 
-## Reservations, Stops, and Recovery
+## Calendar, Stops, and Restarts
 
 The calendar shows one group event with ordered members. Smart reservations
 simulate peak demand over the coverage window, split by each saved run limit,
@@ -410,120 +408,79 @@ A single valve with a one-hour peak and a 30-minute run limit needs 90 minutes
 before allowance. A two-hour peak needs four runs and three breaks: 210 minutes
 before allowance. Grouped Fixed uses its one pass with no repeat breaks; a legacy
 single-valve Fixed event remains exactly its runtime. Zero pulses have no allowance.
+Missing Smart calibration omits that member from the peak, with a named warning;
+if all members lack rates, the calendar shows a start marker with duration N/A.
 
-Missing Smart calibration omits that member from the flow-derived peak, with a
-named warning. If all members are unavailable, the calendar shows a start marker
-with duration N/A. Restoring a rate recalculates the envelope and requires conflict
-checks before future admission. This deliberately replaces the earlier policy of
-reserving two runs even for uncalibrated members.
+Group reservations cannot cross local midnight or overlap other automatic rules
+at the site. Existing overlaps between independent single-valve Fixed rules remain
+allowed. Configuration is validated when saved and again before starting a group.
+The allowance covers nominal tick and command timing, not arbitrary outages.
+The controller will not start a pulse that cannot finish within the reservation.
+Repeated DST times share one scheduled start; nonexistent times are skipped.
+Groups do not catch up outside their scheduled minute.
 
-The allowance covers nominal tick and command timing, not arbitrary outages or
-guaranteed physical closure. New group windows cannot cross local midnight or overlap other automatic
-rules at the site. Existing overlaps between independent single-valve Fixed
-rules remain allowed. Reservations are revalidated when rate, curve, coverage,
-duration, order, or cadence changes, and again at admission.
-DST repeated start times produce one occurrence per local date; nonexistent
-times are skipped and reported. Groups do not catch up outside their start minute.
+The single controller holds active sequences and rest deadlines in memory. It
+advances them on normal ticks without another worker, polling loop or persistent
+progress record. Only attempted pulses create watering logs. Each opening carries
+the existing relay timeout; the command-return time plus its duration bounds
+completion and starts the rest interval. No additional read-back is required
+before the next pulse after that deadline. Uncertain delivery cancels the
+remaining sequence and retains conservative water credit.
 
-Admission is atomic across grouped and individual starts. A conflicting run at
-a scheduled group's start records a skipped occurrence, without a delayed start.
-A submitted Fixed request that encounters a later conflict terminates visibly.
-During a group reservation other manual/Run now starts are rejected: stop the
-group first. The controller checks cancellation, current configuration/limits,
-the saved pulse budget, conflicts, and remaining deadline before every pulse. It persists
-the attempt before issuing the existing bounded hardware command.
+**Disable rule** saves the rule as disabled until it is explicitly re-enabled.
+On its next tick the controller discards future pulses and attempts an ordinary
+early close of the current pulse. Deleting the rule or switching the active
+schedule also stops the sequence. If early close fails, the relay's existing
+timeout ends watering. Editing other settings applies to the next execution.
+Closing the currently watering valve ends the remaining sequence at the next
+controller check. During a break, use **Disable rule** because no pulse is active.
 
-Fresh confirmation that the previous valve is closed is required before advancing
-to another valve. A finished database record or stale cached state is insufficient.
-Uncertain opening or closure interrupts the remaining sequence. Reservation
-deadlines stop new pulses that cannot fit with command/retry allowance; an
-overrun retains the reservation until closure is confirmed.
+Restarting the controller abandons unfinished sequences; they are not rebuilt or
+resumed. Attempted watering logs remain, and recorded attempts prevent replaying
+the group within its scheduled minute. Decisions that attempted no watering need
+no stored record. Existing relay timers and the original watchdog provide the
+physical backstop. Fixed/manual completion and watchdog behavior are retained.
+The relay protocol, duration bounds, polarity and transport retries are unchanged.
 
-While a repeat is waiting, the dashboard shows **Resting** and its next eligible
-time. The persisted closure timestamp is stable across polls. The controller
-checks on its normal cadence and retains the site's reservation; no service or
-request sleeps to implement a break. Cancellation also works during rest.
+### Accepted manual-control concurrency limit
 
-**Stop rule** cancels pending pulses and requests closure. Closing any member of
-an active group does the same, including when another member is watering.
-Cancellation during an opening remains durable; the controller rechecks after
-the call and closes the valve. The UI shows **Stopping** until closure is
-confirmed. Disabling/deleting a group or changing the active schedule also stops
-its pending work. Stop an active occurrence before changing its mode/membership
-or converting a single-valve rule. History and saved configuration snapshots
-survive edits and deletion.
-
-After restart, unfinished occurrences are cancelled and attempted/running/
-uncertain pulses are reconciled through closure and watchdog services, including
-devices subsequently disabled. Attempted commands are never replayed and missed
-dates are not backfilled. The next eligible scheduled date starts normally;
-a new explicit Fixed request requires recovery and confirmed closure first.
-
-Open requests use the existing run record: **QUEUED** has not transmitted,
-**OPENING** is the durable controller attempt, and **DONE** records its result.
-Close requests have one coalesced durable row per valve, independent of run
-history. The controller processes stops, cancellation, recovery and watchdog
-closures before admitting watering. Both fresh physical closure and its database
-confirmation are required before releasing a failed/stopping valve or group.
-Admission checks run again at dispatch, including failures since enqueue.
-Cancellation committed before dispatch prevents opening; cancellation during a
-hardware call closes immediately after that call returns, before replacement.
-
-A web process can disappear after enqueue without blocking recovery. On controller
-restart, queued manual requests and unfinished groups are cancelled visibly;
-attempted openings are closed/reconciled without replay. Acknowledged bounded
-single-valve runs retain their original stop times. Unsent individual requests
-also expire after one configured controller interval plus command allowance,
-rather than starting unexpectedly after a long stall. This freshness check never
-releases an attempted opening or an unconfirmed close.
-
-If storing an opening result fails, the controller attempts emergency closure
-even when the database is unavailable. The durable attempt blocks replacement;
-the next tick or restart reconciles it without any web acknowledgement. Ambiguous
-openings and successful transport retries retain conservative delivery estimates.
-Known early closure of an acknowledged run retains shortened delivery. Failed
-closure remains **Stopping**, with its error visible and a retry on normal ticks.
-
-Legacy web-sender states (`LEGACY`, `UNSENT`, `SENDING`) retain their old meaning;
-no existing `MANUAL` run is silently made controller-owned. Unresolved legacy
-states block that site's new watering until the offline upgrade procedure below.
-A legacy unsent command is cancelled without irrigation credit. A possibly sent
-command is closed/read and retains uncertain delivery; historical timing, rates,
-settings and completed records are preserved.
+Manual actions and the controller can issue commands concurrently, as in the
+previous release. Their ordering can shorten a watering pulse or allow a delayed
+timed opening after a Close action. Web controls also cannot see an in-memory
+group reservation during a break, so manual intervention may interrupt a group.
+Every opening still carries its own relay timeout. A failed early close may leave
+watering active until that timeout. Existing overlapping single-valve Fixed runs
+also retain their released behavior; their stop commands can shorten a later
+pulse. These are accepted operating limits, not pending coordination work.
 
 Page-wide warnings, errors, and action results appear above the page heading.
 Failed forms show a red summary linking to invalid fields, alongside inline
-errors; entered values are retained. Valve/rule-specific diagnostics and past
-run decisions stay beside their records. Curve settings cannot be deleted in
-Admin, because silently restoring defaults would bypass reservation checks;
-use the Curve page to edit or reset settings with validation.
+errors; entered values are retained. Valve/rule-specific diagnostics remain
+beside their records. Smart calculation details are available in Preview.
 
 ## Upgrade and Verification
 
-For the controller-command upgrade:
+Remaining operational limits and optional follow-up work are triaged in
+[docs/ISSUES.md](docs/ISSUES.md). They are not a mandate for additional infrastructure.
 
-1. Back up the persistent database. Stop **all old web and controller processes**;
-   a paused old process must never resume sending commands after reconciliation.
-2. Apply migrations through `0011_controller_commands` from an upgraded
-   maintenance container/process using the existing database volume. Migration
-   preserves all old run fields, rule IDs, durations (including 2700 seconds),
-   calibration and occurrence snapshots. It adds closure requests and distinct
-   controller dispatch values; it does not rewrite old sender ownership.
-3. With old processes still stopped, run
-   `python manage.py reconcile_openings --senders-stopped` using the normal relay
-   connection. This maintenance command only closes/reads; it never opens valves.
-   If closure/database access fails it exits with an error. Restore access and
-   repeat until no unresolved run or close request remains. Do not use this
-   command alongside a live controller or old web sender.
-4. Start the upgraded web app and **exactly one** upgraded controller. Startup
-   cancels stale manual requests/groups and reconciles interrupted controller
-   attempts. Routine new web failures no longer require maintenance recovery.
+For this upgrade:
 
-Keep SQLite on the mounted `/data` volume or use Postgres. Docker's startup
-migration step still applies schema changes, but does not replace stopped-process
-reconciliation for legacy in-flight commands. No host cron/systemd, additional
-worker, dependency, or environment variable is required. No deployment or
-hardware commissioning is part of the automated test suite.
+1. Back up the persistent database and stop **all old web and controller
+   processes**. Allow active relay timers to finish before applying the upgrade;
+   the maximum timer is 3276 seconds from its last opening command.
+2. Apply migrations through `0013_in_memory_group_sequences` using the existing
+   database volume. The forward cleanup preserves rule IDs, saved durations,
+   calibration and actual attempted watering. It removes obsolete command-queue
+   and occurrence state, including unattempted future pulse logs and stored
+   zero/skipped decisions. No migration actuates hardware or replays watering.
+3. Start the upgraded web app and **exactly one** upgraded controller. No separate
+   reconciliation command is required; manual controls are immediately available
+   through the service layer.
+
+Keep SQLite on the mounted `/data` volume or use Postgres. Docker's existing
+startup migration step applies schema changes. No host cron/systemd, additional
+worker, dependency or environment variable is required. Automated tests use
+disposable databases and mocked hardware; they do not commission a physical relay.
 
 The fallback migration fills missing temperatures with 25 °C and adds standard
 curve settings for existing sites without a settings row. Existing temperature
@@ -531,12 +488,10 @@ overrides are preserved. Valve rates remain nullable/N/A; no calibration or
 historical run rate is invented. Updating a Docker image requires no new
 environment configuration for these defaults.
 
-The sender-state migration adds bookkeeping without changing saved durations,
-rate snapshots, or historical decisions. Older two-pass occurrences retain their
-recorded meaning. New Smart occurrences use the revised finite sequence and
-break policy. No new dependency or environment variable is required. Docker's
-existing startup migration step applies the schema changes; keep only one
-controller and stop the old web process as part of the upgrade.
+Previously applied migrations remain unchanged. The forward cleanup migration
+supports both an upgrade from v0.1.4 and databases that already applied the
+development migrations through `0012`; `0013` removes the obsolete persistent
+execution state.
 
 The migration converts every legacy `DYNAMIC` rule to Fixed at its stored
 maximum duration, including disabled rules and inactive schedules. IDs and all
@@ -562,3 +517,6 @@ The empty database variables select the default SQLite configuration expected by
 the configuration-warning test; Django uses a temporary test database. For
 Postgres verification, point the same test command at a disposable local cluster
 with a dedicated test role/database. Never use production credentials for tests.
+
+[PLANS.md](PLANS.md) records the current implementation and verification scope.
+[docs/ISSUES.md](docs/ISSUES.md) records accepted limits and remaining findings.

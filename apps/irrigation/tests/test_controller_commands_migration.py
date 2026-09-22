@@ -1,18 +1,17 @@
+"""Upgrade keeps actual watering and configuration, removing execution state."""
 import datetime as dt
-import io
 from unittest import mock
 
-from django.core.exceptions import ValidationError
-from django.core.management import call_command
-from django.core.management.base import CommandError
+from django.core.exceptions import FieldDoesNotExist
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
 
 
 class ControllerCommandsMigrationTests(TransactionTestCase):
-    before = ("irrigation", "0010_irrigationrun_dispatch_state")
-    after = ("irrigation", "0011_controller_commands")
+    released = ("irrigation", "0006_relay_flash_duration_limits")
+    queued = ("irrigation", "0011_controller_commands")
+    current = ("irrigation", "0013_in_memory_group_sequences")
     instant = dt.datetime(2026, 9, 21, 6, tzinfo=dt.timezone.utc)
 
     def migrate(self, target):
@@ -24,248 +23,275 @@ class ControllerCommandsMigrationTests(TransactionTestCase):
         executor = MigrationExecutor(connection)
         executor.migrate(executor.loader.graph.leaf_nodes())
 
-    def populate_legacy(self, apps):
+    def populate_site(self, apps):
         def model(name):
             return apps.get_model("irrigation", name)
 
-        site = model("Site").objects.create(name="Legacy", timezone="UTC")
+        site = model("Site").objects.create(name="Existing garden", timezone="UTC")
         schedule = model("Schedule").objects.create(site=site, name="Original")
         site.active_schedule = schedule
         site.save(update_fields=["active_schedule"])
-        model("CurveSettings").objects.create(
-            site=site, coverage_days=3, fallback_temperature_c=22.5,
-        )
         device = model("RelayDevice").objects.create(
-            site=site, name="Mock relay", host="test.invalid",
+            site=site, name="Relay", host="test.invalid",
         )
-        valves = [model("Valve").objects.create(
-            relay_device=device, channel=index + 1, name=f"Valve {index}",
-            default_max_duration_seconds=600, application_rate_mm_h=12.5,
-        ) for index in range(4)]
+        valve = model("Valve").objects.create(
+            relay_device=device, channel=1, name="Lawn",
+            default_max_duration_seconds=2700,
+        )
+        model("CurveSettings").objects.create(
+            site=site, min_mm=1.5, max_mm=8, g=0.4, m=24,
+        )
         model("ScheduleRule").objects.create(
-            schedule=schedule, valve=valves[0], mode="FIXED",
+            schedule=schedule, valve=valve, mode="FIXED", enabled=True,
             days_of_week_mask=21, start_time=dt.time(8),
-            max_duration_seconds=2700, note="Saved 45-minute override",
+            max_duration_seconds=2700, note="Saved 45-minute runtime",
         )
-        rule = model("GroupedRule").objects.create(
-            schedule=schedule, mode="SMART", days_of_week_mask=42,
-            start_time=dt.time(10), note="Saved Smart settings",
-        )
-        model("GroupedRuleValve").objects.create(
-            rule=rule, valve=valves[0], order=0, duration_seconds=2700,
-        )
-        occurrence = model("RuleOccurrence").objects.create(
-            site=site, rule=rule, mode="SMART", source="SCHEDULED",
-            requested_at=self.instant, decision_at=self.instant,
-            scheduled_at=self.instant, scheduled_local_date=self.instant.date(),
-            reservation_end=self.instant + dt.timedelta(hours=4),
-            status="FINISHED", outcome="Preserve original decision",
-            config={"members": [{"valve_id": valves[0].pk,
-                                  "duration_seconds": 2700}],
-                    "pulse_budget": 3},
-            decision={"target_mm": 25, "coverage_days": 3},
-        )
-        run_model = model("IrrigationRun")
-        for valve, dispatch, status in zip(
-            valves,
-            ("UNSENT", "SENDING", "LEGACY", "LEGACY"),
-            ("PLANNED", "PLANNED", "PLANNED", "RUNNING"),
-        ):
-            run_model.objects.create(
-                valve=valve, trigger="MANUAL", status=status,
-                dispatch_state=dispatch,
-                requested_start_at=self.instant,
-                attempt_started_at=self.instant if status == "PLANNED" else None,
-                actual_start_at=self.instant if status == "RUNNING" else None,
-                max_duration_seconds=2700, optimal_duration_seconds=2700,
-                application_rate_mm_h=12.5,
-                delivery_uncertain=status == "PLANNED",
-                sender_interrupted=dispatch == "SENDING",
-                error_message="Original legacy sender history",
-            )
-        run_model.objects.create(
-            valve=valves[0], occurrence=occurrence, pass_number=1, member_order=0,
-            trigger="SCHEDULED", status="FINISHED", dispatch_state="DONE",
-            requested_start_at=self.instant - dt.timedelta(days=1),
-            planned_start_at=self.instant - dt.timedelta(days=1),
-            attempt_started_at=self.instant - dt.timedelta(days=1),
-            attempt_finished_at=self.instant - dt.timedelta(days=1)
-            + dt.timedelta(seconds=1),
-            actual_start_at=self.instant - dt.timedelta(days=1),
-            actual_stop_at=self.instant - dt.timedelta(days=1)
-            + dt.timedelta(seconds=2700),
-            closure_confirmed_at=self.instant - dt.timedelta(days=1)
-            + dt.timedelta(seconds=2701),
-            max_duration_seconds=2700, optimal_duration_seconds=2700,
-            application_rate_mm_h=12.5, stop_reason="COMPLETED",
-            delivery_uncertain=True, sender_interrupted=True,
-            error_message="Historical uncertain delivery must remain visible",
-        )
-        return site.pk, [valve.pk for valve in valves]
+        return site, schedule, valve
 
-    def test_populated_upgrade_preserves_all_history_settings_and_ownership(self):
-        old = self.migrate(self.before)
+    def assert_queue_removed(self, apps):
+        run_model = apps.get_model("irrigation", "IrrigationRun")
+        for name in (
+            "dispatch_state", "sender_interrupted", "occurrence", "pass_number",
+            "member_order", "cancellation_requested",
+        ):
+            with self.assertRaises(FieldDoesNotExist):
+                run_model._meta.get_field(name)
+        with self.assertRaises(LookupError):
+            apps.get_model("irrigation", "ValveClosure")
+        self.assertNotIn("irrigation_valveclosure", connection.introspection.table_names())
+        with self.assertRaises(LookupError):
+            apps.get_model("irrigation", "RuleOccurrence")
+        with self.assertRaises(FieldDoesNotExist):
+            apps.get_model("irrigation", "Site")._meta.get_field("admission_version")
+        self.assertNotIn("irrigation_ruleoccurrence", connection.introspection.table_names())
+
+    def test_released_database_upgrades_with_history_and_fixed_settings_intact(self):
+        old = self.migrate(self.released)
         try:
-            self.populate_legacy(old)
+            site, schedule, valve = self.populate_site(old)
+            inactive = old.get_model("irrigation", "Schedule").objects.create(
+                site=site, name="Inactive",
+            )
+            dynamic = old.get_model("irrigation", "ScheduleRule").objects.create(
+                schedule=inactive, valve=valve, mode="DYNAMIC", enabled=False,
+                days_of_week_mask=42, start_time=dt.time(10),
+                max_duration_seconds=2700, note="Preserve legacy settings",
+            )
+            old.get_model("irrigation", "IrrigationRun").objects.create(
+                valve=valve, trigger="MANUAL", status="FINISHED",
+                requested_start_at=self.instant, actual_start_at=self.instant,
+                optimal_duration_seconds=2700, max_duration_seconds=2700,
+                actual_stop_at=self.instant + dt.timedelta(seconds=2700),
+                stop_reason="COMPLETED", error_message="Original history",
+            )
+            names = (
+                "Site", "Schedule", "RelayDevice", "Valve", "CurveSettings",
+                "ScheduleRule", "IrrigationRun",
+            )
+            originals = {
+                name: list(old.get_model("irrigation", name).objects.order_by("pk").values())
+                for name in names
+            }
+            new = self.migrate(self.current)
+            for name, records in originals.items():
+                fields = tuple(records[0])
+                expected = [dict(row) for row in records]
+                if name == "ScheduleRule":
+                    for row in expected:
+                        if row["id"] == dynamic.pk:
+                            row["mode"] = "FIXED"
+                with self.subTest(model=name):
+                    self.assertEqual(
+                        list(new.get_model("irrigation", name).objects
+                             .order_by("pk").values(*fields)), expected,
+                    )
+            curve = new.get_model("irrigation", "CurveSettings").objects.get(site_id=site.pk)
+            self.assertEqual(curve.fallback_temperature_c, 25)
+            self.assertEqual(curve.coverage_days, 2)
+            self.assertIsNone(new.get_model("irrigation", "Valve").objects.get(
+                pk=valve.pk,
+            ).application_rate_mm_h)
+            self.assert_queue_removed(new)
+        finally:
+            self.restore_schema()
+
+    def test_development_upgrade_preserves_completed_smart_history_and_settings(self):
+        old = self.migrate(self.queued)
+        try:
+            site, schedule, valve = self.populate_site(old)
+            valve.application_rate_mm_h = 12.5
+            valve.save(update_fields=["application_rate_mm_h"])
+            old.get_model("irrigation", "CurveSettings").objects.filter(site=site).update(
+                coverage_days=3, fallback_temperature_c=22.5,
+            )
+            rule = old.get_model("irrigation", "GroupedRule").objects.create(
+                schedule=schedule, mode="SMART", days_of_week_mask=42,
+                start_time=dt.time(10), note="Saved Smart settings",
+            )
+            old.get_model("irrigation", "GroupedRuleValve").objects.create(
+                rule=rule, valve=valve, order=0, duration_seconds=2700,
+            )
+            occurrence = old.get_model("irrigation", "RuleOccurrence").objects.create(
+                site=site, rule=rule, mode="SMART", source="SCHEDULED",
+                requested_at=self.instant, decision_at=self.instant,
+                scheduled_at=self.instant, scheduled_local_date=self.instant.date(),
+                reservation_end=self.instant + dt.timedelta(hours=4),
+                status="FINISHED", outcome="Preserve original decision",
+                config={"members": [{"valve_id": valve.pk, "duration_seconds": 2700}],
+                        "pulse_budget": 3},
+                decision={"target_mm": 25, "coverage_days": 3},
+            )
+            old.get_model("irrigation", "IrrigationRun").objects.create(
+                valve=valve, occurrence=occurrence, pass_number=1, member_order=0,
+                trigger="SCHEDULED", status="FINISHED", dispatch_state="DONE",
+                attempt_started_at=self.instant, actual_start_at=self.instant,
+                attempt_finished_at=self.instant + dt.timedelta(seconds=1),
+                actual_stop_at=self.instant + dt.timedelta(seconds=2700),
+                closure_confirmed_at=self.instant + dt.timedelta(seconds=2701),
+                max_duration_seconds=2700, optimal_duration_seconds=2700,
+                application_rate_mm_h=12.5, stop_reason="COMPLETED",
+                delivery_uncertain=True, sender_interrupted=True,
+                error_message="Original uncertain delivery",
+            )
             names = (
                 "Site", "Schedule", "CurveSettings", "RelayDevice", "Valve",
                 "ScheduleRule", "GroupedRule", "GroupedRuleValve",
-                "RuleOccurrence", "IrrigationRun",
+                "IrrigationRun",
             )
-            originals = {
-                name: list(old.get_model("irrigation", name).objects
-                           .order_by("pk").values())
-                for name in names
-            }
-            new = self.migrate(self.after)
+            originals = {}
+            for name in names:
+                records = list(old.get_model("irrigation", name).objects.order_by("pk").values())
+                for row in records:
+                    for field in (
+                        "dispatch_state", "sender_interrupted", "occurrence_id",
+                        "pass_number", "member_order", "cancellation_requested",
+                        "admission_version",
+                    ):
+                        row.pop(field, None)
+                    if name == "IrrigationRun":
+                        row["trigger"] = "GROUP"
+                originals[name] = records
+            # Never turn unattempted future pulses into watering history.
+            old.get_model("irrigation", "IrrigationRun").objects.create(
+                valve=valve, occurrence=occurrence, pass_number=2, member_order=0,
+                trigger="SCHEDULED", status="PLANNED", dispatch_state="UNSENT",
+                planned_start_at=self.instant + dt.timedelta(hours=1),
+                max_duration_seconds=2700, optimal_duration_seconds=2700,
+            )
+            new = self.migrate(self.current)
             for name, records in originals.items():
                 with self.subTest(model=name):
                     self.assertEqual(
                         list(new.get_model("irrigation", name).objects
                              .order_by("pk").values()), records,
                     )
-            self.assertFalse(
-                new.get_model("irrigation", "ValveClosure").objects.exists()
-            )
-            self.assertEqual(
-                new.get_model("irrigation", "IrrigationRun")
-                ._meta.get_field("dispatch_state").default,
-                "DONE",
-            )
+            self.assert_queue_removed(new)
         finally:
             self.restore_schema()
 
-    def test_upgraded_manual_senders_require_explicit_stopped_process_reconciliation(self):
-        old = self.migrate(self.before)
+    def test_abandoned_requests_are_retired_without_replay_or_invented_delivery(self):
+        old = self.migrate(self.queued)
         try:
-            site_id, valve_ids = self.populate_legacy(old)
-            self.migrate(self.after)
-
-            from apps.irrigation import group_services
-            from apps.irrigation.balance import delivery_estimate
-            from apps.irrigation.models import IrrigationRun, Site, Valve
-
-            site = Site.objects.get(pk=site_id)
-            valve = Valve.objects.select_related("relay_device__site").get(
-                pk=valve_ids[0],
-            )
-            physical = {valve_id: True for valve_id in valve_ids}
-            physical[valve_ids[0]] = False  # UNSENT did not reach the relay.
-            history = IrrigationRun.objects.filter(trigger="SCHEDULED").values().get()
+            _, _, valve = self.populate_site(old)
+            run_model = old.get_model("irrigation", "IrrigationRun")
+            runs = {}
+            for state in ("QUEUED", "UNSENT", "OPENING", "SENDING"):
+                runs[state] = run_model.objects.create(
+                    valve=valve, trigger="MANUAL", status="PLANNED",
+                    dispatch_state=state, sender_interrupted=state == "SENDING",
+                    requested_start_at=self.instant,
+                    attempt_started_at=self.instant,
+                    max_duration_seconds=2700, optimal_duration_seconds=2700,
+                    application_rate_mm_h=12.5, delivery_uncertain=True,
+                )
+            old.get_model("irrigation", "ValveClosure").objects.create(valve=valve)
             with (
                 mock.patch("apps.irrigation.services.open_valve_for") as opening,
-                mock.patch(
-                    "apps.irrigation.services.close_valve",
-                    side_effect=lambda item: physical.update({item.pk: False}),
-                ) as closing,
-                mock.patch(
-                    "apps.irrigation.services.read_valve_state",
-                    side_effect=lambda item: physical[item.pk],
-                ),
+                mock.patch("apps.irrigation.services.close_valve") as closing,
+                mock.patch("apps.irrigation.services.read_valve_state") as reading,
             ):
-                group_services.recover_groups()
-                group_services.reconcile_attempts()
-                with self.assertRaises(ValidationError):
-                    group_services.request_single(valve, 2700)
-                self.assertEqual(
-                    list(IrrigationRun.objects.filter(trigger="MANUAL")
-                         .order_by("pk").values_list("dispatch_state", flat=True)),
-                    ["UNSENT", "SENDING", "LEGACY", "LEGACY"],
-                )
-                opening.assert_not_called()
-
-                call_command(
-                    "reconcile_openings", senders_stopped=True,
-                    stdout=io.StringIO(),
-                )
-                self.assertFalse(group_services._unresolved_runs(site).exists())
-                self.assertEqual(
-                    [call.args[0].pk for call in closing.call_args_list],
-                    valve_ids[1:],
-                )
-                self.assertFalse(any(physical.values()))
-                unsent = IrrigationRun.objects.get(valve=valve, trigger="MANUAL")
-                self.assertEqual(unsent.status, "FAILED")
-                self.assertIsNone(unsent.attempt_started_at)
-                self.assertFalse(unsent.delivery_uncertain)
-                estimate = delivery_estimate(unsent)
-                self.assertIsNone(estimate["estimated_mm"])
-                self.assertIsNone(estimate["nominal_mm"])
-                self.assertFalse(estimate["unknown_extra_delivery"])
-                self.assertEqual(
-                    IrrigationRun.objects.filter(pk=history["id"]).values().get(),
-                    history,
-                )
-                queued = group_services.request_single(valve, 2700)
-                self.assertEqual(queued.dispatch_state, "QUEUED")
-                self.assertIsNone(queued.attempt_started_at)
-                opening.assert_not_called()
+                new = self.migrate(self.current)
+            opening.assert_not_called()
+            closing.assert_not_called()
+            reading.assert_not_called()
+            run_model = new.get_model("irrigation", "IrrigationRun")
+            self.assertEqual(run_model.objects.count(), 4)
+            for state, previous in runs.items():
+                with self.subTest(state=state):
+                    run = run_model.objects.get(pk=previous.pk)
+                    self.assertEqual(run.status, "FAILED")
+                    self.assertIsNotNone(run.actual_stop_at)
+                    self.assertIsNone(run.actual_start_at)
+                    self.assertIsNone(run.attempt_finished_at)
+                    self.assertEqual(run.optimal_duration_seconds, 2700)
+                    self.assertEqual(run.application_rate_mm_h, 12.5)
+                    if state in ("QUEUED", "UNSENT"):
+                        self.assertEqual(run.stop_reason, "MANUAL_STOP")
+                        self.assertIsNone(run.attempt_started_at)
+                        self.assertFalse(run.delivery_uncertain)
+                        self.assertIn("queued opening cancelled", run.error_message)
+                    else:
+                        self.assertEqual(run.stop_reason, "ERROR")
+                        self.assertEqual(run.attempt_started_at, self.instant)
+                        self.assertTrue(run.delivery_uncertain)
+                        self.assertIn("delivery is uncertain", run.error_message)
+            self.assert_queue_removed(new)
         finally:
             self.restore_schema()
 
-    def test_failed_legacy_close_without_attempt_metadata_keeps_site_blocked(self):
-        old = self.migrate(self.before)
+    def test_sequence_cleanup_keeps_uncertain_attempts_and_actual_only_history(self):
+        old = self.migrate(("irrigation", "0012_remove_command_queue"))
         try:
-            site_id, valve_ids = self.populate_legacy(old)
-            old.get_model("irrigation", "IrrigationRun").objects.filter(
-                valve_id=valve_ids[2], trigger="MANUAL",
-            ).update(attempt_started_at=None)
-            self.migrate(self.after)
-
-            from apps.irrigation import group_services
-            from apps.irrigation.models import IrrigationRun, Site, Valve
-
-            site = Site.objects.get(pk=site_id)
-            valve = Valve.objects.select_related("relay_device__site").get(
-                pk=valve_ids[2],
+            site, schedule, valve = self.populate_site(old)
+            rule = old.get_model("irrigation", "GroupedRule").objects.create(
+                schedule=schedule, mode="SMART", start_time=dt.time(6),
+                days_of_week_mask=127,
             )
-            other = Valve.objects.select_related("relay_device__site").get(
-                pk=valve_ids[0],
+            occurrence = old.get_model("irrigation", "RuleOccurrence").objects.create(
+                site=site, rule=rule, mode="SMART", source="SCHEDULED",
+                requested_at=self.instant, status="ACTIVE",
             )
-            physical = {valve_id: False for valve_id in valve_ids}
-            physical[valve.pk] = True
-
-            def close(item):
-                if item.pk == valve.pk:
-                    raise RuntimeError("Legacy relay unavailable")
-                physical[item.pk] = False
-
+            runs = old.get_model("irrigation", "IrrigationRun").objects
+            uncertain = runs.create(
+                valve=valve, occurrence=occurrence, pass_number=1,
+                trigger="SCHEDULED", status="FAILED", max_duration_seconds=600,
+                attempt_started_at=self.instant, delivery_uncertain=True,
+                actual_stop_at=self.instant, application_rate_mm_h=7,
+                error_message="Interrupted relay command",
+            )
+            actual_only = runs.create(
+                valve=valve, occurrence=occurrence, pass_number=2,
+                trigger="SCHEDULED", status="FINISHED", max_duration_seconds=600,
+                actual_start_at=self.instant,
+                actual_stop_at=self.instant + dt.timedelta(seconds=600),
+            )
+            runs.create(
+                valve=valve, occurrence=occurrence, pass_number=3,
+                trigger="SCHEDULED", status="FAILED", max_duration_seconds=600,
+                actual_stop_at=self.instant, error_message="Never attempted",
+            )
             with (
                 mock.patch("apps.irrigation.services.open_valve_for") as opening,
-                mock.patch(
-                    "apps.irrigation.services.close_valve", side_effect=close,
-                ) as closing,
-                mock.patch(
-                    "apps.irrigation.services.read_valve_state",
-                    side_effect=lambda item: physical[item.pk],
-                ),
+                mock.patch("apps.irrigation.services.close_valve") as closing,
             ):
-                with self.assertRaisesMessage(CommandError, "1 run(s)"):
-                    call_command(
-                        "reconcile_openings", senders_stopped=True,
-                        stdout=io.StringIO(),
-                    )
-                legacy = IrrigationRun.objects.get(valve=valve, trigger="MANUAL")
-                self.assertEqual(legacy.dispatch_state, "DONE")
-                self.assertIsNone(legacy.attempt_started_at)
-                self.assertIsNone(legacy.closure_confirmed_at)
-                self.assertTrue(legacy.cancellation_requested)
-                self.assertEqual(group_services._unresolved_runs(site).count(), 1)
-                for target in (valve, other):
-                    with self.subTest(valve=target.pk):
-                        with self.assertRaises(ValidationError):
-                            group_services.request_single(target, 60)
-                opening.assert_not_called()
-
-                closing.side_effect = lambda item: physical.update({item.pk: False})
-                call_command(
-                    "reconcile_openings", senders_stopped=True,
-                    stdout=io.StringIO(),
-                )
-                legacy.refresh_from_db()
-                self.assertIsNotNone(legacy.closure_confirmed_at)
-                self.assertFalse(group_services._unresolved_runs(site).exists())
-                group_services.request_single(valve, 60)
-                opening.assert_not_called()
+                new = self.migrate(self.current)
+            opening.assert_not_called()
+            closing.assert_not_called()
+            runs = new.get_model("irrigation", "IrrigationRun").objects
+            self.assertEqual(set(runs.values_list("pk", flat=True)), {
+                uncertain.pk, actual_only.pk,
+            })
+            self.assertEqual(set(runs.values_list("trigger", flat=True)), {"GROUP"})
+            kept = runs.get(pk=uncertain.pk)
+            self.assertEqual(kept.attempt_started_at, self.instant)
+            self.assertIsNone(kept.actual_start_at)
+            self.assertIsNone(kept.attempt_finished_at)
+            self.assertTrue(kept.delivery_uncertain)
+            self.assertIsNone(kept.closure_confirmed_at)
+            self.assertEqual(kept.application_rate_mm_h, 7)
+            self.assertEqual(kept.error_message, "Interrupted relay command")
+            self.assertEqual(runs.get(pk=actual_only.pk).actual_stop_at,
+                             self.instant + dt.timedelta(seconds=600))
+            self.assert_queue_removed(new)
         finally:
             self.restore_schema()

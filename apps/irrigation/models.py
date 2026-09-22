@@ -7,7 +7,6 @@ from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.utils import timezone
 
 from apps.irrigation.curves import (
     DEFAULT_G,
@@ -44,7 +43,6 @@ def validate_application_rate(value: float) -> None:
 
 
 class Site(models.Model):
-    admission_version = models.PositiveBigIntegerField(default=0, editable=False)
     name = models.CharField(max_length=100)
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
@@ -368,92 +366,16 @@ class GroupedRuleValve(models.Model):
             raise ValidationError(errors)
 
 
-class RuleOccurrence(models.Model):
-    SOURCE_SCHEDULED = "SCHEDULED"
-    SOURCE_MANUAL = "MANUAL"
-    STATUS_PENDING = "PENDING"
-    STATUS_ACTIVE = "ACTIVE"
-    STATUS_STOPPING = "STOPPING"
-    STATUS_FINISHED = "FINISHED"
-    STATUS_SKIPPED = "SKIPPED"
-    STATUS_CANCELLED = "CANCELLED"
-    STATUS_FAILED = "FAILED"
-    STATUS_ZERO = "ZERO"
-    STATUS_CHOICES = [(value, value.title()) for value in (
-        "PENDING", "ACTIVE", "STOPPING", "FINISHED", "SKIPPED",
-        "CANCELLED", "FAILED", "ZERO",
-    )]
-
-    site = models.ForeignKey(Site, on_delete=models.CASCADE)
-    rule = models.ForeignKey(
-        GroupedRule, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="occurrences",
-    )
-    mode = models.CharField(max_length=10, choices=GroupedRule.MODE_CHOICES)
-    config = models.JSONField(default=dict)
-    decision = models.JSONField(default=dict)
-    scheduled_local_date = models.DateField(null=True, blank=True)
-    scheduled_at = models.DateTimeField(null=True, blank=True)
-    requested_at = models.DateTimeField()
-    decision_at = models.DateTimeField(null=True, blank=True)
-    reservation_end = models.DateTimeField(null=True, blank=True)
-    source = models.CharField(max_length=10, choices=[
-        (SOURCE_SCHEDULED, "Scheduled"), (SOURCE_MANUAL, "Manual"),
-    ])
-    status = models.CharField(
-        max_length=10, choices=STATUS_CHOICES, default=STATUS_PENDING
-    )
-    cancellation_requested = models.BooleanField(default=False)
-    outcome = models.TextField(blank=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["rule", "scheduled_local_date"], name="unique_rule_local_date"
-            ),
-        ]
-        indexes = [
-            models.Index(fields=["site", "status"], name="occurrence_site_status")
-        ]
-
-    def __str__(self):
-        return f"{self.get_mode_display()} {self.requested_at} ({self.status})"
-
-
-class ValveClosure(models.Model):
-    """Coalesced close intent, including valves with no watering record."""
-
-    valve = models.OneToOneField(
-        Valve, on_delete=models.CASCADE, related_name="closure_request",
-    )
-    requested_at = models.DateTimeField(default=timezone.now)
-    confirmed_at = models.DateTimeField(null=True, blank=True)
-    error_message = models.TextField(blank=True)
-
-
 class IrrigationRun(models.Model):
-    # Historical evidence only: retained for pre-controller-command records.
-    sender_interrupted = models.BooleanField(default=False, editable=False)
-    dispatch_state = models.CharField(
-        max_length=8,
-        choices=[
-            ("LEGACY", "Legacy"),
-            ("UNSENT", "Legacy unsent"),
-            ("SENDING", "Legacy sender in flight"),
-            ("QUEUED", "Queued"),
-            ("OPENING", "Controller opening"),
-            ("DONE", "Dispatch complete"),
-        ],
-        default="DONE",
-        editable=False,
-    )
     TRIGGER_SCHEDULED = "SCHEDULED"
+    TRIGGER_GROUP = "GROUP"
     TRIGGER_MANUAL = "MANUAL"
     TRIGGER_FAILSAFE = "FAILSAFE"
     TRIGGER_RECOVERY = "RECOVERY"
 
     TRIGGER_CHOICES = [
         (TRIGGER_SCHEDULED, "Scheduled"),
+        (TRIGGER_GROUP, "Scheduled group"),
         (TRIGGER_MANUAL, "Manual"),
         (TRIGGER_FAILSAFE, "Failsafe"),
         (TRIGGER_RECOVERY, "Recovery"),
@@ -484,18 +406,11 @@ class IrrigationRun(models.Model):
     ]
 
     valve = models.ForeignKey(Valve, on_delete=models.CASCADE)
-    occurrence = models.ForeignKey(
-        RuleOccurrence, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="runs",
-    )
-    pass_number = models.PositiveSmallIntegerField(null=True, blank=True)
-    member_order = models.PositiveSmallIntegerField(null=True, blank=True)
     attempt_started_at = models.DateTimeField(null=True, blank=True)
     attempt_finished_at = models.DateTimeField(null=True, blank=True)
     application_rate_mm_h = models.FloatField(null=True, blank=True)
     delivery_uncertain = models.BooleanField(default=False)
     closure_confirmed_at = models.DateTimeField(null=True, blank=True)
-    cancellation_requested = models.BooleanField(default=False)
     trigger = models.CharField(max_length=10, choices=TRIGGER_CHOICES)
     requested_start_at = models.DateTimeField(null=True, blank=True)
     planned_start_at = models.DateTimeField(null=True, blank=True)
@@ -522,12 +437,6 @@ class IrrigationRun(models.Model):
     error_message = models.TextField(blank=True)
 
     class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=["occurrence", "valve", "pass_number"],
-                name="unique_occurrence_valve_pass",
-            )
-        ]
         indexes = [
             models.Index(fields=["status"], name="irrigation__status_idx"),
             models.Index(fields=["planned_start_at"], name="irrigation__planned_idx"),

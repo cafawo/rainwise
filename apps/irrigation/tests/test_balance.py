@@ -26,7 +26,6 @@ from apps.irrigation.models import (
     GroupedRuleValve,
     IrrigationRun,
     RelayDevice,
-    RuleOccurrence,
     Schedule,
     ScheduleRule,
     Site,
@@ -238,27 +237,33 @@ class BalanceTests(TestCase):
         self.assertEqual(selected["latest_valid_at"], old_time.isoformat())
         self.assertTrue(selected["fallback"])
 
-    def test_stale_weather_and_resolved_history_warning(self):
+    def test_stale_weather_uses_fallback_without_inventing_missing_history(self):
         end = self.at.replace(minute=0) - dt.timedelta(hours=6)
         self.hourly(end - dt.timedelta(hours=17), end)
         selected = temperature_selection(self.site, self.at)
         self.assertEqual(selected["valid_hours"], 18)
         self.assertTrue(selected["fallback"])
         self.assertIn("older", selected["reason"])
-        self.assertTrue(irrigation_credit(self.valve, self.at, 2)["incomplete_history"])
-        RuleOccurrence.objects.create(
-            site=self.site, mode="SMART", source="SCHEDULED", status="ZERO",
-            requested_at=self.at - dt.timedelta(days=3),
-            decision_at=self.at - dt.timedelta(days=3),
-        )
         self.assertFalse(irrigation_credit(self.valve, self.at, 2)["incomplete_history"])
 
-    def test_build_decision_uses_shared_fallback_and_first_activation_warning(self):
+    def test_history_warning_counts_only_uncalibrated_delivery_in_the_window(self):
+        self.assertFalse(irrigation_credit(self.valve, self.at, 2)["incomplete_history"])
+        run = self.run_record(self.at - dt.timedelta(hours=1), 600)
+        run.application_rate_mm_h = None
+        run.save(update_fields=["application_rate_mm_h"])
+        credit = irrigation_credit(self.valve, self.at, 2)
+        self.assertTrue(credit["incomplete_history"])
+        self.assertEqual(credit["uncalibrated_runs"], 1)
+        self.assertEqual(credit["credit_mm"], 0)
+        later = self.at + dt.timedelta(days=2)
+        self.assertFalse(irrigation_credit(self.valve, later, 2)["incomplete_history"])
+
+    def test_build_decision_uses_shared_fallback_without_first_activation_warning(self):
         members = [SimpleNamespace(valve=self.valve, order=0, duration_seconds=900)]
         decision = build_smart_decision(self.site, members, self.at)
         self.assertTrue(decision["temperature"]["fallback"])
         self.assertTrue(decision["rain"]["warning"])
-        self.assertTrue(decision["valves"][str(self.valve.pk)]["irrigation"]["incomplete_history"])
+        self.assertFalse(decision["valves"][str(self.valve.pk)]["irrigation"]["incomplete_history"])
         self.assertGreater(decision["valves"][str(self.valve.pk)]["planned_seconds"], 0)
         self.curve.fallback_temperature_c = float("inf")
         self.curve.save()
@@ -388,24 +393,23 @@ class GroupModelTests(TestCase):
         self.valve = self.device.valve_set.create(name="Lawn", channel=1)
         self.rule = GroupedRule.objects.create(schedule=self.schedule, mode="FIXED", start_time="06:00")
 
-    def test_membership_and_occurrence_constraints_and_preserved_history(self):
+    def test_membership_constraints_and_preserved_watering_history(self):
         GroupedRuleValve.objects.create(rule=self.rule, valve=self.valve, order=0, duration_seconds=120)
         with self.assertRaises(IntegrityError), transaction.atomic():
             GroupedRuleValve.objects.create(rule=self.rule, valve=self.valve, order=1, duration_seconds=120)
         at = dt.datetime(2026, 7, 8, 4, tzinfo=UTC)
-        occurrence = RuleOccurrence.objects.create(
-            site=self.site, rule=self.rule, mode="FIXED", requested_at=at,
-            source="SCHEDULED", scheduled_local_date=at.date(), config={"saved": True},
+        run = IrrigationRun.objects.create(
+            valve=self.valve, trigger="MANUAL", status="FINISHED",
+            requested_start_at=at, actual_start_at=at,
+            actual_stop_at=at + dt.timedelta(seconds=120),
+            optimal_duration_seconds=120, max_duration_seconds=120,
+            application_rate_mm_h=12,
         )
-        with self.assertRaises(IntegrityError), transaction.atomic():
-            RuleOccurrence.objects.create(
-                site=self.site, rule=self.rule, mode="FIXED", requested_at=at,
-                source="SCHEDULED", scheduled_local_date=at.date(),
-            )
         self.rule.delete()
-        occurrence.refresh_from_db()
-        self.assertIsNone(occurrence.rule_id)
-        self.assertEqual(occurrence.config, {"saved": True})
+        run.refresh_from_db()
+        self.assertEqual(run.optimal_duration_seconds, 120)
+        self.assertEqual(run.application_rate_mm_h, 12)
+        self.assertEqual(run.status, "FINISHED")
 
     def test_fixed_legacy_spelling_saves_and_displays_fixed(self):
         rule = ScheduleRule(

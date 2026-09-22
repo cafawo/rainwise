@@ -2,7 +2,6 @@ from django import forms
 from django.contrib import admin
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Q
 from django.urls import reverse
 from django.utils.html import format_html
 
@@ -15,7 +14,7 @@ class SiteAdminForm(forms.ModelForm):
 
     class Meta:
         model = models.Site
-        exclude = ("admission_version",)
+        fields = "__all__"
 
     def clean_active_schedule(self):
         schedule = self.cleaned_data.get("active_schedule")
@@ -31,66 +30,21 @@ class SiteAdmin(admin.ModelAdmin):
     form = SiteAdminForm
     list_display = ("name", "timezone", "latitude", "longitude", "active_schedule")
 
-    def save_model(self, request, obj, form, change):
-        if change:
-            with group_services.site_admission(obj):
-                previous = models.Site.objects.get(pk=obj.pk)
-                if previous.active_schedule_id != obj.active_schedule_id:
-                    group_services.cancel_site_groups(obj, "Active schedule changed")
-                # Preserve the admission counter increment from this transaction.
-                obj.admission_version = previous.admission_version
-                super().save_model(request, obj, form, change)
-        else:
-            super().save_model(request, obj, form, change)
-
-
-
-def _has_unresolved_runs(query):
-    ids = query.values("pk")
-    return (group_services._unresolved_runs().filter(pk__in=ids).exists()
-            or group_services._legacy_unresolved().filter(pk__in=ids).exists())
-
 
 def _validate_reservation_change(candidate, site):
-    """Check the proposed values without persisting a failed admin form.
-
-    The enclosing admin transaction retains admission ownership through the
-    actual save. Only the inner probe is rolled back, including on success.
-    """
+    """Validate proposed settings without saving a failed admin form."""
     candidate.full_clean()
-    with group_services.site_admission(site):
-        with transaction.atomic():
-            candidate.save()
-            for schedule in models.Schedule.objects.filter(site=site):
-                group_services.validate_schedule(schedule)
-            transaction.set_rollback(True)
+    with transaction.atomic():
+        candidate.save()
+        for schedule in models.Schedule.objects.filter(site=site):
+            group_services.validate_schedule(schedule)
+        transaction.set_rollback(True)
 
 
 class RelayDeviceAdminForm(forms.ModelForm):
     class Meta:
         model = models.RelayDevice
         fields = "__all__"
-
-    def clean(self):
-        cleaned = super().clean()
-        if self.instance.pk and any(
-            field in self.changed_data for field in ("host", "port", "unit_id", "site")
-        ):
-            original = models.RelayDevice.objects.select_related("site").get(
-                pk=self.instance.pk
-            )
-            # Admin keeps its surrounding transaction until save completes.
-            with group_services.site_admission(original.site):
-                if _has_unresolved_runs(models.IrrigationRun.objects.filter(
-                    valve__relay_device=original
-                )) or models.ValveClosure.objects.filter(
-                    valve__relay_device=original, confirmed_at=None,
-                ).exists():
-                    raise ValidationError(
-                        "Stop watering and wait for confirmed closure before "
-                        "changing relay hardware identity."
-                    )
-        return cleaned
 
 
 class ValveAdminForm(forms.ModelForm):
@@ -104,23 +58,6 @@ class ValveAdminForm(forms.ModelForm):
 
     def clean(self):
         cleaned = super().clean()
-        if self.instance.pk and any(
-            field in self.changed_data
-            for field in ("relay_device", "channel", "is_active_high")
-        ):
-            original = models.Valve.objects.select_related(
-                "relay_device__site"
-            ).get(pk=self.instance.pk)
-            with group_services.site_admission(original.relay_device.site):
-                if _has_unresolved_runs(models.IrrigationRun.objects.filter(
-                    valve=original
-                )) or models.ValveClosure.objects.filter(
-                    valve=original, confirmed_at=None,
-                ).exists():
-                    raise ValidationError(
-                        "Stop watering and wait for confirmed closure before "
-                        "changing valve hardware identity."
-                    )
         if (
             not self.errors and self.instance.pk
             and "application_rate_mm_h" in self.changed_data
@@ -141,26 +78,6 @@ class RelayDeviceAdmin(admin.ModelAdmin):
     list_display = ("name", "host", "port", "unit_id", "enabled")
     list_filter = ("enabled",)
 
-    def has_delete_permission(self, request, obj=None):
-        if obj and models.ValveClosure.objects.filter(
-            valve__relay_device=obj, confirmed_at=None,
-        ).exists():
-            return False
-        return super().has_delete_permission(request, obj)
-
-    def save_model(self, request, obj, form, change):
-        with group_services.site_admission(obj.site):
-            if not obj.enabled and change:
-                occurrences = models.RuleOccurrence.objects.filter(
-                    site=obj.site, status__in=group_services.RESERVED_STATUSES
-                ).filter(
-                    Q(runs__valve__relay_device=obj)
-                    | Q(rule__members__valve__relay_device=obj)
-                ).distinct()
-                for occurrence in occurrences:
-                    group_services.cancel_occurrence(occurrence, "Relay disabled")
-            super().save_model(request, obj, form, change)
-
 
 @admin.register(models.Valve)
 class ValveAdmin(admin.ModelAdmin):
@@ -178,20 +95,11 @@ class ValveAdmin(admin.ModelAdmin):
     )
     list_filter = ("relay_device", "is_active_high")
 
-    def has_delete_permission(self, request, obj=None):
-        if obj and models.ValveClosure.objects.filter(valve=obj, confirmed_at=None).exists():
-            return False
-        return super().has_delete_permission(request, obj)
-
 
 class RuleConfigurationAdmin(admin.ModelAdmin):
-    """Use the common editor for mutations, including cancellation and conflicts."""
-    actions = None
+    """Use the shared editor for ordered members and reservation validation."""
 
     def has_add_permission(self, request):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
         return False
 
     def get_readonly_fields(self, request, obj=None):
@@ -245,22 +153,6 @@ class GroupedRuleAdmin(RuleConfigurationAdmin):
         return super().get_readonly_fields(request, obj) + ["ordered_valves"]
 
 
-@admin.register(models.RuleOccurrence)
-class RuleOccurrenceAdmin(admin.ModelAdmin):
-    list_display = ("site", "mode", "scheduled_local_date", "requested_at", "status", "outcome")
-    list_filter = ("site", "mode", "status")
-    actions = None
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-
 @admin.register(models.Schedule)
 class ScheduleAdmin(admin.ModelAdmin):
     list_display = ("name", "site", "created_at", "description")
@@ -268,10 +160,6 @@ class ScheduleAdmin(admin.ModelAdmin):
 
     def get_readonly_fields(self, request, obj=None):
         return ("site",) if obj else ()
-
-    def has_delete_permission(self, request, obj=None):
-        # Schedule configuration deletion must not cascade active groups silently.
-        return False
 
 
 @admin.register(models.IrrigationRun)
@@ -296,7 +184,6 @@ class IrrigationRunAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
-
 
 
 class CurveSettingsAdminForm(forms.ModelForm):

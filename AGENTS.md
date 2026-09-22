@@ -28,6 +28,16 @@ Repository-specific guidance for Codex agents working in this project.
   - If instructions are ambiguous or likely to lead to an inferior design, ask for clarification **before** implementing.
   - If multiple reasonable approaches exist, briefly explain trade-offs and recommend one.
 
+## Simplicity and approval boundaries
+
+- **Default to the smallest change that delivers the requested feature.** Preserve established, working behavior. A feature request or reliability review does not authorize redesigning unrelated systems, including the controller and valve controls.
+- **New database models/tables, additional persistent state, and substantive schema changes require explicit user approval before implementation.** First consider existing models, ordinary local logic, and temporary in-memory state where losing that state is acceptable. Persistence must provide substantial, concrete value that justifies its migration and maintenance cost.
+- **Additional architectural complexity also requires explicit user approval before implementation.** This includes new queues, workers, coordination mechanisms, recovery protocols, state machines, dependencies, and redesigns of working subsystems. Routine local changes within an already approved design do not require repeated approval.
+- **Present a concrete proposal before requesting approval.** Explain the user requirement it serves, the simplest viable alternative, why that alternative is insufficient, and the added behavior, failure modes, and maintenance cost. Generic claims such as "more robust," "safer," or "future-proof" are not sufficient justification.
+- **Respect accepted failure behavior and scope.** Do not add recovery, retry, resumption, or coordination machinery to eliminate a failure mode the user has explicitly accepted. Document unrelated concerns and continue the authorized work; raise any conflict with an explicit safety requirement before changing the design.
+- **Approval must cover the specific design change.** An agent-written entry in `PLANS.md`, a general instruction to implement a feature, or silence is not approval to add models or architectural complexity. Record explicit approval in `PLANS.md`; if that design was already approved, do not ask again.
+- **Apply these rules to reviews as well as new code.** Existing complexity is not justified merely because it has already been implemented. Identify unnecessary additions and propose a simpler alternative; obtain approval before removals that change agreed behavior or stored data.
+
 ## Critical guardrails for this project
 
 - **Never perform Modbus/hardware I/O in HTTP request/response code**

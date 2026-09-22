@@ -16,10 +16,6 @@
 
 {% block content %}
 <h1 class="h3 mb-3">Valves</h1>
-<p class="text-muted">Open and Close are requests. The controller processes them on
-  its next tick (every {{ controller_interval_seconds }} seconds). Refresh to see
-  confirmation or an error; queued requests have not opened a valve.</p>
-{% include "irrigation/occurrences.html" %}
 
 <div class="card">
   <div class="card-body">
@@ -61,7 +57,7 @@
                 {% endif %}
               </td>
               <td>
-                <span class="badge {% if valve.action_status == 'Failed' %}bg-danger{% elif valve.action_status == 'Stopping' %}bg-warning text-dark{% else %}bg-light text-dark{% endif %}">{{ valve.action_status }}</span>
+                <span class="badge {% if valve.action_status == 'Failed' %}bg-danger{% else %}bg-light text-dark{% endif %}">{{ valve.action_status }}</span>
                 {% if valve.action_error %}
                   <div class="text-danger small" role="alert">{{ valve.action_error }}</div>
                 {% endif %}

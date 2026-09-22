@@ -7,11 +7,9 @@
 <td>N/A</td><td>N/A</td><td>N/A</td><td>{{ row.skip_reason }}</td><td>N/A</td><td>N/A</td>
 {% else %}
 <td>{{ row.irrigation.credit_mm|floatformat:2 }} mm</td>
-<td>{{ row.target_mm|floatformat:2 }} mm</td><td>{% if row.peak_seconds != None %}{{ row.peak_seconds|duration }}{% elif row.capacity_mm != None %}Historical capacity: {{ row.capacity_mm|floatformat:2 }} mm{% else %}N/A{% endif %}</td>
+<td>{{ row.target_mm|floatformat:2 }} mm</td><td>{% if row.peak_seconds != None %}{{ row.peak_seconds|duration }}{% else %}N/A{% endif %}</td>
 <td>{% for seconds in row.pulse_seconds %}{{ seconds|duration }}{% if not forloop.last %} + {% endif %}{% empty %}Skip: no dose{% endfor %}</td>
 <td>{{ row.estimated_delivery_mm|floatformat:2 }} mm</td><td>{{ row.unmet_mm|floatformat:2 }} mm</td>
 {% endif %}
 </tr>
-{% for reason in row.execution_messages %}<tr><td colspan="7">{{ reason }}</td></tr>{% endfor %}
-{% if row.execution_unmet_mm != None %}<tr><td colspan="7">{{ row.valve_name }}: estimated execution delivery {{ row.execution_estimated_mm|floatformat:2 }} mm; remaining target {{ row.execution_unmet_mm|floatformat:2 }} mm{% if row.execution_uncertain %} (uncertain command; conservative estimate){% endif %}.</td></tr>{% endif %}
 {% endfor %}</tbody></table></div>

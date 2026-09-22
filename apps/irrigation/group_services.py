@@ -1,11 +1,8 @@
-"""Durable group planning and the shared, short per-site admission boundary.
-
-Only the controller advances groups. Hardware calls never run inside a database
-transaction; the committed attempt record is the recovery boundary.
-"""
+"""Rule validation, immediate controls and controller-owned in-memory sequences."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from collections import deque
+from dataclasses import dataclass, field
 import datetime as dt
 import logging
 import math
@@ -14,26 +11,20 @@ from zoneinfo import ZoneInfo
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.irrigation import services
 from apps.irrigation.models import (
-    GroupedRule, GroupedRuleValve, IrrigationRun,
-    RuleOccurrence, ScheduleRule, Site, Valve, ValveClosure, get_curve_settings,
-    normalize_rule_mode,
+    GroupedRule, GroupedRuleValve, IrrigationRun, RelayDevice,
+    ScheduleRule, Valve, get_curve_settings, normalize_rule_mode,
 )
 
 logger = logging.getLogger(__name__)
-RESERVED_STATUSES = ("PENDING", "ACTIVE", "STOPPING")
-MISSING_RATE_SKIP = "Skipped in Smart: enter a valid watering rate for this valve."
-SENDER_CANCELLED = (
-    "Opening cancelled before acknowledgement; physical delivery is uncertain."
-)
-SENDER_RETRIED = (
+UTC = dt.timezone.utc
+RETRIED_OPENING = (
     "Opening succeeded after a transport retry; physical delivery is uncertain."
 )
-UTC = dt.timezone.utc
 
 
 def controller_interval() -> int:
@@ -44,22 +35,7 @@ def controller_interval() -> int:
 
 
 def command_allowance() -> float:
-    # Connection plus header/body response timeouts, for every configured try.
     return 3 * services.MODBUS_TIMEOUT_SECONDS * (services.MODBUS_RETRIES + 1)
-
-
-@contextmanager
-def site_admission(site):
-    """An UPDATE obtains the write lock on both SQLite and PostgreSQL.
-
-    It must be the first query in the transaction, avoiding SQLite's deferred
-    read-to-write upgrade. This is admission serialization, not a hardware lock.
-    """
-    with transaction.atomic():
-        Site.objects.filter(pk=site.pk).update(
-            admission_version=F("admission_version") + 1
-        )
-        yield
 
 
 def members_for(rule):
@@ -226,528 +202,85 @@ def validate_schedule(schedule):
         validate_configuration(rule)
 
 
-def _reservations(site, exclude=None):
-    query = RuleOccurrence.objects.filter(site=site, status__in=RESERVED_STATUSES)
-    return query.exclude(pk=exclude.pk) if exclude else query
-
-
-def _unresolved_runs(site=None):
-    runs = IrrigationRun.objects.filter(
-        Q(status="RUNNING") |
-        Q(dispatch_state__in=("QUEUED", "OPENING", "UNSENT", "SENDING")) |
-        Q(cancellation_requested=True, closure_confirmed_at=None) |
-        Q(attempt_started_at__isnull=False, closure_confirmed_at__isnull=True)
-    )
-    return runs.filter(valve__relay_device__site=site) if site else runs
-
-
-def _group_conflict(site, occurrence=None):
-    runs = _unresolved_runs(site)
-    if occurrence:
-        runs = runs.exclude(occurrence=occurrence)
-    return (_legacy_unresolved(site).exists() or _pending_closures(site).exists()
-            or _reservations(site, occurrence).exists() or runs.exists()
-            or Valve.objects.filter(relay_device__site=site,
-                                    last_known_is_open=True).exclude(
-                pk__in=IrrigationRun.objects.filter(
-                    occurrence=occurrence, status="RUNNING"
-                ).values("valve_id")
-                if occurrence else []
-            ).exists())
-
-
-def assert_configuration_editable(rule):
-    site = rule.schedule.site
-    if isinstance(rule, GroupedRule):
-        if RuleOccurrence.objects.filter(rule=rule, status__in=RESERVED_STATUSES).exists():
-            raise ValidationError(
-                "Stop the rule and wait for confirmed closure before editing it."
-            )
-    elif (_reservations(site).exists()
-          or _unresolved_runs(site).filter(valve=rule.valve).exists()):
-        raise ValidationError(
-            "Stop watering and wait for confirmed closure before converting this rule."
-        )
-
-
-def cancel_occurrence(occurrence, reason="Stopped by user"):
-    with site_admission(occurrence.site):
-        changed = RuleOccurrence.objects.filter(
-            pk=occurrence.pk, status__in=RESERVED_STATUSES
-        ).update(cancellation_requested=True, status="STOPPING", outcome=reason)
-        if changed:
-            IrrigationRun.objects.filter(occurrence=occurrence).update(
-                cancellation_requested=True
-            )
-            IrrigationRun.objects.filter(
-                occurrence=occurrence, status="PLANNED", attempt_started_at=None,
-            ).update(
-                status="FAILED", stop_reason="MANUAL_STOP", error_message=reason,
-                closure_confirmed_at=timezone.now(), dispatch_state="DONE",
-                delivery_uncertain=False,
-            )
-
-
-def cancel_rule(rule, reason="Rule disabled or deleted"):
-    for occurrence in RuleOccurrence.objects.filter(rule=rule, status__in=RESERVED_STATUSES):
-        cancel_occurrence(occurrence, reason)
-
-
-def cancel_site_groups(site, reason="Active schedule changed"):
-    for occurrence in _reservations(site):
-        cancel_occurrence(occurrence, reason)
-
-
-def _pending_closures(site):
-    return ValveClosure.objects.filter(
-        valve__relay_device__site=site, confirmed_at=None,
-    )
-
-
-def _legacy_unresolved(site=None):
-    runs = IrrigationRun.objects.filter(
-        dispatch_state__in=("LEGACY", "UNSENT", "SENDING"),
-    ).filter(
-        Q(status__in=("PLANNED", "RUNNING"))
-        | Q(dispatch_state__in=("UNSENT", "SENDING"))
-        | Q(attempt_started_at__isnull=False, closure_confirmed_at=None)
-    )
-    return runs.filter(valve__relay_device__site=site) if site else runs
-
-
-def _closure_error(valve, *, close=True):
-    """Controller only: a fresh closed read can resolve a lost close response."""
-    error = ""
-    if close:
-        try:
-            services.close_valve(valve)
-        except Exception as exc:
-            error = f"Closure command failed: {exc}"
-    try:
-        if services.read_valve_state(valve):
-            error = error or "Valve remains open; closure will be retried."
-        else:
-            error = ""
-    except Exception as exc:
-        error = f"Closure not confirmed: {exc}"
-    return error
-
-
-def _confirmed_closed(run, *, close=False):
-    """Controller only: confirm closure after its preceding hardware work."""
-    run.refresh_from_db()
-    if _legacy_unresolved().filter(pk=run.pk).exists():
-        return False
-    error = _closure_error(run.valve, close=close)
-    if error:
-        run.error_message = error
-        IrrigationRun.objects.filter(pk=run.pk).exclude(error_message=error).update(
-            error_message=error,
-        )
-        return False
-    now = timezone.now()
-    updates = {}
-    if run.closure_confirmed_at is None:
-        updates["closure_confirmed_at"] = now
-    if run.status in ("RUNNING", "PLANNED"):
-        updates.update(status="FINISHED", actual_stop_at=now,
-                       stop_reason="MANUAL_STOP" if close else "COMPLETED")
-    # Publish completion and the cached physical state together. A failed write
-    # leaves the run unresolved; the next tick can only close/read it again.
-    with transaction.atomic():
-        if updates:
-            IrrigationRun.objects.filter(pk=run.pk).update(**updates)
-        Valve.objects.filter(pk=run.valve_id).filter(
-            Q(last_known_is_open=True) | Q(last_polled_at=None)
-        ).update(last_known_is_open=False, last_polled_at=now)
-    return True
-
-
-def _recover_returned_command(run, finished_at, error_message, *, started_at=None):
-    """Controller cleanup: close even when result storage is unavailable.
-
-    An unresolved OPENING is recovered on the next tick or restart, never replayed.
-    """
-    closed_at = None
-    try:
-        services.close_valve(run.valve)
-        closed_at = timezone.now()
-    except Exception:
-        logger.exception("Emergency close after opening failure failed")
-    try:
-        updates = dict(
-            dispatch_state="DONE", status="FAILED", cancellation_requested=True,
-            attempt_finished_at=finished_at, delivery_uncertain=True,
-            closure_confirmed_at=None, stop_reason="ERROR",
-            error_message=error_message,
-        )
-        if started_at is not None:
-            updates.update(
-                status="FINISHED", actual_start_at=started_at,
-                actual_stop_at=closed_at, stop_reason="MANUAL_STOP",
-            )
-        acknowledged = IrrigationRun.objects.filter(pk=run.pk).update(**updates)
-    except Exception:
-        logger.exception(
-            "Terminal opening acknowledgement failed for run %s", run.pk,
-        )
-        return
-    if not acknowledged:
-        return
-    try:
-        if run.occurrence_id:
-            cancel_occurrence(
-                run.occurrence, "Uncertain delivery; remaining target unmet",
-            )
-        _confirmed_closed(run)
-    except Exception:
-        logger.exception("Closure reconciliation failed for run %s", run.pk)
-
-
-def _send_claimed(run):
-    """Transmit one already committed logical attempt; never replay it."""
-    admission_site = run.occurrence.site if run.occurrence_id else run.valve.relay_device.site
-    with site_admission(admission_site):
-        run.refresh_from_db()
-        occurrence = run.occurrence
-        if run.dispatch_state != "QUEUED":
-            return run
-        if (occurrence and occurrence.mode == "SMART"
-                and not run.valve.has_valid_application_rate):
-            IrrigationRun.objects.filter(
-                pk=run.pk, status="PLANNED", actual_start_at=None,
-            ).update(
-                attempt_started_at=None, attempt_finished_at=None,
-                delivery_uncertain=False, dispatch_state="DONE",
-            )
-            _skip_uncalibrated_pulses(occurrence, valve_id=run.valve_id)
-            run.refresh_from_db()
-            return run
-        now = timezone.now()
-        reason = None
-        if (run.cancellation_requested
-                or (occurrence and occurrence.cancellation_requested)):
-            reason = "Cancelled before command"
-        elif now > (run.attempt_started_at or run.requested_start_at) + dt.timedelta(
-            seconds=command_allowance() + controller_interval()
-        ):
-            reason = "Opening dispatch window expired before command"
-        elif (_pending_closures(admission_site).exists()
-              or _legacy_unresolved(admission_site).exists()):
-            reason = "Closure or legacy reconciliation pending; opening cancelled"
-        elif not occurrence and (
-            _reservations(admission_site).exists()
-            or _unresolved_runs(admission_site).exclude(pk=run.pk).filter(
-                Q(valve=run.valve) | ~Q(
-                    status="RUNNING", cancellation_requested=False,
-                    delivery_uncertain=False,
-                )
-            ).exists()
-        ):
-            reason = "Conflicting watering or unconfirmed closure; opening cancelled"
-        elif not run.valve.relay_device.enabled:
-            reason = "Relay disabled before command"
-        elif occurrence:
-            rule = GroupedRule.objects.filter(pk=occurrence.rule_id).first()
-            member = GroupedRuleValve.objects.filter(
-                rule_id=occurrence.rule_id, valve=run.valve,
-            ).first()
-            site = Site.objects.get(pk=occurrence.site_id)
-            if (rule is None or not rule.enabled
-                    or rule.mode != occurrence.mode
-                    or rule.schedule.site_id != occurrence.site_id
-                    or run.valve.relay_device.site_id != occurrence.site_id
-                    or occurrence.config.get("schedule_id") != rule.schedule_id
-                    or occurrence.config.get("timezone", site.timezone) != site.timezone
-                    or site.active_schedule_id != rule.schedule_id
-                    or member is None
-                    or run.optimal_duration_seconds > member.duration_seconds):
-                reason = "Configuration changed before command"
-            elif now + dt.timedelta(
-                seconds=run.optimal_duration_seconds + command_allowance()
-            ) > occurrence.reservation_end:
-                reason = "Reservation deadline exhausted before command"
-        if reason:
-            IrrigationRun.objects.filter(pk=run.pk).update(
-                status="FAILED", attempt_started_at=None,
-                attempt_finished_at=now, delivery_uncertain=False,
-                closure_confirmed_at=now, dispatch_state="DONE",
-                error_message=reason, stop_reason="MANUAL_STOP",
-            )
-            if occurrence:
-                cancel_occurrence(occurrence, reason + "; remaining target unmet")
-            run.refresh_from_db()
-            return run
-        claimed = IrrigationRun.objects.filter(
-            pk=run.pk, status="PLANNED", dispatch_state="QUEUED",
-            cancellation_requested=False,
-        ).update(
-            dispatch_state="OPENING", attempt_started_at=now,
-            delivery_uncertain=True, closure_confirmed_at=None,
-        )
-        if not claimed:
-            run.refresh_from_db()
-            return run
-    # A durable OPENING marks the non-replay boundary before network I/O.
-    now = timezone.now()
-    if occurrence and now + dt.timedelta(
-        seconds=run.optimal_duration_seconds + command_allowance()
-    ) > occurrence.reservation_end:
-        IrrigationRun.objects.filter(pk=run.pk).update(
-            dispatch_state="DONE", status="FAILED", attempt_started_at=None,
-            attempt_finished_at=now, delivery_uncertain=False,
-            closure_confirmed_at=now,
-            error_message="Reservation deadline exhausted before transmission",
-        )
-        cancel_occurrence(occurrence, "Reservation deadline exhausted; target unmet")
-        run.refresh_from_db()
-        return run
+def _open_run(run):
+    """Use the unchanged timed relay command and record the actual attempt."""
+    started = timezone.now()
+    returned = None
     try:
         retried = services.open_valve_for(
             run.valve, run.optimal_duration_seconds,
         ) is True
+        returned = timezone.now()
+        IrrigationRun.objects.filter(pk=run.pk).update(
+            status="RUNNING", actual_start_at=started,
+            attempt_finished_at=returned, delivery_uncertain=retried,
+            error_message=RETRIED_OPENING if retried else "",
+        )
     except Exception as exc:
-        _recover_returned_command(run, timezone.now(), str(exc))
+        try:
+            IrrigationRun.objects.filter(pk=run.pk).update(
+                status="FAILED", stop_reason="ERROR", error_message=str(exc),
+                attempt_finished_at=returned or timezone.now(),
+                delivery_uncertain=True,
+            )
+        except Exception:
+            logger.exception("Could not record opening result for run %s", run.pk)
         raise
-    finished = timezone.now()
-    try:
-        acknowledged = IrrigationRun.objects.filter(
-            pk=run.pk, cancellation_requested=False,
-        ).update(
-            status="RUNNING", actual_start_at=now, attempt_finished_at=finished,
-            # A successful retry may have restarted the hardware timer.
-            delivery_uncertain=retried,
-            error_message=SENDER_RETRIED if retried else "",
-            dispatch_state="DONE",
-            closure_confirmed_at=None,
-        )
-    except Exception as persistence_error:
-        _recover_returned_command(
-            run, finished, f"Opening result could not be recorded: {persistence_error}",
-        )
-        raise
-    if not acknowledged:
-        # A web cancellation arrived during dispatch. Complete closure before
-        # this controller can perform any other opening.
-        _recover_returned_command(
-            run, finished, SENDER_CANCELLED, started_at=now,
-        )
     run.refresh_from_db()
-    if occurrence:
-        occurrence.refresh_from_db()
     return run
 
 
-def request_single(valve, duration, rule=None):
-    """HTTP service: persist intent only; controller dispatches on its next tick."""
-    return _admit_single(valve, duration, "MANUAL", rule=rule, queued=True)
+def _new_run(valve, duration, trigger, *, planned_start_at=None, maximum=None):
+    rate = valve.application_rate_mm_h if valve.has_valid_application_rate else None
+    return IrrigationRun.objects.create(
+        valve=valve, trigger=trigger, requested_start_at=timezone.now(),
+        planned_start_at=planned_start_at, status="PLANNED",
+        optimal_duration_seconds=duration,
+        max_duration_seconds=maximum or duration,
+        application_rate_mm_h=rate, attempt_started_at=timezone.now(),
+        delivery_uncertain=True,
+    )
 
 
 def start_single(valve, duration, trigger, planned_start_at=None, rule=None):
-    """Controller only: admit and dispatch a bounded single-valve pulse."""
-    run = _admit_single(valve, duration, trigger, planned_start_at, rule)
-    return _send_claimed(run) if run.dispatch_state == "QUEUED" else run
-
-
-def _admit_single(valve, duration, trigger, planned_start_at=None, rule=None, *, queued=False):
+    """Preserve immediate Fixed/manual starts, including the selected tick minute."""
     services._duration_to_flash_ticks(duration)
-    site = valve.relay_device.site
-    with site_admission(site):
-        site.refresh_from_db()
-        valve.refresh_from_db()
-        valve.relay_device.refresh_from_db()
-        if valve.relay_device.site_id != site.pk:
-            raise ValidationError("Valve ownership changed before admission.")
-        if not valve.relay_device.enabled:
-            raise ValidationError("Relay device is disabled.")
-        now = timezone.now()
-        if trigger == "SCHEDULED" and rule is not None:
-            current_rule = ScheduleRule.objects.filter(pk=rule.pk).select_related(
-                "schedule", "valve__relay_device",
-            ).first()
-            local = now.astimezone(ZoneInfo(site.timezone))
-            due_minute = local.replace(second=0, microsecond=0).astimezone(UTC)
-            if (current_rule is None or not current_rule.enabled
-                    or normalize_rule_mode(current_rule.mode) != "FIXED"
-                    or current_rule.schedule.site_id != site.pk
-                    or current_rule.schedule_id != site.active_schedule_id
-                    or current_rule.valve_id != valve.pk
-                    or current_rule.max_duration_seconds != duration
-                    or not current_rule.uses_weekday(local.weekday())
-                    or (current_rule.start_time.hour, current_rule.start_time.minute)
-                    != (local.hour, local.minute)
-                    or planned_start_at is None
-                    or planned_start_at.astimezone(UTC) != due_minute):
-                raise ValidationError(
-                    "Scheduled rule changed or is no longer due; start skipped."
-                )
-            rule = current_rule
-        if rule and normalize_rule_mode(rule.mode) != "FIXED":
-            raise ValidationError("Unsupported single-valve rule mode.")
-        if planned_start_at is not None:
-            existing = IrrigationRun.objects.filter(
-                valve=valve, planned_start_at=planned_start_at,
-                trigger="SCHEDULED", occurrence=None,
-            ).first()
-            if existing:
-                return existing
-        if queued:
-            existing = IrrigationRun.objects.filter(
-                valve=valve, occurrence=None, trigger="MANUAL",
-                dispatch_state="QUEUED", cancellation_requested=False,
-                optimal_duration_seconds=duration,
-            ).first()
-            if existing:
-                return existing
-        conflict = None
-        if _legacy_unresolved(site).exists():
-            conflict = "Legacy sender unresolved: stop old processes and run reconcile_openings --senders-stopped."
-        elif _pending_closures(site).exists():
-            conflict = "Closure requested; wait for controller confirmation before opening."
-        elif _reservations(site).exists():
-            conflict = "Stop the active group and wait for closure before starting another valve."
-        elif _unresolved_runs(site).filter(valve=valve).exists():
-            conflict = "Valve is already running or awaiting confirmed closure."
-        elif _unresolved_runs(site).exclude(
-            status="RUNNING", cancellation_requested=False, delivery_uncertain=False,
-        ).exists():
-            # Unrelated legacy running pulses retain their original coexistence.
-            conflict = "An opening or uncertain closure is awaiting recovery."
-        if conflict:
-            if planned_start_at is None:
-                raise ValidationError(conflict)
-            return IrrigationRun.objects.create(
-                valve=valve, trigger=trigger, requested_start_at=timezone.now(),
-                planned_start_at=planned_start_at, status="FAILED",
-                optimal_duration_seconds=duration, max_duration_seconds=duration,
-                stop_reason="ERROR", error_message="Skipped: " + conflict,
-            )
-        rate = valve.application_rate_mm_h
-        if rate is not None and (not math.isfinite(rate) or rate <= 0):
-            rate = None
-        run = IrrigationRun.objects.create(
-            valve=valve, trigger=trigger, requested_start_at=now,
-            planned_start_at=planned_start_at, status="PLANNED",
-            optimal_duration_seconds=duration, max_duration_seconds=duration,
-            application_rate_mm_h=rate,
-            attempt_started_at=None if queued else now,
-            delivery_uncertain=False, dispatch_state="QUEUED",
-        )
-    return run
+    if rule and normalize_rule_mode(rule.mode) != "FIXED":
+        raise ValidationError("Unsupported single-valve rule mode.")
+    valve.refresh_from_db()
+    if not valve.relay_device.enabled:
+        raise ValidationError("Relay device is disabled.")
+    if planned_start_at is not None:
+        existing = IrrigationRun.objects.filter(
+            valve=valve, planned_start_at=planned_start_at, trigger="SCHEDULED",
+        ).first()
+        if existing:
+            return existing
+    if trigger == "MANUAL" and rule is None and IrrigationRun.objects.filter(
+        valve=valve, status="RUNNING",
+    ).exists():
+        raise ValidationError("Valve is already running.")
+    run = _new_run(valve, duration, trigger, planned_start_at=planned_start_at)
+    return _open_run(run)
 
 
 def close_member(valve):
-    """HTTP service: persist cancellation and orphan-safe closure intent."""
-    site = valve.relay_device.site
-    with site_admission(site):
-        valve.refresh_from_db()
-        if valve.relay_device.site_id != site.pk:
-            raise ValidationError("Valve ownership changed before cancellation.")
-        for occurrence in _reservations(site):
-            if any(m["valve_id"] == valve.pk for m in occurrence.config.get("members", [])):
-                cancel_occurrence(occurrence)
-        _unresolved_runs(site).filter(valve=valve).update(cancellation_requested=True)
-        request, _ = ValveClosure.objects.get_or_create(valve=valve)
-        if request.confirmed_at is not None:
-            request.requested_at = timezone.now()
-            request.confirmed_at = None
-            request.error_message = ""
-            request.save(update_fields=["requested_at", "confirmed_at", "error_message"])
-    return request
-
-
-def process_closures(observed_closures):
-    """Controller only: close/read, then durably acknowledge a coalesced Close."""
-    for request in ValveClosure.objects.filter(confirmed_at=None).select_related(
-        "valve__relay_device",
-    ).order_by("pk"):
-        valve = request.valve
-        if _legacy_unresolved(valve.relay_device.site).exists():
-            error = "Legacy sender unresolved; stop old processes and run reconcile_openings --senders-stopped."
-        elif valve.pk in observed_closures:
-            # The same controller already closed/read this valve in this safety
-            # phase, with no intervening opening. Reuse that physical result.
-            error = observed_closures[valve.pk]
-        else:
-            error = _closure_error(valve)
-        if error:
-            ValveClosure.objects.filter(pk=request.pk).exclude(error_message=error).update(
-                error_message=error,
-            )
-            continue
-        with site_admission(valve.relay_device.site):
-            now = timezone.now()
-            ValveClosure.objects.filter(pk=request.pk).update(
-                confirmed_at=now, error_message="",
-            )
-            Valve.objects.filter(pk=valve.pk).filter(
-                Q(last_known_is_open=True) | Q(last_polled_at=None)
-            ).update(last_known_is_open=False, last_polled_at=now)
-
-
-def dispatch_manual_requests():
-    """Controller only; a crashed HTTP request needs no acknowledgement."""
-    for run in IrrigationRun.objects.filter(
-        occurrence=None, dispatch_state="QUEUED", status="PLANNED",
-    ).order_by("pk"):
-        try:
-            _send_claimed(run)
-        except Exception:
-            logger.exception("Manual opening failed for run %s", run.pk)
-
-
-def _snapshot(rule, members, *, include_reservation=True, available_seconds=None):
-    config = {
-        "rule_id": rule.pk, "schedule_id": rule.schedule_id, "note": rule.note,
-        "enabled": rule.enabled,
-        "days_of_week_mask": rule.days_of_week_mask,
-        "start_time": rule.start_time.isoformat(),
-        "timezone": rule.schedule.site.timezone,
-        "mode": rule.mode,
-        "sequence_policy": (
-            "equal_previous_run_v1" if rule.mode == "SMART" else "one_pass_v1"
-        ),
-        "controller_interval_seconds": controller_interval(),
-        "command_allowance_seconds": command_allowance(),
-        "members": [{"valve_id": m.valve_id, "name": m.valve.name,
-                     "order": m.order, "duration_seconds": m.duration_seconds,
-                     "application_rate_mm_h": (
-                         m.valve.application_rate_mm_h
-                         if m.valve.has_valid_application_rate else None
-                     )}
-                    for m in members],
-    }
-    if rule.mode == "SMART":
-        curve = get_curve_settings(rule.schedule.site)
-        config["curve"] = {
-            name: (getattr(curve, name) if math.isfinite(getattr(curve, name))
-                   else None) for name in (
-                "min_mm", "max_mm", "g", "m", "coverage_days",
-                "fallback_temperature_c",
-            )
-        }
-    if include_reservation:
-        envelope = reservation_details(
-            rule, members, available_seconds=available_seconds,
+    """Close this valve immediately, using the released service-layer behavior."""
+    runs = IrrigationRun.objects.filter(valve=valve, status="RUNNING")
+    try:
+        services.close_valve(valve)
+    except Exception as exc:
+        runs.update(status="FAILED", stop_reason="ERROR", error_message=str(exc))
+        raise
+    stopped = timezone.now()
+    with transaction.atomic():
+        runs.update(
+            status="FINISHED", actual_stop_at=stopped,
+            closure_confirmed_at=stopped, stop_reason="MANUAL_STOP",
         )
-        config.update({name: envelope[name] for name in (
-            "watering_seconds", "break_seconds", "scheduling_allowance_seconds",
-            "reserved_seconds", "pulse_count", "repeat_count",
-            "unavailable_valve_ids", "unavailable_valves",
-        )})
-        config["peak_pulse_count"] = envelope["pulse_count"]
-    return config
-
-
-def _deadline(site, start, seconds):
-    end = start + dt.timedelta(seconds=seconds)
-    tz = ZoneInfo(site.timezone)
-    next_midnight = dt.datetime.combine(
-        start.astimezone(tz).date() + dt.timedelta(days=1), dt.time(), tz
-    ).astimezone(UTC)
-    if end > next_midnight:
-        raise ValidationError("The group reservation cannot fit before local midnight.")
-    return end
+        Valve.objects.filter(pk=valve.pk).update(
+            last_known_is_open=False, last_polled_at=stopped,
+        )
 
 
 def _remaining_day_seconds(site, start):
@@ -758,506 +291,219 @@ def _remaining_day_seconds(site, start):
     return (midnight - start.astimezone(UTC)).total_seconds()
 
 
-def request_fixed_group(rule):
-    site = rule.schedule.site
-    with site_admission(site):
-        rule.refresh_from_db()
-        site.refresh_from_db()
-        existing = RuleOccurrence.objects.filter(
-            rule=rule, source="MANUAL", status__in=RESERVED_STATUSES
-        ).first()
-        if existing:
-            return existing
-        if rule.mode != "FIXED" or not rule.enabled or site.active_schedule_id != rule.schedule_id:
-            raise ValidationError("Run now requires an enabled Fixed rule in the active schedule.")
-        validate_configuration(rule)
-        if _group_conflict(site):
-            raise ValidationError(
-                "Watering is active or awaiting closure; stop it before Run now."
+def _group_pulse_end(run):
+    returned = run.attempt_finished_at or run.actual_start_at
+    if returned is None:
+        # An interrupted attempt remains uncertain; this is a bookkeeping bound,
+        # not a claim that a closing response was received.
+        returned = run.attempt_started_at + dt.timedelta(seconds=command_allowance())
+    return returned + dt.timedelta(seconds=run.optimal_duration_seconds)
+
+
+def _finish_group_runs(now):
+    """Complete attempted pulse logs at their relay deadline, without replay."""
+    runs = IrrigationRun.objects.filter(
+        trigger=IrrigationRun.TRIGGER_GROUP,
+        attempt_started_at__isnull=False, actual_stop_at=None,
+    )
+    for run in runs:
+        end = _group_pulse_end(run)
+        if now < end:
+            continue
+        updates = {"actual_stop_at": end}
+        if run.status == "RUNNING":
+            updates.update(status="FINISHED", stop_reason="COMPLETED")
+        elif run.status == "PLANNED":
+            updates.update(
+                status="FAILED", stop_reason="ERROR", delivery_uncertain=True,
+                error_message="Opening interrupted; remaining sequence abandoned.",
             )
-        members = members_for(rule)
-        if any(not m.valve.relay_device.enabled for m in members):
-            raise ValidationError("A relay device is disabled.")
-        now = timezone.now()
-        config = _snapshot(
-            rule, members, available_seconds=_remaining_day_seconds(site, now),
-        )
-        end = _deadline(site, now, config["reserved_seconds"])
-        return RuleOccurrence.objects.create(
-            site=site, rule=rule, mode="FIXED", config=config,
-            source="MANUAL", requested_at=now, reservation_end=end, status="PENDING",
-        )
+        IrrigationRun.objects.filter(pk=run.pk).update(**updates)
 
 
-def _plan_occurrence(rule, scheduled_at=None, pending=None, now=None):
-    from apps.irrigation.balance import build_smart_decision
-    from apps.irrigation.sequence import plan_sequence
+def _site_is_watering(site_id):
+    return IrrigationRun.objects.filter(
+        valve__relay_device__site_id=site_id, actual_stop_at=None,
+    ).filter(
+        Q(status="RUNNING")
+        | Q(trigger=IrrigationRun.TRIGGER_GROUP, attempt_started_at__isnull=False)
+    ).exists()
 
-    site = rule.schedule.site
-    with site_admission(site):
+
+@dataclass
+class ActiveGroup:
+    rule_id: int
+    schedule_id: int
+    site_id: int
+    scheduled_at: dt.datetime
+    deadline: dt.datetime
+    valves: dict
+    pulses: deque
+    current: IrrigationRun | None = None
+    ready_at: dict = field(default_factory=dict)
+    stopped: bool = False
+
+
+class GroupRunner:
+    """One controller owns these transient sequences; restart discards them."""
+
+    def __init__(self):
+        self._active = {}
+        self._considered = {}
+
+    @property
+    def active_sites(self):
+        return set(self._active)
+
+    def tick(self, now=None):
         now = timezone.now() if now is None else now
-        site.refresh_from_db()
-        rule.refresh_from_db()
-        local_date = (
-            scheduled_at.astimezone(ZoneInfo(site.timezone)).date()
-            if scheduled_at else None
-        )
-        if scheduled_at and RuleOccurrence.objects.filter(
-            rule=rule, scheduled_local_date=local_date
-        ).exists():
-            return None
+        _finish_group_runs(now)
+        for group in list(self._active.values()):
+            try:
+                self._advance(group, now)
+            except Exception:
+                logger.exception("Group %s stopped after an execution error", group.rule_id)
+                self._stop(group)
+
+        rules = list(GroupedRule.objects.filter(
+            enabled=True, schedule__active_sites__isnull=False,
+        ).select_related("schedule__site"))
+        current_ids = {rule.pk for rule in rules}
+        self._considered = {
+            pk: day for pk, day in self._considered.items() if pk in current_ids
+        }
+        for rule in rules:
+            # Use the admitted instant for Smart water credit, not the old tick.
+            admitted = timezone.now()
+            local = admitted.astimezone(ZoneInfo(rule.schedule.site.timezone))
+            if (not rule.uses_weekday(local.weekday())
+                    or (local.hour, local.minute)
+                    != (rule.start_time.hour, rule.start_time.minute)
+                    or self._considered.get(rule.pk) == local.date()):
+                continue
+            self._considered[rule.pk] = local.date()
+            scheduled = dt.datetime.combine(
+                local.date(), rule.start_time.replace(second=0, microsecond=0),
+                local.tzinfo,
+            ).replace(fold=0).astimezone(UTC)
+            # A repeated local time refers to its first occurrence. Never catch up.
+            if not 0 <= (admitted - scheduled).total_seconds() < 60:
+                continue
+            try:
+                self._start(rule, scheduled, admitted)
+            except (ValidationError, ValueError) as exc:
+                logger.info("Group %s skipped: %s", rule.pk, exc)
+            except Exception:
+                logger.exception("Could not start group %s", rule.pk)
+                group = self._active.get(rule.schedule.site_id)
+                if group:
+                    self._stop(group)
+
+    def _start(self, rule, scheduled, now):
+        from apps.irrigation.balance import build_smart_decision
+        from apps.irrigation.sequence import plan_sequence
+
+        site = rule.schedule.site
+        if site.pk in self._active or _site_is_watering(site.pk):
+            logger.info("Group %s skipped: watering is already active", rule.pk)
+            return
         members = members_for(rule)
-        config = pending.config if pending else _snapshot(
-            rule, members, include_reservation=False,
-        )
-        occurrence = pending or RuleOccurrence.objects.create(
-            site=site, rule=rule, mode=rule.mode, config=config,
-            scheduled_local_date=local_date, scheduled_at=scheduled_at,
-            source="SCHEDULED", requested_at=now, status="PENDING",
-        )
-        if pending:
-            occurrence.refresh_from_db()
-            if occurrence.status != "PENDING" or occurrence.cancellation_requested:
-                return occurrence
-        try:
-            if (not rule.enabled or site.active_schedule_id != rule.schedule_id
-                    or rule.schedule.site_id != site.pk):
-                raise ValidationError("Rule is disabled or its schedule is inactive.")
-            if scheduled_at:
-                local_due = scheduled_at.astimezone(ZoneInfo(site.timezone))
-                if (not rule.uses_weekday(local_due.weekday())
-                        or (rule.start_time.hour, rule.start_time.minute)
-                        != (local_due.hour, local_due.minute)):
-                    raise ValidationError("Scheduled rule changed before admission; skipped.")
-            validate_configuration(rule, members)
-            if pending:
-                saved_members = config["members"]
-                current_by_id = {member.valve_id: member for member in members}
-                if (rule.mode != occurrence.mode
-                        or set(current_by_id) != {
-                            member["valve_id"] for member in saved_members
-                        }):
-                    raise ValidationError("Requested rule membership or mode changed.")
-                # A queued request already has its immutable configuration.
-                # Later edits can reduce admissible limits, never rewrite it.
-                members = []
-                for saved in saved_members:
-                    valve = current_by_id[saved["valve_id"]].valve
-                    valve.application_rate_mm_h = saved["application_rate_mm_h"]
-                    members.append(GroupedRuleValve(
-                        rule=rule, valve=valve, order=saved["order"],
-                        duration_seconds=saved["duration_seconds"],
-                    ))
-            if any(not m.valve.relay_device.enabled for m in members):
-                raise ValidationError("A relay device is disabled.")
-            if _group_conflict(site, occurrence):
-                raise ValidationError(
-                    "Skipped: conflicting active or uncertain watering at admission."
-                )
-            if scheduled_at and not 0 <= (now - scheduled_at).total_seconds() < 60:
-                raise ValidationError("Scheduled minute has elapsed; no catch-up.")
-            reservation_start = scheduled_at or now
-            available = _remaining_day_seconds(site, reservation_start)
-            if not pending:
-                config = _snapshot(rule, members, available_seconds=available)
-                occurrence.config = config
-            end = occurrence.reservation_end or _deadline(
-                site, reservation_start, config.get(
-                    "reserved_seconds",
-                    config.get("watering_seconds", 0)
-                    + config.get("handover_seconds", 0),
-                ),
-            )
+        # Attempted logs also prevent restarting a sequence within its start minute.
+        if IrrigationRun.objects.filter(
+            trigger=IrrigationRun.TRIGGER_GROUP, planned_start_at=scheduled,
+            valve__relay_device__site_id=site.pk,
+        ).exists():
+            return
+        validate_configuration(rule, members)
+        available = _remaining_day_seconds(site, scheduled)
+        peak = reservation_details(rule, members, available_seconds=available)
+        deadline = scheduled + dt.timedelta(seconds=peak["total_seconds"])
+        if rule.mode == "SMART":
             decision = build_smart_decision(
-                site, members, now, available_seconds=available,
+                site, members, now, available_seconds=_remaining_day_seconds(site, now),
                 controller_interval_seconds=controller_interval(),
                 command_allowance_seconds=command_allowance(),
-            ) if rule.mode == "SMART" else {}
-            if rule.mode == "SMART":
-                sequence = decision["sequence"]
-            else:
-                sequence = plan_sequence(
-                    [{"valve_id": m.valve_id, "order": m.order,
-                      "total_seconds": m.duration_seconds,
-                      "run_cap_seconds": m.duration_seconds} for m in members],
-                    smart=False, available_seconds=available,
-                    controller_interval_seconds=controller_interval(),
-                    command_allowance_seconds=command_allowance(),
-                )
-            # This immutable finite budget belongs to this decision only. Rate
-            # restoration or later settings cannot append work to the sequence.
-            occurrence.config = {**config, "pulse_budget": sequence["pulse_count"]}
-            by_id = {member.valve_id: member for member in members}
-            plans = []
-            for pulse in sequence["pulses"]:
-                member = by_id[pulse["valve_id"]]
-                plans.append(IrrigationRun(
-                    valve=member.valve, occurrence=occurrence,
-                    pass_number=pulse["pass_number"], member_order=member.order,
-                    trigger=occurrence.source, requested_start_at=occurrence.requested_at,
-                    planned_start_at=scheduled_at, status="PLANNED",
-                    optimal_duration_seconds=pulse["duration_seconds"],
-                    max_duration_seconds=member.duration_seconds,
-                    application_rate_mm_h=(member.valve.application_rate_mm_h
-                        if member.valve.has_valid_application_rate else None),
-                ))
-            IrrigationRun.objects.bulk_create(plans)
-            occurrence.decision = decision
-            occurrence.decision_at = now
-            occurrence.reservation_end = end
-            skipped = any(
-                row.get("skipped") for row in decision.get("valves", {}).values()
             )
-            if plans:
-                occurrence.status = "ACTIVE"
-                occurrence.outcome = (
-                    "Planned; some Smart valves skipped because they need a watering rate"
-                    if skipped else "Planned"
-                )
-            elif skipped:
-                occurrence.status = "SKIPPED"
-                occurrence.outcome = (
-                    "No pulses planned; unavailable Smart valves need a watering rate"
-                )
-            else:
-                occurrence.status = "ZERO"
-                occurrence.outcome = "No whole-second watering dose planned"
-        except (ValidationError, ValueError) as exc:
-            occurrence.status = "SKIPPED"
-            occurrence.outcome = str(exc)
-            occurrence.decision_at = now
-        occurrence.save()
-        return occurrence
-
-
-def occurrence_next_eligible_at(occurrence, runs=None):
-    """Derive durable rest eligibility without sliding timestamps or writes."""
-    if (occurrence.mode != "SMART" or occurrence.status != "ACTIVE"
-            or occurrence.config.get("sequence_policy") != "equal_previous_run_v1"):
-        return None
-    if runs is None:
-        runs = list(occurrence.runs.order_by("pass_number", "member_order"))
-    else:
-        runs = sorted(runs, key=lambda run: (run.pass_number, run.member_order))
-    if any(run.attempt_started_at and (
-            run.status in ("PLANNED", "RUNNING")
-            or run.closure_confirmed_at is None) for run in runs):
-        return None
-    pending = next((run for run in runs if run.status == "PLANNED"
-                    and not run.attempt_started_at), None)
-    if pending is None:
-        return None
-    prior = [run for run in runs if run.valve_id == pending.valve_id
-             and run.attempt_started_at and run.closure_confirmed_at]
-    if not prior:
-        return None
-    previous = prior[-1]
-    return previous.closure_confirmed_at + dt.timedelta(
-        seconds=previous.optimal_duration_seconds,
-    )
-
-
-def _skip_uncalibrated_pulses(occurrence, valve_id=None):
-    """Permanently skip unattempted work; never modify a commanded pulse."""
-    if occurrence.mode != "SMART":
-        return
-    pending = IrrigationRun.objects.filter(
-        occurrence=occurrence, status="PLANNED", attempt_started_at=None,
-    ).select_related("valve")
-    unavailable = [
-        run.pk for run in pending
-        if run.valve_id == valve_id or not run.valve.has_valid_application_rate
-    ]
-    if not unavailable:
-        return
-    with site_admission(occurrence.site):
-        changed = IrrigationRun.objects.filter(
-            pk__in=unavailable, status="PLANNED", attempt_started_at=None,
-        ).update(
-            status="FAILED", stop_reason="ERROR",
-            error_message=MISSING_RATE_SKIP,
-        )
-        if changed:
-            RuleOccurrence.objects.filter(pk=occurrence.pk, status="ACTIVE").update(
-                outcome=(
-                    "Some Smart valves skipped: enter their watering rates "
-                    "for future Smart watering"
-                )
-            )
-
-
-def _progress(occurrence, fresh_closed):
-    occurrence.refresh_from_db()
-    if occurrence.status == "STOPPING":
-        attempted = IrrigationRun.objects.filter(
-            occurrence=occurrence, attempt_started_at__isnull=False
-        )
-        if not attempted.filter(closure_confirmed_at__isnull=True).exists():
-            RuleOccurrence.objects.filter(pk=occurrence.pk).update(status="CANCELLED")
-        return
-    if occurrence.status != "ACTIVE":
-        return
-    current_rule = GroupedRule.objects.filter(pk=occurrence.rule_id).first()
-    current_site = Site.objects.get(pk=occurrence.site_id)
-    if (current_rule is None or not current_rule.enabled
-            or current_site.active_schedule_id != current_rule.schedule_id
-            or current_rule.schedule.site_id != occurrence.site_id
-            or occurrence.config.get("schedule_id") != current_rule.schedule_id
-            or occurrence.config.get("timezone", current_site.timezone)
-            != current_site.timezone):
-        cancel_occurrence(occurrence, "Rule disabled, deleted, or active schedule changed")
-        reconcile_attempts()
-        return
-    _skip_uncalibrated_pulses(occurrence)
-    if any(not member.valve.relay_device.enabled for member in members_for(current_rule)):
-        cancel_occurrence(occurrence, "Relay disabled; remaining target unmet")
-        reconcile_attempts()
-        return
-    if _group_conflict(current_site, occurrence):
-        cancel_occurrence(occurrence, "Conflicting watering interrupted the group")
-        reconcile_attempts()
-        return
-    runs = list(IrrigationRun.objects.filter(occurrence=occurrence).select_related(
-        "valve__relay_device"
-    ).order_by("pass_number", "member_order"))
-    attempted = [run for run in runs if run.attempt_started_at]
-    if any(run.status in ("RUNNING", "PLANNED") for run in attempted):
-        return
-    if any(run.delivery_uncertain for run in attempted):
-        cancel_occurrence(occurrence, "Uncertain delivery; remaining target unmet")
-        return
-    # A later pass may reopen an earlier valve. Confirm the immediately prior
-    # pulse only, after first establishing that no pulse remains active.
-    previous = attempted[-1] if attempted else None
-    if (previous and previous.pk not in fresh_closed
-            and not _confirmed_closed(previous)):
-        cancel_occurrence(occurrence, "Closure unconfirmed; remaining target unmet")
-        return
-    pending = next((r for r in runs if r.status == "PLANNED" and not r.attempt_started_at), None)
-    if pending is None:
-        skipped = (
-            any(run.error_message == MISSING_RATE_SKIP for run in runs)
-            or any(row.get("skipped") for row in
-                   occurrence.decision.get("valves", {}).values())
-        )
-        RuleOccurrence.objects.filter(pk=occurrence.pk, status="ACTIVE").update(
-            status="SKIPPED" if skipped and not attempted else "FINISHED",
-            outcome=(
-                "Completed available watering; some Smart valves skipped for missing rates"
-                if skipped else "Completed planned watering"
-            ),
-        )
-        return
-    eligible = occurrence_next_eligible_at(occurrence)
-    if eligible and timezone.now() < eligible:
-        if eligible + dt.timedelta(
-            seconds=pending.optimal_duration_seconds + command_allowance()
-        ) > occurrence.reservation_end:
-            cancel_occurrence(occurrence, "Reservation deadline exhausted; remaining target unmet")
-        # A rest needs no admission claim and no database write on every tick.
-        return
-    with site_admission(occurrence.site):
-        occurrence.refresh_from_db()
-        pending.refresh_from_db()
-        if (occurrence.status != "ACTIVE" or occurrence.cancellation_requested
-                or pending.attempt_started_at):
-            return
-        try:
-            site = Site.objects.get(pk=occurrence.site_id)
-            rule = GroupedRule.objects.filter(pk=occurrence.rule_id).first()
-            if (rule is None or not rule.enabled
-                    or site.active_schedule_id != rule.schedule_id
-                    or rule.schedule.site_id != occurrence.site_id
-                    or occurrence.config.get("schedule_id") != rule.schedule_id):
-                raise ValidationError("Rule disabled, deleted, or schedule changed")
-            validate_configuration(rule)
-            if _group_conflict(site, occurrence):
-                raise ValidationError("Conflicting watering interrupted the group")
-            pending.valve.refresh_from_db()
-            pending.valve.relay_device.refresh_from_db()
-            if pending.valve.relay_device.site_id != occurrence.site_id:
-                raise ValidationError("Valve ownership changed; remaining target unmet")
-            if (occurrence.mode == "SMART"
-                    and not pending.valve.has_valid_application_rate):
-                _skip_uncalibrated_pulses(occurrence)
-                return
-            if not pending.valve.relay_device.enabled:
-                raise ValidationError("Relay disabled")
-            member = GroupedRuleValve.objects.filter(rule=rule, valve=pending.valve).first()
-            if (rule.mode != occurrence.mode or member is None
-                    or pending.optimal_duration_seconds > member.duration_seconds):
-                raise ValidationError("Configuration changed; remaining target unmet")
-            saved_members = occurrence.config.get("members", [])
-            current_members = members_for(rule)
-            if [(m.valve_id, m.order) for m in current_members] != [
-                (m["valve_id"], m["order"]) for m in saved_members
-            ]:
-                raise ValidationError("Valve order or membership changed; remaining target unmet")
-            budget = occurrence.config.get("pulse_budget")
-            if budget is not None and occurrence.runs.count() > budget:
-                raise ValidationError("Saved pulse budget exceeded; remaining target unmet")
-            now = timezone.now()
-            eligible = occurrence_next_eligible_at(occurrence)
-            command_start = max(now, eligible) if eligible else now
-            command_end = command_start + dt.timedelta(
-                seconds=pending.optimal_duration_seconds + command_allowance()
-            )
-            if command_end > occurrence.reservation_end:
-                raise ValidationError("Reservation deadline exhausted; remaining target unmet")
-            if eligible and now < eligible:
-                # Reservation and cancellation remain durable while the normal
-                # controller cadence waits. No blocking sleep or status write.
-                return
-            claimed = IrrigationRun.objects.filter(
-                pk=pending.pk, status="PLANNED", attempt_started_at=None,
-                cancellation_requested=False,
-            ).update(
-                attempt_started_at=now, delivery_uncertain=True,
-                dispatch_state="QUEUED",
-            )
-            if not claimed:
-                return
-        except ValidationError as exc:
-            cancel_occurrence(occurrence, str(exc))
-            return
-    _send_claimed(pending)
-
-
-def recover_groups():
-    """Startup cancels stale requests; attempted openings are never replayed."""
-    for occurrence in RuleOccurrence.objects.filter(status__in=RESERVED_STATUSES):
-        cancel_occurrence(occurrence, "Controller restarted; unfinished sequence cancelled")
-    reconcile_attempts(restarting=True)
-
-
-def reconcile_attempts(restarting=False, *, senders_stopped=False):
-    """Controller only; legacy web senders require explicit offline recovery."""
-    if senders_stopped:
-        # Offline maintenance also stops acknowledged bounded runs; ordinary
-        # controller startup keeps their original stop times instead.
-        IrrigationRun.objects.filter(status="RUNNING").update(
-            cancellation_requested=True,
-        )
-        _legacy_unresolved().filter(dispatch_state="UNSENT").update(
-            dispatch_state="DONE", status="FAILED", cancellation_requested=True,
-            attempt_started_at=None, attempt_finished_at=None,
-            delivery_uncertain=False, closure_confirmed_at=timezone.now(),
-            stop_reason="MANUAL_STOP", error_message="Legacy unsent opening cancelled",
-        )
-        # Preserve all timing, calibration and historical evidence. No old row
-        # becomes a queued controller opening, regardless of its trigger.
-        _legacy_unresolved().update(
-            dispatch_state="DONE", cancellation_requested=True,
-            delivery_uncertain=True, closure_confirmed_at=None,
-        )
-    fresh_closed = set()
-    observed_closures = {}
-    query = IrrigationRun.objects.filter(
-        Q(attempt_started_at__isnull=False, closure_confirmed_at=None)
-        | Q(dispatch_state__in=("QUEUED", "OPENING"))
-        | Q(status="RUNNING")
-        | Q(cancellation_requested=True, closure_confirmed_at=None)
-    ).select_related("valve__relay_device", "occurrence").order_by("pk")
-    for run in query:
-        if _legacy_unresolved().filter(pk=run.pk).exists():
-            continue
-        now = timezone.now()
-        stopping = run.cancellation_requested or (
-            run.occurrence and run.occurrence.status == "STOPPING"
-        )
-        if run.dispatch_state == "QUEUED":
-            queued_at = run.attempt_started_at or run.requested_start_at
-            expired = queued_at is None or now > queued_at + dt.timedelta(
-                seconds=command_allowance() + controller_interval(),
-            )
-            if restarting or stopping or expired or senders_stopped:
-                IrrigationRun.objects.filter(pk=run.pk, dispatch_state="QUEUED").update(
-                    dispatch_state="DONE", cancellation_requested=True,
-                    status="FAILED", stop_reason="MANUAL_STOP",
-                    error_message=("Controller restarted; queued opening cancelled"
-                                   if restarting else "Queued opening cancelled or expired"),
-                    attempt_started_at=None, attempt_finished_at=None,
-                    delivery_uncertain=False, closure_confirmed_at=now,
-                )
-            continue
-        if run.dispatch_state == "OPENING":
-            # No other live controller exists. An attempt seen here returned
-            # without a durable result, or belongs to the previous process.
-            IrrigationRun.objects.filter(pk=run.pk).update(
-                dispatch_state="DONE", status="FAILED", stop_reason="ERROR",
-                cancellation_requested=True, delivery_uncertain=True,
-                error_message="Opening result unknown; recovering closure without replay",
-                closure_confirmed_at=None,
-            )
-            stopping = True
-        if run.status == "RUNNING" and not stopping:
-            stop_at = run.actual_start_at + dt.timedelta(
-                seconds=run.optimal_duration_seconds or run.max_duration_seconds
-            ) if run.actual_start_at else None
-            if stop_at and now < stop_at:
-                continue
-        needs_close = (stopping or run.delivery_uncertain
-                       or run.status in ("PLANNED", "FAILED", "RUNNING"))
-        confirmed = _confirmed_closed(run, close=needs_close)
-        observed_closures[run.valve_id] = "" if confirmed else run.error_message
-        if confirmed:
-            fresh_closed.add(run.pk)
-        elif run.occurrence:
-            cancel_occurrence(run.occurrence, "Closure unconfirmed; sequence interrupted")
-    process_closures(observed_closures)
-    return fresh_closed
-
-
-def group_tick(now=None, *, fresh_closed=None):
-    if fresh_closed is None:
-        fresh_closed = reconcile_attempts()
-    for occurrence in RuleOccurrence.objects.filter(status__in=("ACTIVE", "STOPPING")):
-        try:
-            _progress(occurrence, fresh_closed)
-        except Exception:
-            logger.exception("Group progression failed for occurrence %s", occurrence.pk)
-            cancel_occurrence(occurrence, "Execution error; remaining pulses cancelled")
-    for pending in RuleOccurrence.objects.filter(status="PENDING").select_related(
-        "rule__schedule__site"
-    ):
-        if pending.rule_id:
-            occurrence = _plan_occurrence(pending.rule, pending=pending)
-            if occurrence:
-                _progress(occurrence, fresh_closed)
+            sequence = decision["sequence"]
         else:
-            cancel_occurrence(pending, "Rule deleted")
-    # The fresh admitted time, not an old loop timestamp, defines the balance.
-    decision_time = timezone.now() if now is None else now
-    rules = GroupedRule.objects.filter(
-        enabled=True, schedule__active_sites__isnull=False
-    ).select_related("schedule__site")
-    for rule in rules:
-        local = decision_time.astimezone(ZoneInfo(rule.schedule.site.timezone))
-        if not rule.uses_weekday(local.weekday()):
-            continue
-        nominal = dt.datetime.combine(local.date(), rule.start_time, local.tzinfo)
-        normalized = nominal.astimezone(UTC).astimezone(local.tzinfo)
-        if normalized.replace(tzinfo=None) != nominal.replace(tzinfo=None):
-            if local.replace(tzinfo=None) >= nominal.replace(tzinfo=None):
-                with site_admission(rule.schedule.site):
-                    RuleOccurrence.objects.get_or_create(
-                        rule=rule, scheduled_local_date=local.date(), defaults={
-                            "site": rule.schedule.site, "mode": rule.mode,
-                            "scheduled_at": nominal.astimezone(UTC), "requested_at": decision_time,
-                            "source": "SCHEDULED", "status": "SKIPPED",
-                            "outcome": "Nonexistent local scheduled time (DST gap)",
-                            "config": _snapshot(
-                                rule, members_for(rule), include_reservation=False,
-                            ),
-                        },
-                    )
-            continue
-        if (local.hour, local.minute) != (rule.start_time.hour, rule.start_time.minute):
-            continue
-        scheduled_at = nominal.replace(second=0, microsecond=0, fold=local.fold).astimezone(UTC)
-        try:
-            occurrence = _plan_occurrence(rule, scheduled_at=scheduled_at)
-            if occurrence:
-                _progress(occurrence, fresh_closed)
-        except Exception:
-            logger.exception("Planning failed for group %s", rule.pk)
+            sequence = plan_sequence(
+                [{"valve_id": member.valve_id, "order": member.order,
+                  "total_seconds": member.duration_seconds,
+                  "run_cap_seconds": member.duration_seconds} for member in members],
+                smart=False, available_seconds=available,
+                controller_interval_seconds=controller_interval(),
+                command_allowance_seconds=command_allowance(),
+            )
+        if not sequence["pulses"]:
+            logger.info("Group %s needs no watering", rule.pk)
+            return
+        group = ActiveGroup(
+            rule.pk, rule.schedule_id, site.pk, scheduled, deadline,
+            {member.valve_id: member.valve for member in members},
+            deque(sequence["pulses"]),
+        )
+        self._active[site.pk] = group
+        self._advance(group, now)
+
+    def _stop(self, group):
+        """Abandon future pulses; try early close once, otherwise use relay timeout."""
+        if group.stopped:
+            return
+        group.stopped = True
+        group.pulses.clear()
+        if group.current:
+            current = IrrigationRun.objects.filter(pk=group.current.pk).first()
+            if current is None or current.actual_stop_at is None:
+                try:
+                    close_member(group.valves[group.current.valve_id])
+                except Exception:
+                    logger.exception("Early group close failed; relay timeout remains active")
+
+    def _advance(self, group, now):
+        if not group.stopped and not GroupedRule.objects.filter(
+            pk=group.rule_id, enabled=True, schedule_id=group.schedule_id,
+            schedule__site__active_schedule_id=group.schedule_id,
+        ).exists():
+            self._stop(group)
+        if group.current:
+            run = group.current
+            try:
+                run.refresh_from_db()
+            except IrrigationRun.DoesNotExist:
+                self._stop(group)
+                self._active.pop(group.site_id, None)
+                return
+            if run.actual_stop_at is None:
+                return
+            if (run.status == "FAILED" or run.stop_reason == "MANUAL_STOP"
+                    or run.delivery_uncertain):
+                group.pulses.clear()
+            group.ready_at[run.valve_id] = run.actual_stop_at + dt.timedelta(
+                seconds=run.optimal_duration_seconds,
+            )
+            group.current = None
+        if not group.pulses:
+            self._active.pop(group.site_id, None)
+            return
+        pulse = group.pulses[0]
+        valve = group.valves[pulse["valve_id"]]
+        if now < group.ready_at.get(valve.pk, now):
+            return
+        if _site_is_watering(group.site_id):
+            self._stop(group)
+            return
+        if not RelayDevice.objects.filter(pk=valve.relay_device_id, enabled=True).exists():
+            self._stop(group)
+            return
+        now = timezone.now()
+        duration = pulse["duration_seconds"]
+        if now + dt.timedelta(seconds=duration + command_allowance()) > group.deadline:
+            logger.info("Group %s stopped at its reservation deadline", group.rule_id)
+            self._stop(group)
+            return
+        group.pulses.popleft()
+        group.current = _new_run(
+            valve, duration, IrrigationRun.TRIGGER_GROUP,
+            planned_start_at=group.scheduled_at,
+        )
+        _open_run(group.current)

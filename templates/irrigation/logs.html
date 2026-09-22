@@ -4,7 +4,6 @@
 
 {% block content %}
 <h1 class="h3 mb-3">Logs</h1>
-{% include "irrigation/occurrences.html" %}
 
 <div class="card">
   <div class="card-body">
@@ -56,7 +55,7 @@
               <td>{% if run.delivery.calibrated %}{{ run.delivery.nominal_mm|floatformat:2 }} / {{ run.delivery.estimated_mm|floatformat:2 }} mm{% else %}Unknown: no calibration snapshot{% endif %}
               {% if run.delivery.uncertain %}<div>Uncertain delivery: conservative estimate</div>{% endif %}
               {% if run.delivery.unknown_extra_delivery %}<div>Extra delivery unknown after interrupted attempt</div>{% endif %}
-              {% if run.occurrence_id %}<div>Rule occurrence {{ run.occurrence_id }} · Pass {{ run.pass_number }}</div>{% endif %}</td>
+              </td>
               <td>
                 {% if run.stop_reason %}
                   {{ run.get_stop_reason_display }}

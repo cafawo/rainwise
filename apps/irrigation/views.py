@@ -9,7 +9,8 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
+from django.db.models.functions import Coalesce
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -42,7 +43,6 @@ from apps.irrigation.models import (
     get_curve_settings,
     GroupedRule,
     GroupedRuleValve,
-    RuleOccurrence,
     normalize_rule_mode,
     IrrigationRun,
     Schedule,
@@ -93,107 +93,46 @@ def _smart_status(site):
         dt.datetime.fromisoformat(temperature["latest_valid_at"])
         if temperature["latest_valid_at"] else None
     )
-    warnings = []
-    if site.active_schedule_id:
-        for rule in GroupedRule.objects.filter(
-            schedule_id=site.active_schedule_id, mode="SMART", enabled=True
-        ).prefetch_related("members__valve__relay_device"):
-            try:
-                decision = balance.build_smart_decision(site, list(rule.members.all()), now)
-                warnings.extend(
-                    warning for warning in decision["warnings"]
-                    if not warning.startswith("Operating with fallback")
-                )
-            except (ValidationError, ValueError) as exc:
-                warnings.append(str(exc))
-    return {"temperature": temperature, "quality_warnings": list(dict.fromkeys(warnings))}
-
-
-def _occurrence_cards(site, limit=30):
-    if not site:
-        return []
-    now = timezone.now()
-    occurrences = list(
-        RuleOccurrence.objects.filter(site=site).select_related("rule")
-        .prefetch_related("runs").order_by("-requested_at", "-pk")[:limit]
-    )
-    for occurrence in occurrences:
-        runs = list(occurrence.runs.all())
-        occurrence.progress_total = len(runs)
-        occurrence.progress_finished = sum(run.status == "FINISHED" for run in runs)
-        occurrence.next_eligible_at = group_services.occurrence_next_eligible_at(occurrence, runs=runs)
-        occurrence.is_resting = bool(
-            occurrence.status == "ACTIVE" and occurrence.next_eligible_at
-            and occurrence.next_eligible_at > now
-        )
-        occurrence.member_names = " → ".join(
-            member.get("name", "")
-            for member in occurrence.config.get("members", [])
-        )
-        occurrence.decision_rows = []
-        for saved_row in occurrence.decision.get("valves", {}).values():
-            row = saved_row.copy()
-            estimates = [balance.delivery_estimate(run, cutoff=now) for run in runs
-                         if run.valve_id == row["valve_id"]]
-            row["execution_estimated_mm"] = sum(
-                estimate["estimated_mm"] or 0 for estimate in estimates
-            )
-            row["execution_unmet_mm"] = (
-                max(0, row["target_mm"] - row["execution_estimated_mm"])
-                if row["target_mm"] is not None else None
-            )
-            row["execution_messages"] = list(dict.fromkeys(
-                run.error_message for run in runs
-                if run.valve_id == row["valve_id"] and run.error_message
-                and run.attempt_started_at is None
-            ))
-            row["execution_uncertain"] = any(estimate["uncertain"] for estimate in estimates)
-            occurrence.decision_rows.append(row)
-    return occurrences
+    return {"temperature": temperature}
 
 
 def _valve_feedback(valves):
-    valves = list(valves.select_related("closure_request"))
+    valves = list(valves)
+    unresolved_run = IrrigationRun.objects.filter(
+        valve_id=models.OuterRef("pk"), actual_stop_at=None,
+    ).filter(
+        models.Q(status="RUNNING")
+        | models.Q(status="PLANNED", attempt_started_at__isnull=False),
+    ).order_by("-pk").values("pk")[:1]
     latest_run = IrrigationRun.objects.filter(
         valve_id=models.OuterRef("pk"),
+    ).exclude(
+        status="PLANNED", attempt_started_at=None,
     ).order_by("-pk").values("pk")[:1]
+    # Keep an active watering attempt visible ahead of newer failed requests.
     latest_ids = Valve.objects.filter(pk__in=[v.pk for v in valves]).annotate(
-        latest_run=models.Subquery(latest_run),
+        latest_run=Coalesce(
+            models.Subquery(unresolved_run), models.Subquery(latest_run),
+        ),
     ).values("latest_run")
     runs = {run.valve_id: run for run in IrrigationRun.objects.filter(pk__in=latest_ids)}
-    legacy_ids = set(group_services._legacy_unresolved().filter(
-        valve_id__in=[v.pk for v in valves],
-    ).values_list("valve_id", flat=True))
     for valve in valves:
         run = runs.get(valve.pk)
-        closure = getattr(valve, "closure_request", None)
         valve.action_status = "—"
         valve.action_error = (
             run.error_message if run and (
                 run.status == "FAILED" or run.delivery_uncertain
-                or run.closure_confirmed_at is None
+                or run.actual_stop_at is None
             ) else ""
         )
-        if valve.pk in legacy_ids:
-            valve.action_status = "Stopping"
-            valve.action_error = (
-                "Legacy sender unresolved. Stop old web/controller processes and run "
-                "reconcile_openings --senders-stopped before starting watering."
+        if run:
+            unfinished = (
+                run.status in ("PLANNED", "RUNNING") and run.actual_stop_at is None
             )
-        elif closure and closure.confirmed_at is None:
-            valve.action_status = "Stopping"
-            valve.action_error = closure.error_message or valve.action_error
-        elif run:
-            if run.cancellation_requested and run.closure_confirmed_at is None:
-                valve.action_status = "Stopping"
-            elif run.dispatch_state == "QUEUED":
-                valve.action_status = "Queued"
-            elif run.dispatch_state == "OPENING":
-                valve.action_status = "Opening requested"
-            elif run.status == "RUNNING":
+            if unfinished and run.status == "RUNNING":
                 valve.action_status = "Running"
-            elif run.attempt_started_at and run.closure_confirmed_at is None:
-                valve.action_status = "Stopping"
+            elif unfinished and run.attempt_started_at:
+                valve.action_status = "Starting"
             elif run.status == "FAILED":
                 valve.action_status = "Failed"
     return valves
@@ -214,9 +153,7 @@ def dashboard(request: HttpRequest) -> HttpResponse:
         "irrigation/dashboard.html",
         {
             "valves": _valve_feedback(valves),
-            "controller_interval_seconds": group_services.controller_interval(),
             "show_default_sqlite_warning": _using_default_sqlite(),
-            "occurrences": _occurrence_cards(site, limit=10),
             **_smart_status(site),
         },
     )
@@ -252,7 +189,7 @@ def curve_view(request: HttpRequest) -> HttpResponse:
                 form.add_error(None, "No site configured to store curve settings.")
             else:
                 try:
-                    with group_services.site_admission(site):
+                    with transaction.atomic():
                         candidate, _ = CurveSettings.objects.update_or_create(
                             site=site, defaults=form.cleaned_data
                         )
@@ -334,12 +271,15 @@ def open_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
     site = _get_active_site(request)
     valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
     try:
-        group_services.request_single(
-            valve, valve.default_max_duration_seconds
+        run = group_services.start_single(
+            valve, valve.default_max_duration_seconds, IrrigationRun.TRIGGER_MANUAL,
         )
-        messages.success(request, "Opening requested; queued for the next controller tick.")
+        if run.status == IrrigationRun.STATUS_FAILED:
+            messages.error(request, f"Failed to open valve: {run.error_message}")
+        else:
+            messages.success(request, "Valve opened.")
     except Exception as exc:
-        messages.error(request, f"Opening request failed: {exc}")
+        messages.error(request, f"Failed to open valve: {exc}")
     return redirect("dashboard")
 
 
@@ -350,9 +290,9 @@ def close_valve_view(request: HttpRequest, valve_id: int) -> HttpResponse:
     valve = get_object_or_404(Valve, pk=valve_id, relay_device__site=site)
     try:
         group_services.close_member(valve)
-        messages.success(request, "Closure requested. Any active rule is stopping.")
+        messages.success(request, "Valve closed.")
     except Exception as exc:
-        messages.error(request, f"Closure request failed: {exc}")
+        messages.error(request, f"Failed to close valve: {exc}")
     return redirect("dashboard")
 
 
@@ -423,7 +363,7 @@ def logs_view(request: HttpRequest) -> HttpResponse:
             minutes = round((stop - start).total_seconds() / 60.0, 1)
             run.duration_minutes_display = f"{minutes:g}"
     return render(request, "irrigation/logs.html", {
-        "runs": runs, "occurrences": _occurrence_cards(site),
+        "runs": runs,
     })
 
 
@@ -445,9 +385,10 @@ def _editor_data(request):
 
 def _rule_urls(rule):
     prefix = "group" if isinstance(rule, GroupedRule) else "schedule"
+    actions = ("edit", "copy", "delete")
+    actions += ("stop", "preview") if prefix == "group" else ("run",)
     return {action + "_url": reverse(prefix + "_" + action, args=[rule.pk])
-            for action in ("edit", "copy", "delete", "run", "stop", "preview")
-            if prefix == "group" or action not in {"stop", "preview"}}
+            for action in actions}
 
 
 def _editor_errors(form, formset):
@@ -530,7 +471,7 @@ def _edit_rule(request, rule=None, copying=False):
                 "start_time": values["start_time"],
             }
             try:
-                with group_services.site_admission(site):
+                with transaction.atomic():
                     existing = None if copying else rule
                     if grouped:
                         candidate = (
@@ -558,19 +499,9 @@ def _edit_rule(request, rule=None, copying=False):
                             rule=candidate, valve=row["valve"], order=index,
                             duration_seconds=row["duration_seconds"],
                         ) for index, row in enumerate(selected, 1)]
-                        if existing:
-                            old_members = ([(m.valve_id, m.order) for m in
-                                            existing.members.order_by("order")]
-                                           if is_group else [(existing.valve_id, 1)])
-                            new_members = [(m.valve_id, m.order) for m in members]
-                            if (not is_group or old_members != new_members or
-                                    normalize_rule_mode(existing.mode) != candidate.mode):
-                                group_services.assert_configuration_editable(existing)
                         group_services.validate_configuration(
                             candidate, members=members, exclude_rule=existing
                         )
-                        if existing and is_group and not candidate.enabled:
-                            group_services.cancel_rule(existing, "Rule disabled")
                         candidate.save()
                         if existing and is_group:
                             candidate.members.all().delete()
@@ -653,7 +584,7 @@ def group_copy(request, rule_id):
 @require_POST
 def schedule_delete(request, rule_id):
     rule = get_object_or_404(ScheduleRule, pk=rule_id, schedule__site=_get_active_site(request))
-    with group_services.site_admission(rule.schedule.site):
+    with transaction.atomic():
         rule.delete()
     messages.success(request, "Schedule rule deleted.")
     return redirect("schedule")
@@ -663,10 +594,9 @@ def schedule_delete(request, rule_id):
 @require_POST
 def group_delete(request, rule_id):
     rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
-    with group_services.site_admission(rule.schedule.site):
-        group_services.cancel_rule(rule, "Rule deleted")
+    with transaction.atomic():
         rule.delete()
-    messages.success(request, "Rule deleted. Any active watering is stopping.")
+    messages.success(request, "Rule deleted.")
     return redirect("schedule")
 
 
@@ -674,21 +604,14 @@ def group_delete(request, rule_id):
 @require_POST
 def group_stop(request, rule_id):
     rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
-    group_services.cancel_rule(rule, "Stopped by user")
-    messages.success(request, "Stopping rule; waiting for confirmed closure.")
-    return redirect("dashboard")
-
-
-@login_required
-@require_POST
-def group_run(request, rule_id):
-    rule = get_object_or_404(GroupedRule, pk=rule_id, schedule__site=_get_active_site(request))
-    try:
-        group_services.request_fixed_group(rule)
-        messages.success(request, "Run requested. The controller will execute the sequence.")
-    except (ValidationError, RuntimeError) as exc:
-        messages.error(request, str(exc))
-    return redirect("group_edit", rule_id=rule.pk)
+    rule.enabled = False
+    rule.save(update_fields=["enabled"])
+    messages.success(
+        request,
+        "Rule disabled. The controller stops its sequence on the next tick. "
+        "Re-enable the rule to resume future schedules.",
+    )
+    return redirect("schedule")
 
 
 @login_required
@@ -740,7 +663,7 @@ def schedule_new(request: HttpRequest) -> HttpResponse:
             copy_current = form.cleaned_data["copy_current"]
 
             try:
-                with group_services.site_admission(site):
+                with transaction.atomic():
                     new_schedule = Schedule.objects.create(
                         site=site, name=name, description=description
                     )
@@ -763,7 +686,6 @@ def schedule_new(request: HttpRequest) -> HttpResponse:
                                 member.rule = source
                                 member.save()
                     group_services.validate_schedule(new_schedule)
-                    group_services.cancel_site_groups(site, "Active schedule changed")
                     site.active_schedule = new_schedule
                     site.save(update_fields=["active_schedule"])
                 messages.success(request, "Schedule created.")
@@ -797,10 +719,8 @@ def schedule_load(request: HttpRequest) -> HttpResponse:
         if form.is_valid():
             schedule = form.cleaned_data["schedule"]
             try:
-                with group_services.site_admission(site):
+                with transaction.atomic():
                     group_services.validate_schedule(schedule)
-                    if site.active_schedule_id != schedule.pk:
-                        group_services.cancel_site_groups(site, "Active schedule changed")
                     site.active_schedule = schedule
                     site.save(update_fields=["active_schedule"])
                 messages.success(request, f"Loaded schedule: {schedule.name}.")
@@ -1164,11 +1084,14 @@ def trigger_run_now(request: HttpRequest, rule_id: int) -> HttpResponse:
     try:
         if normalize_rule_mode(rule.mode) != ScheduleRule.MODE_FIXED:
             raise ValidationError("Unsupported rule mode; no valve was opened.")
-        group_services.request_single(
-            rule.valve, rule.max_duration_seconds,
+        run = group_services.start_single(
+            rule.valve, rule.max_duration_seconds, IrrigationRun.TRIGGER_MANUAL,
             rule=rule,
         )
-        messages.success(request, "Run requested; queued for the next controller tick.")
+        if run.status == IrrigationRun.STATUS_FAILED:
+            messages.error(request, f"Failed to start run: {run.error_message}")
+        else:
+            messages.success(request, "Run started.")
     except Exception as exc:
         messages.error(request, f"Failed to start run: {exc}")
     return redirect("schedule")

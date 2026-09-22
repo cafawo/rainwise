@@ -1,1222 +1,416 @@
-from __future__ import annotations
-
+"""Behavior tests for transient sequences and ordinary timed watering logs."""
 import datetime as dt
-import threading
 from unittest import mock
 
 from django.core.exceptions import ValidationError
-from django.db import DatabaseError, close_old_connections, connections
-from django.db.models.query import QuerySet
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase
 
 from apps.irrigation import group_services
-from apps.irrigation.management.commands.controller import Command
 from apps.irrigation.models import (
-    CurveSettings,
-    GroupedRule,
-    GroupedRuleValve,
-    IrrigationRun,
-    RelayDevice,
-    RuleOccurrence,
-    Schedule,
-    ScheduleRule,
-    Site,
-    Valve,
+    CurveSettings, GroupedRule, GroupedRuleValve, IrrigationRun,
+    RelayDevice, Schedule, ScheduleRule, Site, Valve,
 )
+
+UTC = dt.timezone.utc
 
 
 class GroupExecutionTests(TestCase):
-    """Exercise persisted execution with bounded, entirely mocked hardware."""
-
     def setUp(self):
-        self.clock = dt.datetime(2026, 9, 21, 6, 0, tzinfo=dt.timezone.utc)
-        self.site = Site.objects.create(name="Test garden", timezone="UTC")
-        self.schedule = Schedule.objects.create(site=self.site, name="Active")
+        self.now = dt.datetime(2026, 9, 21, 6, tzinfo=UTC)
+        self.site = Site.objects.create(name="Garden", timezone="UTC")
+        self.schedule = Schedule.objects.create(site=self.site, name="Summer")
         self.site.active_schedule = self.schedule
         self.site.save(update_fields=["active_schedule"])
         self.device = RelayDevice.objects.create(
-            site=self.site, name="Mock relay", host="192.0.2.1"
+            site=self.site, name="Test relay", host="test.invalid",
         )
-        self.valves = [
+        self.a, self.b = [
             Valve.objects.create(
-                relay_device=self.device,
-                channel=channel,
-                name=name,
-                default_max_duration_seconds=900,
+                relay_device=self.device, channel=index, name=name,
+                application_rate_mm_h=7, default_max_duration_seconds=1800,
             )
-            for channel, name in ((1, "A"), (2, "B"))
+            for index, name in ((1, "A"), (2, "B"))
         ]
-        self.patches = [
-            mock.patch(
-                "apps.irrigation.group_services.timezone.now",
-                side_effect=lambda: self.clock,
-            ),
-            mock.patch("apps.irrigation.services.open_valve_for"),
+        self.runner = group_services.GroupRunner()
+        patches = [
+            mock.patch("apps.irrigation.group_services.timezone.now",
+                       side_effect=lambda: self.now),
+            mock.patch("apps.irrigation.services.open_valve_for", return_value=False),
             mock.patch("apps.irrigation.services.close_valve"),
-            mock.patch("apps.irrigation.services.read_valve_state", return_value=False),
-            mock.patch(
-                "apps.irrigation.services.read_device_states", return_value=[False] * 8
-            ),
         ]
-        self.clock_mock, self.open, self.close, self.read, _ = [
-            patcher.start() for patcher in self.patches
-        ]
-        for patcher in self.patches:
+        self.clock, self.open, self.close = [patcher.start() for patcher in patches]
+        for patcher in patches:
             self.addCleanup(patcher.stop)
 
-    def rule(self, *, mode="FIXED", durations=(60, 120), start_time=None):
+    def rule(self, mode="FIXED", durations=(60, 120)):
         rule = GroupedRule.objects.create(
-            schedule=self.schedule,
-            mode=mode,
+            schedule=self.schedule, mode=mode, start_time=dt.time(6),
             days_of_week_mask=127,
-            start_time=start_time or dt.time(6),
         )
-        for order, (valve, duration) in enumerate(zip(self.valves, durations)):
+        for order, (valve, duration) in enumerate(zip((self.a, self.b), durations)):
             GroupedRuleValve.objects.create(
-                rule=rule, valve=valve, order=order, duration_seconds=duration
+                rule=rule, valve=valve, order=order, duration_seconds=duration,
             )
         return rule
 
-    def smart_rule(self, *, need=2, durations=(900, 900)):
+    def smart(self, durations=(1800,), demand=7, coverage=1):
         CurveSettings.objects.create(
-            site=self.site, min_mm=need, max_mm=need, g=1, m=20,
-            coverage_days=2, fallback_temperature_c=20,
+            site=self.site, min_mm=demand, max_mm=demand,
+            coverage_days=coverage, fallback_temperature_c=25,
         )
-        for valve in self.valves:
-            valve.application_rate_mm_h = 12
-            valve.save(update_fields=["application_rate_mm_h"])
-        return self.rule(mode="SMART", durations=durations)
+        return self.rule("SMART", durations)
 
-    def tick(self, *, seconds=0, stop_finished=False):
-        self.clock += dt.timedelta(seconds=seconds)
-        if stop_finished:
-            Command()._stop_running_runs(self.clock)
-        group_services.group_tick(self.clock)
+    def tick(self, seconds=0):
+        self.now += dt.timedelta(seconds=seconds)
+        self.runner.tick()
 
-    def assert_no_pending_attempts(self, occurrence):
-        self.assertFalse(occurrence.runs.filter(
-            status="PLANNED", attempt_started_at__isnull=True,
-            cancellation_requested=False,
-        ).exists())
+    def commands(self):
+        return [(call.args[0].name, call.args[1])
+                for call in self.open.call_args_list]
 
-    def finish_occurrence(self, occurrence):
-        """Advance the mock clock through watering and durable rests."""
-        for _ in range(2 * occurrence.runs.count() + 2):
-            occurrence.refresh_from_db()
-            if occurrence.status not in ("ACTIVE", "STOPPING"):
-                return
-            running = occurrence.runs.filter(status="RUNNING").first()
-            if running:
-                stop = running.actual_start_at + dt.timedelta(
-                    seconds=running.optimal_duration_seconds,
-                )
-                self.tick(seconds=max(0, (stop - self.clock).total_seconds()),
-                          stop_finished=True)
-            else:
-                eligible = group_services.occurrence_next_eligible_at(occurrence)
-                self.tick(seconds=max(0, (eligible - self.clock).total_seconds())
-                          if eligible else 0)
-        self.fail("Mock sequence failed to finish within its finite pulse budget")
-
-    def test_reservations_use_peak_sequence_and_selected_cadence(self):
-        fixed = self.rule()
-        smart = self.smart_rule(durations=(900, 600))
-        for cadence in (30, 60):
-            with self.subTest(cadence=cadence), mock.patch.dict(
-                "os.environ", {"CONTROLLER_INTERVAL_SECONDS": str(cadence)}
-            ):
-                allowance = group_services.command_allowance()
-                self.assertEqual(group_services.reservation_seconds(fixed),
-                                 (180, 3 * cadence + 2 * allowance))
-                self.assertEqual(group_services.reservation_seconds(smart),
-                                 (2700, 7 * cadence + 4 * allowance))
-
-    def test_fixed_needs_no_weather_calibration_or_manual_duration_ceiling(self):
-        rule = self.rule(durations=(1200, 60))
-        group_services.validate_configuration(rule)
-        self.tick()
-        self.open.assert_called_once_with(self.valves[0], 1200)
-
-    def test_fixed_run_now_is_controller_owned_and_deduplicated(self):
-        rule = self.rule(start_time=dt.time(20))
-        first = group_services.request_fixed_group(rule)
-        second = group_services.request_fixed_group(rule)
-        self.assertEqual(first.pk, second.pk)
-        self.assertEqual(RuleOccurrence.objects.count(), 1)
-        self.open.assert_not_called()
-        self.tick()
-        self.open.assert_called_once_with(self.valves[0], 60)
-        attempted = IrrigationRun.objects.get(attempt_started_at__isnull=False)
-        self.assertEqual(attempted.trigger, "MANUAL")
-
-    def test_smart_run_now_and_unknown_modes_cannot_open(self):
-        smart = self.smart_rule()
-        with self.assertRaises(ValidationError):
-            group_services.request_fixed_group(smart)
-        GroupedRule.objects.filter(pk=smart.pk).update(mode="ALIEN")
-        self.tick()
-        self.open.assert_not_called()
-
-    def test_fixed_sequence_waits_for_fresh_closure_and_runs_once(self):
-        rule = self.rule()
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.tick()
-        self.open.assert_called_once_with(self.valves[0], 60)
-        self.tick(seconds=60, stop_finished=True)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 60), mock.call(self.valves[1], 120),
-        ])
-        self.read.assert_any_call(self.valves[0])
-        self.tick(seconds=120, stop_finished=True)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.tick()
-        self.assertEqual(self.open.call_count, 2)
-
-    def test_failed_fresh_read_interrupts_despite_finished_run_and_closed_cache(self):
-        rule = self.rule()
-        self.tick()
-        self.assertFalse(self.valves[0].last_known_is_open)
-        self.read.side_effect = RuntimeError("No current read")
-        self.tick(seconds=60, stop_finished=True)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertIn(occurrence.status, ("STOPPING", "FAILED", "CANCELLED"))
-        self.open.assert_called_once_with(self.valves[0], 60)
-        self.assert_no_pending_attempts(occurrence)
-
-    def test_claim_and_attempt_exist_before_transmission(self):
-        rule = self.rule()
-
-        def inspect_attempt(valve, duration):
-            run = IrrigationRun.objects.get(valve=valve, attempt_started_at__isnull=False)
-            self.assertEqual(run.optimal_duration_seconds, duration)
-            self.assertEqual(run.occurrence.rule_id, rule.pk)
-            self.assertEqual(run.occurrence.status, "ACTIVE")
-
-        self.open.side_effect = inspect_attempt
-        self.tick()
-        self.open.assert_called_once()
-
-    def test_cancellation_during_open_closes_without_starting_next_member(self):
-        rule = self.rule()
-
-        def cancel_in_flight(*_args):
-            occurrence = RuleOccurrence.objects.get(rule=rule)
-            group_services.cancel_occurrence(occurrence, "Test cancellation during open")
-
-        self.open.side_effect = cancel_in_flight
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertTrue(occurrence.cancellation_requested)
-        self.close.assert_any_call(self.valves[0])
-        self.tick(seconds=60, stop_finished=True)
-        self.open.assert_called_once()
-        self.assert_no_pending_attempts(occurrence)
-
-    def test_cancellation_before_open_never_transmits(self):
-        rule = self.rule(start_time=dt.time(20))
-        occurrence = group_services.request_fixed_group(rule)
-        group_services.cancel_occurrence(occurrence, "Cancelled before admission")
-        self.tick()
-        self.open.assert_not_called()
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "CANCELLED")
-
-    def test_closing_any_group_member_cancels_current_member(self):
-        rule = self.rule()
-        self.tick()
-        group_services.close_member(self.valves[1])
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertTrue(occurrence.cancellation_requested)
-        self.close.assert_any_call(self.valves[0])
-        self.open.assert_called_once()
-
-    def test_single_admitted_first_causes_skipped_group_without_late_launch(self):
-        rule = self.rule()
-        group_services.start_single(self.valves[1], 600, "MANUAL")
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "SKIPPED")
-        self.assertFalse(occurrence.runs.exists())
-        self.tick(seconds=600, stop_finished=True)
-        self.open.assert_called_once_with(self.valves[1], 600)
-
-    def test_group_admitted_first_blocks_individual_start(self):
+    def test_fixed_group_logs_only_attempted_pulses_in_order(self):
         self.rule()
         self.tick()
-        with self.assertRaises(ValidationError):
-            group_services.start_single(self.valves[1], 60, "MANUAL")
-        self.open.assert_called_once_with(self.valves[0], 60)
+        self.assertEqual(self.commands(), [("A", 60)])
+        self.assertEqual(IrrigationRun.objects.count(), 1)
+        self.tick(60)
+        self.assertEqual(self.commands(), [("A", 60), ("B", 120)])
+        self.tick(120)
+        self.assertFalse(self.runner.active_sites)
+        self.assertEqual(IrrigationRun.objects.filter(status="FINISHED").count(), 2)
+        self.close.assert_not_called()  # The original relay timer ends the pulse.
 
-    def test_pending_run_now_rejected_if_conflict_arises_before_admission(self):
-        rule = self.rule(start_time=dt.time(20))
-        occurrence = group_services.request_fixed_group(rule)
-        IrrigationRun.objects.create(
-            valve=self.valves[1], trigger="MANUAL", status="RUNNING",
-            actual_start_at=self.clock, attempt_started_at=self.clock,
-            optimal_duration_seconds=600, max_duration_seconds=600,
+    def test_enough_smart_rounds_with_equal_duration_rests(self):
+        self.smart(durations=(1200,))
+        for seconds in (0, 1200, 1200, 1200, 1200, 1200):
+            self.tick(seconds)
+        self.assertEqual(self.commands(), [("A", 1200)] * 3)
+        self.assertFalse(self.runner.active_sites)
+        self.assertEqual(
+            list(IrrigationRun.objects.order_by("pk").values_list("actual_start_at", flat=True)),
+            [dt.datetime(2026, 9, 21, hour, minute, tzinfo=UTC)
+             for hour, minute in ((6, 0), (6, 40), (7, 20))],
         )
+
+    def test_shorter_other_valve_does_not_replace_required_rest(self):
+        self.b.application_rate_mm_h = 84
+        self.b.save(update_fields=["application_rate_mm_h"])
+        self.smart(durations=(1800, 300))
         self.tick()
-        occurrence.refresh_from_db()
-        self.assertIn(occurrence.status, ("SKIPPED", "FAILED", "CANCELLED"))
+        self.tick(1800)
+        self.tick(300)
+        self.assertEqual(self.commands(), [("A", 1800), ("B", 300)])
+        self.tick(1499)
+        self.assertEqual(self.open.call_count, 2)
+        self.tick(1)
+        self.assertEqual(self.commands()[-1], ("A", 1800))
+        self.tick(1800)
+        self.assertFalse(self.runner.active_sites)
+
+    def test_forty_five_minute_pulses_supported(self):
+        self.smart(durations=(2700,), demand=10.5)
+        self.tick()
+        self.tick(2700)
+        self.assertEqual(self.open.call_count, 1)
+        self.tick(2700)
+        self.assertEqual(self.commands(), [("A", 2700), ("A", 2700)])
+
+    def test_curve_rate_and_limit_edits_apply_next_day(self):
+        rule = self.smart()
+        self.tick()
+        CurveSettings.objects.filter(site=self.site).update(min_mm=3.5, max_mm=3.5)
+        self.a.application_rate_mm_h = 14
+        self.a.save(update_fields=["application_rate_mm_h"])
+        rule.members.update(duration_seconds=900)
+        self.tick(1800)
+        self.tick(1800)
+        self.assertEqual(self.commands(), [("A", 1800), ("A", 1800)])
+        self.assertEqual(
+            list(IrrigationRun.objects.values_list("application_rate_mm_h", flat=True)),
+            [7, 7],
+        )
+        self.tick(1800)
+        self.now = dt.datetime(2026, 9, 22, 6, tzinfo=UTC)
+        self.tick()
+        self.assertEqual(self.commands()[-1], ("A", 900))
+        self.assertEqual(IrrigationRun.objects.latest("pk").application_rate_mm_h, 14)
+
+    def test_membership_and_order_edits_do_not_rewrite_current_sequence(self):
+        rule = self.rule()
+        self.tick()
+        rule.members.all().delete()
+        for order, (valve, duration) in enumerate(((self.b, 300), (self.a, 180))):
+            GroupedRuleValve.objects.create(
+                rule=rule, valve=valve, order=order, duration_seconds=duration,
+            )
+        self.tick(60)
+        self.assertEqual(self.commands(), [("A", 60), ("B", 120)])
+        self.tick(120)
+        self.now = dt.datetime(2026, 9, 22, 6, tzinfo=UTC)
+        self.tick()
+        self.assertEqual(self.commands()[-1], ("B", 300))
+
+    def test_lost_rate_applies_next_invocation(self):
+        self.smart(durations=(1800, 1800))
+        self.tick()
+        Valve.objects.filter(pk=self.b.pk).update(application_rate_mm_h=None)
+        self.tick(1800)
+        self.assertEqual(self.commands()[-1], ("B", 1800))
+        self.assertEqual(IrrigationRun.objects.latest("pk").application_rate_mm_h, 7)
+
+    def test_missing_rate_at_admission_skips_only_that_valve(self):
+        self.smart(durations=(1800, 1800))
+        Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=None)
+        self.tick()
+        self.assertEqual(self.commands(), [("B", 1800)])
+
+    def test_zero_target_creates_no_watering_records(self):
+        self.smart(demand=0)
+        self.tick()
+        self.tick(30)
+        self.assertFalse(IrrigationRun.objects.exists())
+        self.assertFalse(self.runner.active_sites)
         self.open.assert_not_called()
 
-    def test_manual_request_rejects_midnight_crossing(self):
-        rule = self.rule(start_time=dt.time(20))
-        self.clock = self.clock.replace(hour=23, minute=59)
-        with self.assertRaises(ValidationError):
-            group_services.request_fixed_group(rule)
+    def test_disable_stops_current_pulse_and_future_rounds(self):
+        rule = self.smart()
+        self.tick()
+        rule.enabled = False
+        rule.save(update_fields=["enabled"])
+        self.tick(60)
+        self.close.assert_called_once()
+        self.assertFalse(self.runner.active_sites)
+        self.assertEqual(self.open.call_count, 1)
+        self.assertEqual(IrrigationRun.objects.get().stop_reason, "MANUAL_STOP")
+
+    def test_disable_while_resting_needs_no_command_queue(self):
+        rule = self.smart()
+        self.tick()
+        self.tick(1800)
+        rule.enabled = False
+        rule.save(update_fields=["enabled"])
+        self.tick(60)
+        self.assertFalse(self.runner.active_sites)
+        self.close.assert_not_called()
+        self.assertEqual(self.open.call_count, 1)
+
+    def test_delete_and_schedule_switch_stop_next_tick(self):
+        for action in ("delete", "switch"):
+            with self.subTest(action=action):
+                self.setUp_for_next_scenario()
+                rule = self.rule()
+                self.tick()
+                if action == "delete":
+                    rule.delete()
+                else:
+                    other = Schedule.objects.create(site=self.site, name="Other")
+                    Site.objects.filter(pk=self.site.pk).update(active_schedule=other)
+                self.tick(10)
+                self.assertFalse(self.runner.active_sites)
+                self.assertEqual(self.open.call_count, 1)
+                self.close.assert_called_once()
+
+    def setUp_for_next_scenario(self):
+        GroupedRule.objects.all().delete()
+        IrrigationRun.objects.all().delete()
+        Site.objects.filter(pk=self.site.pk).update(active_schedule=self.schedule)
+        self.now = dt.datetime(2026, 9, 21, 6, tzinfo=UTC)
+        self.runner = group_services.GroupRunner()
+        self.open.reset_mock()
+        self.close.reset_mock()
+
+    def test_failed_early_close_waits_for_timeout_without_retry_machinery(self):
+        rule = self.rule()
+        self.tick()
+        self.close.side_effect = RuntimeError("Offline")
+        rule.enabled = False
+        rule.save(update_fields=["enabled"])
+        self.tick(10)
+        self.tick(10)
+        self.assertEqual(self.close.call_count, 1)
+        self.assertIn(self.site.pk, self.runner.active_sites)
+        self.tick(40)
+        self.assertFalse(self.runner.active_sites)
+        self.assertEqual(self.open.call_count, 1)
+        self.assertIsNotNone(IrrigationRun.objects.get().actual_stop_at)
+
+    def test_opening_failure_never_replays_or_opens_next_member(self):
+        self.rule()
+        self.open.side_effect = RuntimeError("Lost response")
+        self.tick()
+        self.tick(600)
+        self.assertEqual(self.open.call_count, 1)
+        run = IrrigationRun.objects.get()
+        self.assertTrue(run.delivery_uncertain)
+        self.assertFalse(self.runner.active_sites)
+
+    def test_transport_retry_stops_later_pulses_without_changing_driver(self):
+        self.rule()
+        self.open.return_value = True
+        self.tick()
+        self.tick(60)
+        self.assertEqual(self.open.call_count, 1)
+        self.assertFalse(self.runner.active_sites)
+        self.assertTrue(IrrigationRun.objects.get().delivery_uncertain)
+
+    def test_manual_close_of_current_pulse_ends_sequence(self):
+        self.rule()
+        self.tick()
+        self.now += dt.timedelta(seconds=10)
+        group_services.close_member(self.a)
+        self.tick()
+        self.assertFalse(self.runner.active_sites)
+        self.assertEqual(self.open.call_count, 1)
+
+    def test_restart_abandons_sequence_and_completes_only_existing_log(self):
+        self.rule()
+        self.tick()
+        self.runner = group_services.GroupRunner()
+        self.tick(30)
+        self.assertEqual(self.open.call_count, 1)
+        self.tick(30)
+        self.assertEqual(self.open.call_count, 1)
+        self.assertEqual(IrrigationRun.objects.get().status, "FINISHED")
+        self.assertFalse(self.runner.active_sites)
+
+    def test_restart_during_rest_does_not_resume(self):
+        self.smart()
+        self.tick()
+        self.tick(1800)
+        self.runner = group_services.GroupRunner()
+        self.tick(1800)
+        self.assertEqual(self.open.call_count, 1)
+
+    def test_membership_edit_and_restart_do_not_repeat_the_same_start(self):
+        rule = self.smart(durations=(1,), demand=0.003)
+        self.tick()
+        self.tick(1)
+        rule.members.update(valve=self.b)
+        self.runner = group_services.GroupRunner()
+        self.tick(1)
+        self.assertEqual(self.commands(), [("A", 1)])
+
+    def test_missed_start_is_not_backfilled(self):
+        self.rule()
+        self.tick(60)
         self.open.assert_not_called()
+        self.assertFalse(IrrigationRun.objects.exists())
 
-    def test_new_group_conflicts_with_existing_single_rule(self):
+    def test_repeated_dst_time_does_not_restart_after_controller_restart(self):
+        self.site.timezone = "Europe/Berlin"
+        self.site.save(update_fields=["timezone"])
+        self.now = dt.datetime(2026, 10, 25, 0, 30, tzinfo=UTC)
         rule = self.rule()
-        ScheduleRule.objects.create(
-            schedule=self.schedule, valve=self.valves[0], mode="FIXED",
-            start_time=dt.time(6, 1), days_of_week_mask=127,
-            max_duration_seconds=60,
-        )
-        with self.assertRaises(ValidationError):
-            group_services.validate_configuration(rule)
-
-    def test_switching_schedule_cancels_pending_work(self):
-        rule = self.rule()
+        rule.start_time = dt.time(2, 30)
+        rule.save(update_fields=["start_time"])
         self.tick()
-        other = Schedule.objects.create(site=self.site, name="Replacement")
-        self.site.active_schedule = other
-        self.site.save(update_fields=["active_schedule"])
-        self.tick()
-        self.open.assert_called_once()
-        self.close.assert_any_call(self.valves[0])
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assert_no_pending_attempts(occurrence)
+        self.runner = group_services.GroupRunner()
+        self.tick(3600)
+        self.assertEqual(self.open.call_count, 1)
 
-    def test_disabled_device_still_receives_recovery_close_for_attempted_rows(self):
-        rule = self.rule(start_time=dt.time(20))
-        for index, status in enumerate(("PLANNED", "FAILED")):
-            occurrence = RuleOccurrence.objects.create(
-                site=self.site, rule=rule, mode="FIXED", source="MANUAL",
-                requested_at=self.clock, status="ACTIVE",
-                reservation_end=self.clock + dt.timedelta(minutes=10),
-            )
-            IrrigationRun.objects.create(
-                valve=self.valves[index], occurrence=occurrence,
-                pass_number=1, member_order=index, status=status,
-                trigger="MANUAL", attempt_started_at=self.clock,
-                optimal_duration_seconds=60, max_duration_seconds=60,
-            )
+    def test_existing_watering_skips_group_without_future_rows(self):
+        self.rule()
+        group_services.start_single(self.a, 600, "MANUAL")
+        self.tick()
+        self.assertEqual(self.open.call_count, 1)
+        self.assertFalse(IrrigationRun.objects.filter(trigger="GROUP").exists())
+
+    def test_intervening_manual_watering_abandons_remaining_group(self):
+        self.smart()
+        self.tick()
+        self.tick(1800)
+        group_services.start_single(self.b, 300, "MANUAL")
+        self.tick(1)
+        # Manual watering is accepted; the group will not overlap its next pulse.
+        self.tick(1799)
+        self.assertEqual(self.open.call_count, 2)
+        self.tick(1)
+        self.assertFalse(self.runner.active_sites)
+
+    def test_disabled_relay_prevents_next_opening(self):
+        self.rule()
+        self.tick()
         self.device.enabled = False
         self.device.save(update_fields=["enabled"])
-        group_services.recover_groups()
-        self.open.assert_not_called()
-        for valve in self.valves:
-            self.close.assert_any_call(valve)
-            self.read.assert_any_call(valve)
-        self.assertFalse(IrrigationRun.objects.filter(closure_confirmed_at__isnull=True).exists())
+        self.tick(60)
+        self.tick(1)
+        self.assertEqual(self.open.call_count, 1)
+        self.assertFalse(self.runner.active_sites)
 
-    def test_recovery_requires_fresh_read_even_if_redundant_close_fails(self):
-        rule = self.rule()
+    def test_deleted_valve_abandons_sequence_without_blocking_the_site(self):
+        self.rule()
         self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        group_services.cancel_occurrence(occurrence)
-        self.close.side_effect = RuntimeError("Redundant close unavailable")
-        self.read.return_value = True
-        self.tick()
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "STOPPING")
-        self.read.return_value = False
-        self.tick()
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "CANCELLED")
-        self.assertFalse(occurrence.runs.filter(
-            attempt_started_at__isnull=False, closure_confirmed_at__isnull=True
-        ).exists())
-        self.open.assert_called_once()
+        self.a.delete()
+        self.tick(10)
+        self.assertFalse(self.runner.active_sites)
+        self.close.assert_called_once()
+        self.assertEqual(self.open.call_count, 1)
 
-    def test_smart_rotates_first_pass_then_partial_second_pass(self):
-        rule = self.smart_rule(need=2)
+    def test_slow_opening_uses_return_time_for_completion_and_rest(self):
+        self.smart()
+        def delayed_open(*args):
+            self.now += dt.timedelta(seconds=10)
+            return False
+        self.open.side_effect = delayed_open
         self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=300, stop_finished=True)
-        self.tick(seconds=600)
-        self.tick(seconds=300, stop_finished=True)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 900), mock.call(self.valves[1], 900),
-            mock.call(self.valves[0], 300), mock.call(self.valves[1], 300),
-        ])
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.assertEqual(list(occurrence.runs.order_by("pass_number", "member_order").values_list(
-            "valve_id", "pass_number", flat=False,
-        )), [(self.valves[0].pk, 1), (self.valves[1].pk, 1),
-             (self.valves[0].pk, 2), (self.valves[1].pk, 2)])
-
-    def test_zero_demand_is_recorded_once_without_hardware(self):
-        rule = self.smart_rule(need=0)
-        self.tick()
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "ZERO")
-        self.assertFalse(occurrence.runs.exists())
-        self.open.assert_not_called()
-
-    def test_excluded_weekday_never_creates_automatic_work(self):
-        rule = self.smart_rule()
-        rule.days_of_week_mask = 1 << 1  # Tuesday; the fixed clock is Monday.
-        rule.save(update_fields=["days_of_week_mask"])
-        self.tick()
-        self.assertFalse(RuleOccurrence.objects.exists())
-        self.open.assert_not_called()
-
-    def test_rule_deletion_preserves_execution_snapshot(self):
-        rule = self.rule()
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        snapshot = occurrence.config
-        group_services.cancel_rule(rule, "Deleted")
-        rule.delete()
-        self.tick()
-        occurrence.refresh_from_db()
-        self.assertIsNone(occurrence.rule_id)
-        self.assertEqual(occurrence.config, snapshot)
-        self.assertTrue(occurrence.runs.exists())
-        self.open.assert_called_once()
-
-    def test_command_deadline_rechecked_after_claim_with_fresh_clock(self):
-        rule = self.rule(durations=(60,))
-        occurrence = group_services._plan_occurrence(rule, scheduled_at=self.clock)
-        occurrence.reservation_end = self.clock + dt.timedelta(
-            seconds=60 + group_services.command_allowance() + 5,
-        )
-        occurrence.save(update_fields=["reservation_end"])
-        original_send = group_services._send_claimed
-
-        def delayed_send(run):
-            self.clock += dt.timedelta(seconds=6)
-            return original_send(run)
-
-        with mock.patch.object(group_services, "_send_claimed", side_effect=delayed_send):
-            self.tick()
-        self.open.assert_not_called()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertTrue(occurrence.cancellation_requested)
-        self.assertIn("deadline", occurrence.outcome.lower())
-
-    def test_reservation_overrun_blocks_manual_until_closure_confirmed(self):
-        rule = self.rule(durations=(60,))
-        self.tick()
-        self.read.side_effect = RuntimeError("Cannot establish closure")
-        self.tick(seconds=1000, stop_finished=True)
-        with self.assertRaises(ValidationError):
-            group_services.start_single(self.valves[1], 60, "MANUAL")
-        self.open.assert_called_once()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "STOPPING")
-        self.read.side_effect = None
-        self.tick()
-        group_services.start_single(self.valves[1], 60, "MANUAL")
+        self.tick(1790)
+        self.assertEqual(IrrigationRun.objects.get().status, "RUNNING")
+        self.tick(10)
+        self.assertEqual(IrrigationRun.objects.get().actual_stop_at, self.now)
+        self.tick(1799)
+        self.assertEqual(self.open.call_count, 1)
+        self.tick(1)
         self.assertEqual(self.open.call_count, 2)
 
-    def test_increased_cadence_revalidates_existing_group_conflicts(self):
-        rule = self.rule(durations=(60,), start_time=dt.time(6))
+    def test_reservation_expiry_discards_remaining_sequence(self):
+        self.smart()
+        self.tick()
+        self.tick(23 * 3600)
+        self.assertEqual(self.open.call_count, 1)
+        self.tick()
+        self.assertFalse(self.runner.active_sites)
+
+    def test_slow_preparation_cannot_start_a_pulse_past_its_deadline(self):
+        rule = self.rule()
+        reserved = group_services.reservation_details(rule)["total_seconds"]
+        started = self.now
+        self.tick()
+        self.now = started + dt.timedelta(
+            seconds=reserved - 120 - group_services.command_allowance() - 1,
+        )
+
+        def delayed_enabled_check():
+            self.now += dt.timedelta(seconds=2)
+            return True
+
+        with mock.patch(
+            "apps.irrigation.group_services.RelayDevice.objects.filter",
+        ) as devices:
+            devices.return_value.exists.side_effect = delayed_enabled_check
+            self.tick()
+        self.assertEqual(self.commands(), [("A", 60)])
+
+
+    def test_overlapping_group_rejected_but_independent_fixed_overlap_preserved(self):
+        group = self.rule()
         ScheduleRule.objects.create(
-            schedule=self.schedule, valve=self.valves[1], mode="FIXED",
-            days_of_week_mask=127, start_time=dt.time(6, 2, 30),
-            max_duration_seconds=60,
+            schedule=self.schedule, valve=self.a, start_time=dt.time(6),
+            days_of_week_mask=127, mode="FIXED", max_duration_seconds=60,
         )
-        with mock.patch.dict("os.environ", {"CONTROLLER_INTERVAL_SECONDS": "30"}):
-            group_services.validate_configuration(rule)
-        with mock.patch.dict("os.environ", {"CONTROLLER_INTERVAL_SECONDS": "60"}):
-            with self.assertRaises(ValidationError):
-                group_services.validate_configuration(rule)
-            self.tick()
-        self.open.assert_not_called()
-
-    def test_failed_durable_claim_prevents_any_hardware_command(self):
-        self.rule()
-        original_update = QuerySet.update
-
-        def fail_claim(queryset, **values):
-            if queryset.model is IrrigationRun and "attempt_started_at" in values:
-                raise DatabaseError("Simulated claim persistence failure")
-            return original_update(queryset, **values)
-
-        with mock.patch.object(QuerySet, "update", new=fail_claim):
-            self.tick()
-        self.open.assert_not_called()
-        self.assertFalse(IrrigationRun.objects.filter(attempt_started_at__isnull=False).exists())
-
-    def test_failed_result_write_after_command_closes_and_never_replays(self):
-        rule = self.rule()
-        original_update = QuerySet.update
-
-        def fail_command_result(queryset, **values):
-            if queryset.model is IrrigationRun and values.get("status") == "RUNNING":
-                raise DatabaseError("Simulated post-command persistence failure")
-            return original_update(queryset, **values)
-
-        with mock.patch.object(QuerySet, "update", new=fail_command_result):
-            self.tick()
-        self.open.assert_called_once()
-        self.close.assert_any_call(self.valves[0])
-        attempted = IrrigationRun.objects.get(attempt_started_at__isnull=False)
-        self.assertTrue(attempted.delivery_uncertain)
-        group_services.recover_groups()
-        self.tick(seconds=60)
-        self.open.assert_called_once()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertTrue(occurrence.cancellation_requested)
-
-    def test_old_uncertain_attempts_supply_credit_without_a_two_attempt_ceiling(self):
-        rule = self.smart_rule(need=2, durations=(900,))
-        old_schedule = Schedule.objects.create(site=self.site, name="Old schedule")
-        old_rule = GroupedRule.objects.create(
-            schedule=old_schedule, mode="SMART", start_time=dt.time(4),
-            days_of_week_mask=127,
-        )
-        occurrence = RuleOccurrence.objects.create(
-            site=self.site, rule=old_rule, mode="SMART", source="SCHEDULED",
-            status="CANCELLED", requested_at=self.clock - dt.timedelta(hours=2),
-        )
-        for pass_number in (1, 2):
-            when = self.clock - dt.timedelta(hours=2) + dt.timedelta(minutes=pass_number)
-            IrrigationRun.objects.create(
-                valve=self.valves[0], occurrence=occurrence, trigger="SCHEDULED",
-                status="FAILED", pass_number=pass_number, member_order=0,
-                attempt_started_at=when, attempt_finished_at=when,
-                closure_confirmed_at=when + dt.timedelta(seconds=1),
-                optimal_duration_seconds=1, max_duration_seconds=900,
-                application_rate_mm_h=12, delivery_uncertain=True,
-            )
-        self.tick()
-        self.open.assert_called_once_with(self.valves[0], 900)
-        self.assertEqual(IrrigationRun.objects.filter(
-            valve=self.valves[0], attempt_started_at__isnull=False,
-            occurrence__mode="SMART",
-        ).count(), 3)
-        decision = RuleOccurrence.objects.get(rule=rule).decision
-        self.assertGreater(decision["valves"][str(self.valves[0].pk)]["irrigation"]["credit_mm"], 0)
-
-    def test_completed_delivery_earlier_in_admitted_minute_is_credited(self):
-        rule = self.smart_rule(need=2)
-        start = self.clock - dt.timedelta(minutes=10) + dt.timedelta(seconds=20)
-        stop = self.clock + dt.timedelta(seconds=20)
-        IrrigationRun.objects.create(
-            valve=self.valves[0], trigger="MANUAL", status="FINISHED",
-            actual_start_at=start, actual_stop_at=stop,
-            attempt_started_at=start, attempt_finished_at=start,
-            closure_confirmed_at=stop, optimal_duration_seconds=600,
-            max_duration_seconds=600, application_rate_mm_h=12,
-            stop_reason="COMPLETED",
-        )
-        self.tick(seconds=40)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.decision_at, self.clock)
-        self.assertEqual(occurrence.scheduled_at, self.clock.replace(second=0))
-        self.open.assert_called_once_with(self.valves[0], 600)
-
-    def test_dst_gap_is_recorded_as_skipped(self):
-        self.site.timezone = "Europe/Berlin"
-        self.site.save(update_fields=["timezone"])
-        self.clock = dt.datetime(2026, 3, 29, 1, 0, tzinfo=dt.timezone.utc)
-        rule = self.rule(start_time=dt.time(2, 30))
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "SKIPPED")
-        self.assertIn("DST", occurrence.outcome)
-        self.open.assert_not_called()
-
-    def test_dst_repeated_minute_produces_one_occurrence(self):
-        self.site.timezone = "Europe/Berlin"
-        self.site.save(update_fields=["timezone"])
-        self.clock = dt.datetime(2026, 10, 25, 0, 30, tzinfo=dt.timezone.utc)
-        rule = self.rule(durations=(60,), start_time=dt.time(2, 30))
-        self.tick()
-        self.tick(seconds=3600, stop_finished=True)
-        self.assertEqual(RuleOccurrence.objects.filter(rule=rule).count(), 1)
-        self.open.assert_called_once()
-
-    def test_other_site_group_does_not_block_individual_opening(self):
-        self.rule()
-        self.tick()
-        other_site = Site.objects.create(name="Independent garden", timezone="UTC")
-        other_device = RelayDevice.objects.create(
-            site=other_site, name="Other mock", host="192.0.2.3",
-        )
-        other_valve = Valve.objects.create(
-            relay_device=other_device, name="Independent valve", channel=1,
-            default_max_duration_seconds=600,
-        )
-        group_services.start_single(other_valve, 60, "MANUAL")
-        self.open.assert_has_calls([
-            mock.call(self.valves[0], 60), mock.call(other_valve, 60),
-        ])
-
-    def test_unexpected_open_future_member_interrupts_the_reservation(self):
-        rule = self.rule()
-        self.tick()
-        Valve.objects.filter(pk=self.valves[1].pk).update(last_known_is_open=True)
-        self.tick(seconds=60, stop_finished=True)
-        self.open.assert_called_once_with(self.valves[0], 60)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertTrue(occurrence.cancellation_requested)
-
-    def test_second_pass_open_state_is_not_mistaken_for_failed_first_pass_closure(self):
-        rule = self.smart_rule(need=2)
-        self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=900, stop_finished=True)
-        self.read.side_effect = lambda valve: valve.pk == self.valves[0].pk
-        self.tick(seconds=60)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertFalse(occurrence.cancellation_requested)
-        self.assertEqual(occurrence.status, "ACTIVE")
-        self.assertEqual(self.open.call_count, 3)
-        self.read.side_effect = None
-        self.tick(seconds=240, stop_finished=True)
-        self.tick(seconds=600)
-        self.open.assert_called_with(self.valves[1], 300)
-
-    def test_legacy_running_pulse_needs_closure_confirmation_before_group_admission(self):
-        rule = self.rule()
-        legacy = IrrigationRun.objects.create(
-            valve=self.valves[1], trigger="MANUAL", status="RUNNING",
-            actual_start_at=self.clock - dt.timedelta(seconds=61),
-            optimal_duration_seconds=60, max_duration_seconds=60,
-        )
-        self.close.side_effect = RuntimeError("Legacy redundant close failed")
-        self.read.side_effect = RuntimeError("No fresh state available")
-        self.tick(stop_finished=True)
-        self.open.assert_not_called()
-        self.assertEqual(RuleOccurrence.objects.get(rule=rule).status, "SKIPPED")
-        legacy.refresh_from_db()
-        self.assertEqual(legacy.status, "FINISHED")
-        self.assertEqual(legacy.optimal_duration_seconds, 60)
-        self.assertIsNone(legacy.closure_confirmed_at)
-
-    def test_failed_startup_recovery_preserves_stops_and_blocks_group_progression(self):
-        command = Command()
-        command._recovery_pending = True
-        with (
-            mock.patch.object(
-                group_services, "recover_groups",
-                side_effect=DatabaseError("Unavailable"),
-            ),
-            mock.patch.object(group_services, "group_tick") as group_tick,
-            mock.patch.object(command, "_start_due_runs"),
-            mock.patch.object(command, "_stop_running_runs", return_value=set()) as stop,
-            mock.patch.object(command, "_watchdog_close") as watchdog,
-            mock.patch.object(command, "_refresh_weather"),
-        ):
-            command._tick(self.clock)
-        stop.assert_called_once()
-        watchdog.assert_called_once()
-        group_tick.assert_not_called()
-        self.assertTrue(command._recovery_pending)
-
-    def assert_daily_deliveries(self, need, expected):
-        rule = self.smart_rule(need=need)
-        first_decision = self.clock
-        for day, expected_mm in enumerate(expected):
-            self.clock = first_decision + dt.timedelta(days=day)
-            self.tick()
-            occurrence = RuleOccurrence.objects.get(
-                rule=rule, scheduled_local_date=self.clock.date(),
-            )
-            self.finish_occurrence(occurrence)
-            occurrence.refresh_from_db()
-            self.assertIn(occurrence.status, ("FINISHED", "ZERO"))
-            for valve in self.valves:
-                delivered_seconds = sum(occurrence.runs.filter(
-                    valve=valve, attempt_started_at__isnull=False,
-                ).values_list("optimal_duration_seconds", flat=True))
-                self.assertAlmostEqual(
-                    delivered_seconds * 12 / 3600, expected_mm,
-                    msg=f"Day {day + 1}, valve {valve.name}",
-                )
-
-    def test_complete_multiday_sequence_alternates_four_and_zero(self):
-        self.assert_daily_deliveries(2, [4, 0, 4, 0])
-
-    def test_complete_multiday_sequence_alternates_eight_and_zero(self):
-        self.assert_daily_deliveries(4, [8, 0, 8, 0])
-
-    def test_complete_multiday_sequence_alternates_fourteen_and_zero(self):
-        self.assert_daily_deliveries(7, [14, 0, 14, 0])
-
-    def test_faster_calibrated_valve_is_fulfilled_and_skips_second_pass(self):
-        self.smart_rule(need=2)
-        self.valves[1].application_rate_mm_h = 24
-        self.valves[1].save(update_fields=["application_rate_mm_h"])
-        self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=600, stop_finished=True)
-        self.tick(seconds=300, stop_finished=True)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 900), mock.call(self.valves[1], 600),
-            mock.call(self.valves[0], 300),
-        ])
-
-    def test_pending_manual_request_keeps_saved_duration_and_calibration(self):
-        self.valves[0].application_rate_mm_h = 12
-        self.valves[0].save(update_fields=["application_rate_mm_h"])
-        rule = self.rule(durations=(60,), start_time=dt.time(20))
-        occurrence = group_services.request_fixed_group(rule)
-        rule.members.update(duration_seconds=120)
-        self.valves[0].application_rate_mm_h = 24
-        self.valves[0].save(update_fields=["application_rate_mm_h"])
-        self.tick()
-        self.open.assert_called_once_with(self.valves[0], 60)
-        attempted = occurrence.runs.get(attempt_started_at__isnull=False)
-        self.assertEqual(attempted.optimal_duration_seconds, 60)
-        self.assertEqual(attempted.application_rate_mm_h, 12)
-
-    def test_missing_smart_rate_skips_only_affected_member(self):
-        rule = self.smart_rule()
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
-        reservation = group_services.reservation_seconds(rule)
-        self.tick()
-        self.finish_occurrence(RuleOccurrence.objects.get(rule=rule))
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[1], 900), mock.call(self.valves[1], 300),
-        ])
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "FINISHED")
-        missing = occurrence.decision["valves"][str(self.valves[0].pk)]
-        self.assertTrue(missing["skipped"])
-        self.assertEqual(missing["planned_seconds"], 0)
-        self.assertTrue(occurrence.decision["warnings"])
-        self.assertFalse(occurrence.runs.filter(
-            valve=self.valves[0], attempt_started_at__isnull=False,
-        ).exists())
-        self.assertEqual(group_services.reservation_seconds(rule), reservation)
-        self.assertEqual(occurrence.config["watering_seconds"]
-                         + occurrence.config["break_seconds"], reservation[0])
-        self.assertEqual(occurrence.config["scheduling_allowance_seconds"], reservation[1])
-
-    def test_all_missing_smart_rates_record_idempotent_skip_not_zero_demand(self):
-        rule = self.smart_rule()
-        Valve.objects.filter(pk__in=[valve.pk for valve in self.valves]).update(
-            application_rate_mm_h=None,
-        )
-        self.tick()
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "SKIPPED")
-        self.assertFalse(occurrence.runs.exists())
-        self.assertEqual(len(occurrence.decision["valves"]), 2)
-        self.assertTrue(all(
-            row["skipped"] for row in occurrence.decision["valves"].values()
-        ))
-        self.open.assert_not_called()
-
-    def test_rate_removed_after_planning_preserves_snapshot_and_other_members(self):
-        rule = self.smart_rule()
-        occurrence = group_services._plan_occurrence(
-            rule, scheduled_at=self.clock,
-        )
-        original_snapshot = occurrence.config
-        planned_rates = list(occurrence.runs.filter(
-            valve=self.valves[1],
-        ).values_list("application_rate_mm_h", flat=True))
-        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=None)
-        self.tick()
-        self.finish_occurrence(occurrence)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
-        ])
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.assertEqual(occurrence.config, original_snapshot)
-        self.assertEqual(list(occurrence.runs.filter(
-            valve=self.valves[1],
-        ).values_list("application_rate_mm_h", flat=True)), planned_rates)
-        self.assertFalse(occurrence.runs.filter(
-            valve=self.valves[1], attempt_started_at__isnull=False,
-        ).exists())
-
-    def test_rate_cleared_during_active_pulse_does_not_rewrite_or_extend_it(self):
-        rule = self.smart_rule()
-        self.tick()
-        active = IrrigationRun.objects.get(status="RUNNING")
-        original_start = active.actual_start_at
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
-        self.tick(seconds=60)
-        active.refresh_from_db()
-        self.assertEqual(active.status, "RUNNING")
-        self.assertEqual(active.actual_start_at, original_start)
-        self.assertEqual(active.optimal_duration_seconds, 900)
-        self.assertEqual(active.application_rate_mm_h, 12)
-        self.close.assert_not_called()
-        self.tick(seconds=840, stop_finished=True)
-        self.read.assert_any_call(self.valves[0])
-        self.tick(seconds=900, stop_finished=True)
-        self.tick()
-        self.tick(seconds=900)
-        self.tick(seconds=300, stop_finished=True)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 900), mock.call(self.valves[1], 900),
-            mock.call(self.valves[1], 300),
-        ])
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.assertEqual(occurrence.runs.filter(
-            valve=self.valves[0], attempt_started_at__isnull=False,
-        ).count(), 1)
-
-    def test_rate_restoration_applies_next_decision_without_replaying_old_skip(self):
-        rule = self.smart_rule()
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
-        self.tick()
-        first = RuleOccurrence.objects.get(rule=rule)
-        original_decision = first.decision
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=12)
-        self.finish_occurrence(first)
-        first.refresh_from_db()
-        self.assertEqual(first.decision, original_decision)
-        self.assertFalse(first.runs.filter(valve=self.valves[0]).exists())
-        self.assertEqual(self.open.call_count, 2)
-        self.clock = self.clock.replace(hour=6, minute=0) + dt.timedelta(days=1)
-        self.tick()
-        self.open.assert_called_with(self.valves[0], 900)
-        next_occurrence = RuleOccurrence.objects.exclude(pk=first.pk).get(rule=rule)
-        self.assertFalse(next_occurrence.decision["valves"][str(self.valves[0].pk)].get(
-            "skipped", False,
-        ))
-
-    def test_restoration_does_not_reactivate_pulses_skipped_after_planning(self):
-        rule = self.smart_rule()
-        first_decision = self.clock
-        self.tick()
-        first = RuleOccurrence.objects.get(rule=rule)
-        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=None)
-        self.tick()
-        skipped = list(first.runs.filter(valve=self.valves[1]).values(
-            "pk", "status", "error_message", "attempt_started_at",
-        ))
-        self.assertTrue(all(row["status"] == "FAILED" for row in skipped))
-        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=12)
-        self.finish_occurrence(first)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
-        ])
-        self.assertEqual(list(first.runs.filter(valve=self.valves[1]).values(
-            "pk", "status", "error_message", "attempt_started_at",
-        )), skipped)
-        self.clock = first_decision + dt.timedelta(days=1)
-        self.tick()
-        self.open.assert_called_with(self.valves[1], 900)
-
-    def test_all_rates_removed_after_planning_records_skip_without_attempts(self):
-        rule = self.smart_rule()
-        occurrence = group_services._plan_occurrence(
-            rule, scheduled_at=self.clock,
-        )
-        Valve.objects.filter(pk__in=[valve.pk for valve in self.valves]).update(
-            application_rate_mm_h=None,
-        )
-        self.tick()
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "SKIPPED")
-        self.assertEqual(occurrence.runs.count(), 4)
-        self.assertFalse(occurrence.runs.filter(
-            attempt_started_at__isnull=False,
-        ).exists())
-        self.open.assert_not_called()
-
-    def test_rate_removed_between_claim_and_send_consumes_no_attempt(self):
-        rule = self.smart_rule()
-        original_send = group_services._send_claimed
-
-        def clear_rate_before_transmission(run):
-            if run.valve_id == self.valves[0].pk:
-                Valve.objects.filter(pk=run.valve_id).update(application_rate_mm_h=None)
-            return original_send(run)
-
-        with mock.patch.object(
-            group_services, "_send_claimed", side_effect=clear_rate_before_transmission,
-        ):
-            self.tick()
-        self.tick()
-        self.finish_occurrence(RuleOccurrence.objects.get(rule=rule))
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[1], 900), mock.call(self.valves[1], 300),
-        ])
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertFalse(occurrence.runs.filter(
-            valve=self.valves[0], attempt_started_at__isnull=False,
-        ).exists())
-
-    def test_fixed_group_ignores_missing_rates_before_and_during_execution(self):
-        self.rule()
-        self.tick()
-        self.tick(seconds=60, stop_finished=True)
-        self.tick(seconds=120, stop_finished=True)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 60), mock.call(self.valves[1], 120),
-        ])
-
-    def test_invalid_stored_smart_rates_do_not_abort_calibrated_members(self):
-        rule = self.smart_rule(need=7)
-        first_decision = self.clock
-        for day, invalid_rate in enumerate((0, -1, float("inf"))):
-            with self.subTest(rate=invalid_rate):
-                self.clock = first_decision + dt.timedelta(days=2 * day)
-                Valve.objects.filter(pk=self.valves[0].pk).update(
-                    application_rate_mm_h=invalid_rate,
-                )
-                calls_before = self.open.call_count
-                self.tick()
-                occurrence = RuleOccurrence.objects.get(
-                    rule=rule, scheduled_local_date=self.clock.date(),
-                )
-                self.finish_occurrence(occurrence)
-                occurrence.refresh_from_db()
-                self.assertEqual(occurrence.status, "FINISHED")
-                self.assertTrue(occurrence.decision["valves"][str(self.valves[0].pk)]["skipped"])
-                self.assertEqual(self.open.call_args_list[calls_before:], [
-                    *[mock.call(self.valves[1], 900)] * 4,
-                    mock.call(self.valves[1], 600),
-                ])
-
-
-    def test_single_valve_one_hour_target_requires_thirty_minute_break(self):
-        rule = self.smart_rule(need=3.5, durations=(1800,))
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=7)
-        start = self.clock
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.config["pulse_budget"], 2)
-        self.assertEqual(occurrence.config["watering_seconds"], 3600)
-        self.assertEqual(occurrence.config["break_seconds"], 1800)
-        self.tick(seconds=1800, stop_finished=True)
-        eligible = start + dt.timedelta(seconds=3600)
-        self.assertEqual(group_services.occurrence_next_eligible_at(occurrence), eligible)
-        first = occurrence.runs.get(pass_number=1)
-        closed = first.closure_confirmed_at
-        self.site.refresh_from_db()
-        admission_version = self.site.admission_version
-        for seconds in (60, 600, 1139):
-            self.tick(seconds=seconds)
-            first.refresh_from_db()
-            self.assertEqual(first.closure_confirmed_at, closed)
-            self.assertEqual(group_services.occurrence_next_eligible_at(occurrence), eligible)
-            self.open.assert_called_once()
-            self.site.refresh_from_db()
-            self.assertEqual(self.site.admission_version, admission_version)
         with self.assertRaises(ValidationError):
-            group_services.start_single(self.valves[1], 60, "MANUAL")
-        self.tick(seconds=1)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 1800), mock.call(self.valves[0], 1800),
-        ])
-        self.tick(seconds=1800, stop_finished=True)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.assertEqual(self.clock, start + dt.timedelta(seconds=5400))
-
-    def test_two_day_peak_has_four_runs_three_breaks_and_finite_saved_budget(self):
-        rule = self.smart_rule(need=7, durations=(1800,))
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=7)
-        for cadence in (30, 60):
-            with mock.patch.dict("os.environ", {"CONTROLLER_INTERVAL_SECONDS": str(cadence)}):
-                peak = group_services.reservation_details(rule)
-                self.assertEqual(peak["watering_seconds"], 7200)
-                self.assertEqual(peak["break_seconds"], 5400)
-                self.assertEqual(peak["pulse_count"], 4)
-                self.assertEqual(peak["repeat_count"], 3)
-                self.assertEqual(peak["total_seconds"],
-                                 12600 + 8 * cadence + 4 * group_services.command_allowance())
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        snapshot = occurrence.config
-        self.finish_occurrence(occurrence)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.assertEqual(occurrence.config, snapshot)
-        self.assertEqual(snapshot["pulse_budget"], 4)
-        self.assertEqual(self.open.call_args_list, [mock.call(self.valves[0], 1800)] * 4)
-        self.assertEqual(list(occurrence.runs.order_by("pass_number").values_list(
-            "pass_number", flat=True,
-        )), [1, 2, 3, 4])
-
-    def test_45_minute_override_keeps_two_hour_target_and_required_rests(self):
-        rule = self.smart_rule(need=7, durations=(2700,))
-        Valve.objects.filter(pk=self.valves[0].pk).update(
-            application_rate_mm_h=7, default_max_duration_seconds=600,
-        )
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        snapshot = occurrence.config
-        self.finish_occurrence(occurrence)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "FINISHED")
-        self.assertEqual(occurrence.config, snapshot)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 2700), mock.call(self.valves[0], 2700),
-            mock.call(self.valves[0], 1800),
-        ])
-        runs = list(occurrence.runs.order_by("pass_number"))
-        for previous, following in zip(runs, runs[1:]):
-            self.assertGreaterEqual(
-                following.actual_start_at - previous.closure_confirmed_at,
-                dt.timedelta(seconds=previous.optimal_duration_seconds),
+            group_services.validate_configuration(group)
+        group.delete()
+        for duration in (60, 120):
+            single = ScheduleRule.objects.create(
+                schedule=self.schedule, valve=self.b, start_time=dt.time(6),
+                days_of_week_mask=127, mode="FIXED", max_duration_seconds=duration,
             )
-        self.assertEqual(rule.members.get().duration_seconds, 2700)
+            group_services.validate_configuration(single)
 
-    def test_short_intervening_valve_counts_only_its_elapsed_time_toward_break(self):
-        rule = self.smart_rule(need=7, durations=(1800, 300))
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=14)
-        Valve.objects.filter(pk=self.valves[1].pk).update(application_rate_mm_h=168)
-        start = self.clock
-        self.tick()
-        self.tick(seconds=1800, stop_finished=True)
-        self.open.assert_called_with(self.valves[1], 300)
-        self.tick(seconds=300, stop_finished=True)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(group_services.occurrence_next_eligible_at(occurrence),
-                         start + dt.timedelta(seconds=3600))
-        self.tick(seconds=1499)
-        self.assertEqual(self.open.call_count, 2)
-        self.tick(seconds=1)
-        self.open.assert_called_with(self.valves[0], 1800)
-        self.tick(seconds=1800, stop_finished=True)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "FINISHED")
-
-    def test_late_confirmation_delays_rest_and_does_not_use_nominal_stop(self):
-        rule = self.smart_rule(need=2, durations=(900,))
-        start = self.clock
-        self.tick()
-        self.tick(seconds=960, stop_finished=True)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(group_services.occurrence_next_eligible_at(occurrence),
-                         start + dt.timedelta(seconds=1860))
-        self.tick(seconds=840)
-        self.open.assert_called_once()
-        self.tick(seconds=60)
-        self.assertEqual(self.open.call_count, 2)
-        self.finish_occurrence(occurrence)
-
-    def test_cancellation_while_resting_releases_only_after_safe_closure(self):
-        rule = self.smart_rule(durations=(900,))
-        self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertIsNotNone(group_services.occurrence_next_eligible_at(occurrence))
-        group_services.cancel_occurrence(occurrence)
-        self.tick()
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "CANCELLED")
-        self.tick(seconds=900)
-        self.open.assert_called_once()
-        self.assert_no_pending_attempts(occurrence)
-
-    def test_restart_during_rest_never_resumes_or_replays(self):
-        rule = self.smart_rule(durations=(900,))
-        self.tick()
-        self.tick(seconds=900, stop_finished=True)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        before = occurrence.decision
-        group_services.recover_groups()
-        self.tick(seconds=1800)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "CANCELLED")
-        self.assertEqual(occurrence.decision, before)
-        self.open.assert_called_once()
-
-    def test_late_tick_exhausts_deadline_and_reports_unmet_without_another_open(self):
-        rule = self.smart_rule(durations=(900,))
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.clock = occurrence.reservation_end
-        self.tick(stop_finished=True)
-        occurrence.refresh_from_db()
-        self.assertTrue(occurrence.cancellation_requested)
-        self.assertIn("deadline", occurrence.outcome.lower())
-        self.assertIn("unmet", occurrence.outcome.lower())
-        self.open.assert_called_once()
-
-    def test_valve_default_changes_do_not_rewrite_saved_limits_or_pending_work(self):
-        rule = self.smart_rule(durations=(900,))
-        self.tick()
-        Valve.objects.filter(pk=self.valves[0].pk).update(default_max_duration_seconds=60)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.finish_occurrence(occurrence)
-        self.assertEqual(self.open.call_args_list, [
-            mock.call(self.valves[0], 900), mock.call(self.valves[0], 300),
-        ])
-        self.assertEqual(rule.members.get().duration_seconds, 900)
-
-    def test_saved_rule_limit_reduction_blocks_incompatible_pending_pulse(self):
-        rule = self.smart_rule(durations=(900,))
-        self.tick()
-        first = IrrigationRun.objects.get(status="RUNNING")
-        rule.members.update(duration_seconds=100)
-        self.tick(seconds=900, stop_finished=True)
-        self.tick(seconds=900)
-        first.refresh_from_db()
-        self.assertEqual(first.optimal_duration_seconds, 900)
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertTrue(occurrence.cancellation_requested)
-        self.assertIn("unmet", occurrence.outcome)
-        self.open.assert_called_once()
-
-    def test_unfittable_peak_is_a_visible_skip_before_any_pulse_allocation(self):
-        rule = self.smart_rule(durations=(1,))
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=1e-300)
+    def test_impossible_peak_rejected_without_allocating_watering_rows(self):
+        rule = self.smart()
+        self.a.application_rate_mm_h = 1e-200
+        self.a.save(update_fields=["application_rate_mm_h"])
         with self.assertRaises(ValidationError):
             group_services.validate_configuration(rule)
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "SKIPPED")
-        self.assertIn("midnight", occurrence.outcome)
-        self.assertFalse(occurrence.runs.exists())
-        self.open.assert_not_called()
-
-    def test_zero_peak_has_no_watering_break_or_allowance(self):
-        rule = self.smart_rule(need=0)
-        peak = group_services.reservation_details(rule)
-        self.assertTrue(peak["available"])
-        self.assertEqual(peak["total_seconds"], 0)
-        self.assertEqual(peak["pulse_count"], 0)
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "ZERO")
-        self.assertEqual(occurrence.reservation_end, self.clock)
-
-    def test_restored_rate_rechecks_new_peak_conflict_before_future_admission(self):
-        rule = self.smart_rule(durations=(900,))
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=None)
-        peak = group_services.reservation_details(rule)
-        self.assertFalse(peak["available"])
-        self.assertEqual(peak["total_seconds"], 0)
-        ScheduleRule.objects.create(
-            schedule=self.schedule, valve=self.valves[1], mode="FIXED",
-            start_time=dt.time(6, 10), days_of_week_mask=127, max_duration_seconds=60,
-        )
-        group_services.validate_configuration(rule)
-        Valve.objects.filter(pk=self.valves[0].pk).update(application_rate_mm_h=12)
-        self.tick()
-        occurrence = RuleOccurrence.objects.get(rule=rule)
-        self.assertEqual(occurrence.status, "SKIPPED")
-        self.assertIn("overlaps", occurrence.outcome)
-        self.assertIn("06:10", occurrence.outcome)
-        self.open.assert_not_called()
-
-
-class GroupAdmissionRaceTests(TransactionTestCase):
-    """Independent DB connections see the committed claim before hardware I/O."""
-
-    def setUp(self):
-        self.now = dt.datetime(2026, 9, 21, 6, 0, tzinfo=dt.timezone.utc)
-        self.site = Site.objects.create(name="Race garden", timezone="UTC")
-        self.schedule = Schedule.objects.create(site=self.site, name="Active")
-        self.site.active_schedule = self.schedule
-        self.site.save(update_fields=["active_schedule"])
-        device = RelayDevice.objects.create(
-            site=self.site, name="Mock only", host="192.0.2.2",
-        )
-        self.valve = Valve.objects.create(
-            relay_device=device, channel=1, name="A",
-            default_max_duration_seconds=600,
-        )
-        self.rule = GroupedRule.objects.create(
-            schedule=self.schedule, mode="FIXED", days_of_week_mask=127,
-            start_time=dt.time(6),
-        )
-        GroupedRuleValve.objects.create(
-            rule=self.rule, valve=self.valve, order=0, duration_seconds=60,
-        )
-        self.claimed = threading.Event()
-        self.release = threading.Event()
-        self.errors = []
-        self.patches = [
-            mock.patch("apps.irrigation.group_services.timezone.now", return_value=self.now),
-            mock.patch("apps.irrigation.services.open_valve_for"),
-            mock.patch("apps.irrigation.services.close_valve"),
-            mock.patch("apps.irrigation.services.read_valve_state", return_value=False),
-        ]
-        _, self.open, self.close, self.read = [patcher.start() for patcher in self.patches]
-        for patcher in self.patches:
-            self.addCleanup(patcher.stop)
-
-    def start_claimed_thread(self, operation):
-        send = group_services._send_claimed
-
-        def pause_after_claim(run):
-            self.claimed.set()
-            if not self.release.wait(5):
-                raise AssertionError("Test did not release the claimed command")
-            return send(run)
-
-        patcher = mock.patch.object(group_services, "_send_claimed", side_effect=pause_after_claim)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-        def work():
-            close_old_connections()
-            try:
-                operation()
-            except Exception as exc:
-                self.errors.append(exc)
-            finally:
-                connections.close_all()
-
-        thread = threading.Thread(target=work, daemon=True)
-        thread.start()
-        self.addCleanup(self.release.set)
-        self.assertTrue(self.claimed.wait(5), "The first path did not commit a claim")
-        return thread
-
-    def finish(self, thread):
-        self.release.set()
-        thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(self.errors, [])
-
-    def test_group_claim_blocks_manual_during_in_flight_open(self):
-        thread = self.start_claimed_thread(lambda: group_services.group_tick(self.now))
-        try:
-            with self.assertRaises(ValidationError):
-                group_services.start_single(self.valve, 60, "MANUAL")
-        finally:
-            self.finish(thread)
-        self.open.assert_called_once_with(self.valve, 60)
-
-    def test_manual_claim_causes_group_skip_during_in_flight_open(self):
-        thread = self.start_claimed_thread(
-            lambda: group_services.start_single(self.valve, 60, "MANUAL")
-        )
-        try:
-            group_services.group_tick(self.now)
-            self.assertEqual(RuleOccurrence.objects.get(rule=self.rule).status, "SKIPPED")
-        finally:
-            self.finish(thread)
-        self.open.assert_called_once_with(self.valve, 60)
-
-    def test_group_claim_blocks_automatic_start_during_in_flight_open(self):
-        thread = self.start_claimed_thread(lambda: group_services.group_tick(self.now))
-        try:
-            skipped = group_services.start_single(
-                self.valve, 60, "SCHEDULED", planned_start_at=self.now,
-            )
-            self.assertEqual(skipped.status, "FAILED")
-            self.assertIsNone(skipped.attempt_started_at)
-            self.assertIn("Skipped", skipped.error_message)
-        finally:
-            self.finish(thread)
-        self.open.assert_called_once_with(self.valve, 60)
-
-    def test_automatic_claim_causes_group_skip_during_in_flight_open(self):
-        thread = self.start_claimed_thread(lambda: group_services.start_single(
-            self.valve, 60, "SCHEDULED", planned_start_at=self.now,
-        ))
-        try:
-            group_services.group_tick(self.now)
-            self.assertEqual(RuleOccurrence.objects.get(rule=self.rule).status, "SKIPPED")
-        finally:
-            self.finish(thread)
-        self.open.assert_called_once_with(self.valve, 60)
+        self.assertFalse(IrrigationRun.objects.exists())

@@ -12,7 +12,7 @@ from django.utils import timezone
 from apps.irrigation.forms import CurveForm
 from apps.irrigation.models import (
     CurveSettings, GroupedRule, GroupedRuleValve, IrrigationRun, RelayDevice,
-    RuleOccurrence, Schedule, ScheduleRule, Site, Valve,
+    Schedule, ScheduleRule, Site, Valve,
 )
 
 
@@ -138,13 +138,19 @@ class SharedRuleEditorTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.max_duration_seconds, 90)
 
-    def test_conversion_rejects_active_run_and_keeps_original(self):
+    def test_conversion_during_watering_keeps_actual_history(self):
         old = self.legacy()
-        IrrigationRun.objects.create(valve=self.a, trigger="MANUAL", status="RUNNING", max_duration_seconds=90)
-        response = self.client.post(reverse("schedule_edit", args=[old.pk]), self.payload("SMART"))
-        self.assertContains(response, "Stop watering")
-        self.assertTrue(ScheduleRule.objects.filter(pk=old.pk).exists())
-        self.assertFalse(GroupedRule.objects.exists())
+        run = IrrigationRun.objects.create(
+            valve=self.a, trigger="MANUAL", status="RUNNING", max_duration_seconds=90,
+        )
+        response = self.client.post(
+            reverse("schedule_edit", args=[old.pk]), self.payload("SMART"),
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(ScheduleRule.objects.filter(pk=old.pk).exists())
+        self.assertEqual(GroupedRule.objects.get().mode, "SMART")
+        run.refresh_from_db()
+        self.assertEqual(run.status, "RUNNING")
 
     def test_edit_single_fixed_preserves_id(self):
         old = self.legacy()
@@ -187,20 +193,35 @@ class SharedRuleEditorTests(TestCase):
         old = self.legacy()
         ScheduleRule.objects.filter(pk=old.pk).update(mode="DYNAMIC")
         self.client.post(reverse("schedule_run", args=[old.pk]))
-        opening.assert_not_called()
-        self.assertEqual(IrrigationRun.objects.get().dispatch_state, "QUEUED")
+        opening.assert_called_once_with(self.a, 900)
+        self.assertEqual(IrrigationRun.objects.get().status, "RUNNING")
         self.assertEqual(IrrigationRun.objects.get().optimal_duration_seconds, 900)
 
-    @mock.patch("apps.irrigation.services.open_valve_for")
-    def test_fixed_group_run_now_only_requests_controller(self, opening):
+    def test_failed_run_now_return_shows_error_instead_of_success(self):
+        rule = self.legacy()
+        run = IrrigationRun.objects.create(
+            valve=self.a, trigger="MANUAL", status="FAILED",
+            max_duration_seconds=900, error_message="Relay unreachable",
+        )
+        with mock.patch(
+            "apps.irrigation.group_services.start_single", return_value=run,
+        ):
+            response = self.client.post(
+                reverse("schedule_run", args=[rule.pk]), follow=True,
+            )
+        self.assertContains(response, "Failed to start run: Relay unreachable")
+        self.assertNotContains(response, "Run started.")
+
+    def test_group_run_now_is_removed(self):
+        from django.urls import NoReverseMatch
+
         rule = self.group("FIXED")
-        now = dt.datetime(2026, 9, 21, 6, 0, tzinfo=dt.timezone.utc)
-        with mock.patch("apps.irrigation.group_services.timezone.now", return_value=now):
-            self.client.post(reverse("group_run", args=[rule.pk]))
-            self.client.post(reverse("group_run", args=[rule.pk]))
-        opening.assert_not_called()
-        self.assertEqual(RuleOccurrence.objects.count(), 1)
-        self.assertEqual(RuleOccurrence.objects.get().status, "PENDING")
+        response = self.client.get(reverse("group_edit", args=[rule.pk]))
+        self.assertNotContains(response, ">Run now<")
+        self.assertContains(response, ">Disable rule<")
+        with self.assertRaises(NoReverseMatch):
+            reverse("group_run", args=[rule.pk])
+        self.assertEqual(self.client.post(f"/schedule/group/{rule.pk}/run/").status_code, 404)
 
     @mock.patch("apps.irrigation.services.open_valve_for")
     def test_smart_preview_never_opens_and_no_run_now_button(self, opening):
@@ -212,9 +233,8 @@ class SharedRuleEditorTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "fallback temperature")
         self.assertContains(response, "Lawn A")
-        self.client.post(reverse("group_run", args=[rule.pk]))
         opening.assert_not_called()
-        self.assertFalse(RuleOccurrence.objects.exists())
+        self.assertFalse(IrrigationRun.objects.exists())
 
     def test_calendar_uses_peak_watering_breaks_and_allowance_at_both_cadences(self):
         rule = self.group()
@@ -254,33 +274,45 @@ class SharedRuleEditorTests(TestCase):
         self.assertContains(response, "midnight")
         self.assertFalse(GroupedRule.objects.exists())
 
-    def occurrence(self, rule):
-        return RuleOccurrence.objects.create(
-            rule=rule, site=self.site, mode=rule.mode, status="ACTIVE", source="MANUAL",
-            requested_at=timezone.now(), config={"members": [{"name": "Lawn A"}]},
-        )
 
-    def test_disabling_group_requests_cancellation(self):
+    def test_disabling_group_saves_configuration_without_hardware_io(self):
         rule = self.group("FIXED")
-        occurrence = self.occurrence(rule)
         data = self.payload(valves=[self.a, self.b])
         data.pop("enabled")
-        response = self.client.post(reverse("group_edit", args=[rule.pk]), data)
+        with mock.patch("apps.irrigation.services.close_valve") as closing:
+            response = self.client.post(reverse("group_edit", args=[rule.pk]), data)
         self.assertEqual(response.status_code, 302)
-        occurrence.refresh_from_db()
-        self.assertTrue(occurrence.cancellation_requested)
-        self.assertEqual(occurrence.status, "STOPPING")
+        rule.refresh_from_db()
+        self.assertFalse(rule.enabled)
+        closing.assert_not_called()
 
-    def test_mode_change_requires_stop_and_delete_preserves_occurrence(self):
+    def test_disable_rule_action_is_explicit_and_persists_enabled_flag(self):
+        rule = self.group()
+        with mock.patch("apps.irrigation.services.close_valve") as closing:
+            response = self.client.post(reverse("group_stop", args=[rule.pk]), follow=True)
+        self.assertContains(response, "Rule disabled.")
+        rule.refresh_from_db()
+        self.assertFalse(rule.enabled)
+        closing.assert_not_called()
+        self.assertNotContains(self.client.get(reverse("group_edit", args=[rule.pk])), ">Disable rule<")
+
+    def test_group_mode_change_and_delete_preserve_actual_watering(self):
         rule = self.group("FIXED")
-        occurrence = self.occurrence(rule)
-        response = self.client.post(reverse("group_edit", args=[rule.pk]), self.payload("SMART", [self.a, self.b]))
-        self.assertContains(response, "Stop the rule")
+        run = IrrigationRun.objects.create(
+            valve=self.a, trigger="GROUP", status="RUNNING", max_duration_seconds=900,
+            actual_start_at=timezone.now(), application_rate_mm_h=12,
+        )
+        response = self.client.post(
+            reverse("group_edit", args=[rule.pk]), self.payload("SMART", [self.a, self.b]),
+        )
+        self.assertEqual(response.status_code, 302)
+        rule.refresh_from_db()
+        self.assertEqual(rule.mode, "SMART")
         self.client.post(reverse("group_delete", args=[rule.pk]))
-        occurrence.refresh_from_db()
-        self.assertIsNone(occurrence.rule_id)
-        self.assertTrue(occurrence.cancellation_requested)
-        self.assertEqual(occurrence.config["members"][0]["name"], "Lawn A")
+        self.assertFalse(GroupedRule.objects.filter(pk=rule.pk).exists())
+        run.refresh_from_db()
+        self.assertEqual(run.status, "RUNNING")
+        self.assertEqual(run.application_rate_mm_h, 12)
 
     def test_copy_schedule_preserves_groups_and_normalizes_residual(self):
         rule = self.group("FIXED")
@@ -296,12 +328,10 @@ class SharedRuleEditorTests(TestCase):
         self.assertEqual(copied.rules.get().mode, "FIXED")
         self.assertNotEqual(group.pk, rule.pk)
 
-    def test_schedule_switch_cancels_active_occurrence(self):
-        occurrence = self.occurrence(self.group("FIXED"))
+    def test_schedule_switch_saves_active_schedule(self):
+        self.group("FIXED")
         other = Schedule.objects.create(site=self.site, name="Other")
         self.client.post(reverse("schedule_load"), {"schedule": other.pk})
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "STOPPING")
         self.site.refresh_from_db()
         self.assertEqual(self.site.active_schedule_id, other.pk)
 
@@ -311,7 +341,7 @@ class SharedRuleEditorTests(TestCase):
         self.client.post(reverse("site_select"), {"site_id": other.pk})
         for route in ("group_edit", "group_copy", "group_preview"):
             self.assertEqual(self.client.get(reverse(route, args=[rule.pk])).status_code, 404)
-        for route in ("group_run", "group_stop", "group_delete"):
+        for route in ("group_stop", "group_delete"):
             self.assertEqual(self.client.post(reverse(route, args=[rule.pk])).status_code, 404)
 
     def test_curve_rejects_invalid_windows_and_nonfinite_settings(self):
@@ -327,17 +357,16 @@ class SharedRuleEditorTests(TestCase):
         self.curve.refresh_from_db()
         self.assertEqual(self.curve.fallback_temperature_c, 25)
 
-    def test_dashboard_and_logs_show_zero_decision_and_fallback(self):
-        rule = self.group()
-        occurrence = self.occurrence(rule)
-        occurrence.status = "ZERO"
-        occurrence.outcome = "No demand"
-        occurrence.save()
-        for route in ("dashboard", "logs"):
-            response = self.client.get(reverse(route))
+    def test_dashboard_uses_temperature_warning_without_running_planner(self):
+        self.group()
+        with mock.patch("apps.irrigation.balance.build_smart_decision") as planner:
+            response = self.client.get(reverse("dashboard"))
+            self.assertContains(response, "Operating with fallback temperature")
+            self.assertNotIn("occurrences", response.context)
+            response = self.client.get(reverse("logs"))
             self.assertEqual(response.status_code, 200)
-            self.assertContains(response, "No demand")
-        self.assertContains(self.client.get(reverse("dashboard")), "Operating with fallback temperature")
+            self.assertNotIn("occurrences", response.context)
+        planner.assert_not_called()
 
     def test_calendar_skips_dst_gap_and_has_one_fold_event(self):
         self.site.timezone = "Europe/Berlin"
@@ -354,31 +383,20 @@ class SharedRuleEditorTests(TestCase):
             )
             self.assertEqual(len(response.json()), expected)
 
-    def test_remaining_execution_target_visible_without_rewriting_decision(self):
-        rule = self.group()
-        occurrence = self.occurrence(rule)
-        decision = {"valves": {str(self.a.pk): {
-            "valve_id": self.a.pk, "valve_name": self.a.name,
-            "target_mm": 4, "capacity_mm": 6, "pulse_seconds": [900, 300],
-            "estimated_delivery_mm": 4, "unmet_mm": 0,
-            "irrigation": {"credit_mm": 0},
-        }}}
-        occurrence.decision = decision
-        occurrence.status = "CANCELLED"
-        occurrence.save()
+    def test_logs_show_actual_group_delivery_without_persisted_progress(self):
         now = timezone.now()
         IrrigationRun.objects.create(
-            valve=self.a, occurrence=occurrence, pass_number=1,
-            trigger="SCHEDULED", status="FINISHED",
+            valve=self.a, trigger="GROUP", status="FINISHED",
             max_duration_seconds=900, optimal_duration_seconds=900,
             actual_start_at=now - dt.timedelta(minutes=20),
             actual_stop_at=now - dt.timedelta(minutes=5),
             application_rate_mm_h=12,
         )
         response = self.client.get(reverse("logs"))
-        self.assertContains(response, "remaining target 1.00 mm")
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.decision, decision)
+        self.assertContains(response, "Lawn A")
+        self.assertContains(response, "Scheduled group")
+        self.assertNotContains(response, "Rule occurrence")
+        self.assertNotContains(response, "remaining target")
 
     def test_second_enabled_smart_membership_rejected_outside_overlap(self):
         self.group()
@@ -399,36 +417,45 @@ class SharedRuleEditorTests(TestCase):
         self.site.refresh_from_db()
         self.assertEqual(self.site.active_schedule_id, self.schedule.pk)
 
-    def test_admin_rejects_hardware_identity_changes_until_confirmed_closed(self):
+    def test_admin_allows_hardware_configuration_edits_during_watering(self):
         from apps.irrigation.admin import RelayDeviceAdminForm, ValveAdminForm
 
-        now = timezone.now()
-        run = IrrigationRun.objects.create(
-            valve=self.a, trigger="MANUAL", status="FAILED",
-            attempt_started_at=now, max_duration_seconds=900,
+        IrrigationRun.objects.create(
+            valve=self.a, trigger="MANUAL", status="RUNNING",
+            attempt_started_at=timezone.now(), max_duration_seconds=900,
         )
-        valve_data = {
+        form = ValveAdminForm({
             "relay_device": self.a.relay_device_id, "channel": 3,
             "name": self.a.name, "is_active_high": "on",
             "default_max_duration_seconds": 800, "application_rate_mm_h": 10,
-        }
-        form = ValveAdminForm(valve_data, instance=self.a)
-        self.assertFalse(form.is_valid())
-        self.assertIn("confirmed closure", str(form.errors))
+        }, instance=self.a)
+        self.assertTrue(form.is_valid(), form.errors)
         relay = self.a.relay_device
-        relay_data = {
+        form = RelayDeviceAdminForm({
             "site": self.site.pk, "host": "new.invalid", "port": 502,
             "unit_id": 1, "enabled": "on", "name": relay.name,
-        }
-        form = RelayDeviceAdminForm(relay_data, instance=relay)
-        self.assertFalse(form.is_valid())
-        self.assertIn("confirmed closure", str(form.errors))
-        run.closure_confirmed_at = now
-        run.save()
-        self.a.refresh_from_db()
-        relay.refresh_from_db()
-        self.assertTrue(ValveAdminForm(valve_data, instance=self.a).is_valid())
-        self.assertTrue(RelayDeviceAdminForm(relay_data, instance=relay).is_valid())
+        }, instance=relay)
+        self.assertTrue(form.is_valid(), form.errors)
+
+
+    def test_admin_can_delete_inactive_schedule(self):
+        user = get_user_model().objects.get(username="editor")
+        user.is_staff = user.is_superuser = True
+        user.save()
+        schedule = Schedule.objects.create(site=self.site, name="Unused")
+        legacy = self.legacy()
+        legacy.schedule = schedule
+        legacy.save(update_fields=["schedule"])
+        group = self.group("FIXED")
+        group.schedule = schedule
+        group.save(update_fields=["schedule"])
+        response = self.client.post(
+            reverse("admin:irrigation_schedule_delete", args=[schedule.pk]), {"post": "yes"},
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(Schedule.objects.filter(pk=schedule.pk).exists())
+        self.assertFalse(ScheduleRule.objects.filter(pk=legacy.pk).exists())
+        self.assertFalse(GroupedRule.objects.filter(pk=group.pk).exists())
 
     def test_admin_allows_rate_and_limit_edits_during_watering(self):
         from apps.irrigation.admin import ValveAdminForm
@@ -445,32 +472,33 @@ class SharedRuleEditorTests(TestCase):
         self.assertTrue(form.is_valid(), form.errors)
 
     @mock.patch("apps.irrigation.services.close_valve")
-    def test_admin_disabling_relay_requests_durable_group_cancellation(self, closing):
+    def test_admin_disabling_relay_only_saves_enabled_flag(self, closing):
         user = get_user_model().objects.get(username="editor")
         user.is_staff = user.is_superuser = True
         user.save()
-        occurrence = self.occurrence(self.group("FIXED"))
+        self.group("FIXED")
         relay = self.a.relay_device
         response = self.client.post(
             reverse("admin:irrigation_relaydevice_change", args=[relay.pk]),
             {"site": self.site.pk, "name": relay.name, "host": relay.host,
-             "port": relay.port, "unit_id": relay.unit_id, "_save": "Save"},
+             "port": relay.port, "unit_id": relay.unit_id,
+             "initial-port": relay.port, "initial-unit_id": relay.unit_id,
+             "_save": "Save"},
         )
-        self.assertEqual(response.status_code, 302)
-        occurrence.refresh_from_db()
-        self.assertEqual(occurrence.status, "STOPPING")
-        self.assertTrue(occurrence.cancellation_requested)
+        self.assertEqual(
+            response.status_code, 302,
+            response.context["adminform"].form.errors if response.context else "",
+        )
         relay.refresh_from_db()
         self.assertFalse(relay.enabled)
         closing.assert_not_called()
 
     def test_admin_execution_history_is_read_only(self):
         from django.contrib.admin.sites import AdminSite
-        from apps.irrigation.admin import IrrigationRunAdmin, RuleOccurrenceAdmin
+        from apps.irrigation.admin import IrrigationRunAdmin
 
         for model, admin_class in (
             (IrrigationRun, IrrigationRunAdmin),
-            (RuleOccurrence, RuleOccurrenceAdmin),
         ):
             model_admin = admin_class(model, AdminSite())
             self.assertFalse(model_admin.has_add_permission(None))
@@ -583,50 +611,21 @@ class SharedRuleEditorTests(TestCase):
         self.assertEqual(response.context["reservation"]["watering_seconds"], 4200)
         for route in ("dashboard", "curve"):
             response = self.client.get(reverse(route))
-            self.assertContains(response, "Lawn A: skipped in Smart")
-            self.assertContains(response, "Enter a measured watering rate")
+            self.assertNotContains(response, "Lawn A: skipped in Smart")
         Valve.objects.filter(pk=self.a.pk).update(application_rate_mm_h=12)
         for route in ("dashboard", "curve"):
             response = self.client.get(reverse(route))
             self.assertNotContains(response, "Lawn A: skipped in Smart")
 
-    def test_all_missing_rates_render_skipped_decisions_and_preserve_historical_warning(self):
+    def test_all_missing_rates_are_explained_in_preview(self):
         rule = self.group()
         Valve.objects.update(application_rate_mm_h=None)
         response = self.client.get(reverse("group_preview", args=[rule.pk]))
         self.assertContains(response, "Lawn A: skipped in Smart")
         self.assertContains(response, "Lawn B: skipped in Smart")
         self.assertNotContains(response, "Skip: no dose")
-        occurrence = self.occurrence(rule)
-        occurrence.status = "SKIPPED"
-        occurrence.outcome = "All members are skipped because watering rates are unavailable."
-        occurrence.decision = response.context["decision"]
-        occurrence.save()
-        response = self.client.get(reverse("logs"))
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Lawn A: skipped in Smart")
-        self.assertContains(response, "N/A")
-        Valve.objects.update(application_rate_mm_h=12)
-        response = self.client.get(reverse("dashboard"))
-        self.assertFalse(any("skipped in Smart" in warning for warning in response.context["quality_warnings"]))
-        self.assertContains(self.client.get(reverse("logs")), "Lawn A: skipped in Smart")
+        self.assertFalse(IrrigationRun.objects.exists())
 
-    def test_runtime_unattempted_skip_reason_shows_in_occurrence_history(self):
-        from apps.irrigation import balance
-
-        rule = self.group()
-        occurrence = self.occurrence(rule)
-        occurrence.decision = balance.build_smart_decision(
-            self.site, list(rule.members.select_related("valve")), timezone.now()
-        )
-        occurrence.save()
-        reason = "Lawn A: skipped in Smart. Enter a measured watering rate."
-        IrrigationRun.objects.create(
-            occurrence=occurrence, valve=self.a, pass_number=1, trigger="SCHEDULED",
-            status="FAILED", max_duration_seconds=900, error_message=reason,
-        )
-        self.assertContains(self.client.get(reverse("dashboard")), reason)
-        self.assertContains(self.client.get(reverse("logs")), reason)
 
     def test_blank_smart_override_resolves_server_side_valve_default(self):
         response = self.client.post(reverse("schedule_create"), self.payload(

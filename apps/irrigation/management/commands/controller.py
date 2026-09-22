@@ -63,13 +63,6 @@ class Command(BaseCommand):
         last_poll_at: dt.datetime | None = None
         self._ensure_default_site()
         self._ensure_default_schedules()
-        self._recovery_pending = True
-        try:
-            group_services.recover_groups()
-            self._recovery_pending = False
-        except Exception:
-            logger.exception("Startup recovery failed; group execution remains blocked")
-
         while True:
             loop_started = timezone.now()
             close_old_connections()
@@ -141,6 +134,8 @@ class Command(BaseCommand):
 
         for rule in rules:
             site = rule.valve.relay_device.site
+            if site.pk in self._group_runner().active_sites:
+                continue
             tz_name = site.timezone or settings.TIME_ZONE
             tz = ZoneInfo(tz_name)
             local_now = timezone.localtime(now, tz)
@@ -169,54 +164,40 @@ class Command(BaseCommand):
             except Exception as exc:
                 logger.warning("Scheduled start skipped/failed for rule %s: %s", rule.pk, exc)
 
+    def _group_runner(self):
+        if not hasattr(self, "_groups"):
+            self._groups = group_services.GroupRunner()
+        return self._groups
+
     def _tick(self, now: dt.datetime) -> None:
-        # All safety work finishes before this single process admits an opening.
-        # A database error blocks dispatch for this tick, not emergency closures.
-        safety_ready = True
-        reconciled = False
+        try:
+            self._start_due_runs(now)
+        except Exception:
+            logger.exception("Single-valve planning failed")
         recently_closed = set()
-        fresh_closed = set()
         try:
             recently_closed = self._stop_running_runs(now)
         except Exception:
-            safety_ready = False
-            logger.exception("Stopping runs failed")
+            logger.exception("Single-valve completion failed")
         try:
-            if getattr(self, "_recovery_pending", False):
-                group_services.recover_groups()
-                self._recovery_pending = False
-            else:
-                fresh_closed = group_services.reconcile_attempts()
-            reconciled = True
+            self._group_runner().tick()
         except Exception:
-            safety_ready = False
-            logger.exception("Closure reconciliation failed")
+            logger.exception("Group planning/execution failed")
         try:
-            self._watchdog_close(now, recently_closed, reconciled=reconciled)
+            self._watchdog_close(now, recently_closed)
         except Exception:
-            safety_ready = False
             logger.exception("Watchdog failed")
-        if safety_ready:
-            try:
-                group_services.dispatch_manual_requests()
-                self._start_due_runs(now)
-            except Exception:
-                logger.exception("Single-valve planning failed")
-            try:
-                group_services.group_tick(fresh_closed=fresh_closed)
-            except Exception:
-                logger.exception("Group planning/execution failed")
         try:
             self._refresh_weather(now)
         except Exception:
             logger.exception("Weather refresh failed")
 
     def _stop_running_runs(self, now: dt.datetime) -> set[int]:
-        runs = IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
+        runs = IrrigationRun.objects.filter(
+            status=IrrigationRun.STATUS_RUNNING,
+        ).exclude(trigger=IrrigationRun.TRIGGER_GROUP)
         recently_closed: set[int] = set()
         for run in runs.select_related("valve"):
-            if group_services._legacy_unresolved().filter(pk=run.pk).exists():
-                continue
             if not run.actual_start_at:
                 continue
 
@@ -260,20 +241,13 @@ class Command(BaseCommand):
         run.stop_reason = reason
         run.actual_stop_at = now
         update_fields = ["status", "stop_reason", "actual_stop_at"]
-        if run.attempt_started_at is None and run.actual_start_at is not None:
-            # A pulse already running during upgrade has no new metadata. Keep
-            # its recorded timing, but require fresh closure before group work.
-            run.attempt_started_at = run.actual_start_at
-            update_fields.append("attempt_started_at")
         if error_message:
             run.error_message = error_message
             update_fields.append("error_message")
         run.save(update_fields=update_fields)
         return True
 
-    def _watchdog_close(
-        self, now: dt.datetime, recently_closed: set[int], *, reconciled=False,
-    ) -> None:
+    def _watchdog_close(self, now: dt.datetime, recently_closed: set[int]) -> None:
         running = {
             run.valve_id: run
             for run in IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
@@ -284,27 +258,19 @@ class Command(BaseCommand):
             if valve.id in recently_closed:
                 continue
             run = running.get(valve.id)
-            if (run and run.actual_start_at and not run.cancellation_requested
-                    and not run.delivery_uncertain):
+            if run and run.actual_start_at:
                 max_stop = run.actual_start_at + dt.timedelta(
                     seconds=run.max_duration_seconds
                 )
+                if (run.trigger == IrrigationRun.TRIGGER_GROUP
+                        and run.attempt_finished_at):
+                    # Group completion uses the same conservative relay expiry;
+                    # command latency must not shorten a Smart pulse here.
+                    max_stop = run.attempt_finished_at + dt.timedelta(
+                        seconds=run.optimal_duration_seconds or run.max_duration_seconds,
+                    )
                 if now < max_stop:
                     continue
-
-            if group_services._legacy_unresolved(valve.relay_device.site).exists():
-                # Old web processes must be stopped before hardware ownership
-                # can be transferred. Ordinary ticks never acknowledge them.
-                continue
-
-            if reconciled and (group_services._pending_closures(valve.relay_device.site).filter(
-                valve=valve,
-            ).exists() or group_services._unresolved_runs().filter(
-                valve=valve,
-            ).exclude(dispatch_state="QUEUED").exists()):
-                # This tick's reconciliation already handles known unfinished
-                # work, including failed closes. Watchdog handles orphan opens.
-                continue
 
             recent_failsafe = IrrigationRun.objects.filter(
                 valve=valve,
@@ -319,11 +285,6 @@ class Command(BaseCommand):
 
             try:
                 services.close_valve(valve)
-                if services.read_valve_state(valve):
-                    raise RuntimeError("Watchdog closure not confirmed")
-                Valve.objects.filter(pk=valve.pk).update(
-                    last_known_is_open=False, last_polled_at=now,
-                )
                 status = IrrigationRun.STATUS_FINISHED
                 stop_reason = IrrigationRun.STOP_FAILSAFE
                 error_message = ""
@@ -341,8 +302,6 @@ class Command(BaseCommand):
                 optimal_duration_seconds=None,
                 max_duration_seconds=valve.default_max_duration_seconds,
                 actual_stop_at=now,
-                attempt_started_at=now,
-                closure_confirmed_at=now if status == "FINISHED" else None,
                 status=status,
                 stop_reason=stop_reason,
                 error_message=error_message,
