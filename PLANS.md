@@ -5,6 +5,82 @@ The user approved removing RuleOccurrence and the admission counter, keeping
 Smart execution in memory, reducing warnings/weather repair, and applying
 configuration edits on the next execution. Preserve v0.1.4 valve controls.
 
+## Protected valve-control instructions
+
+Requested by the user on 2026-09-22: strengthen `AGENTS.md` so that changes to
+valve control require specific, informed approval, including small changes and
+indirect effects through shared code or configuration. Two independent read-only
+reviews identified gaps in the existing approval, timed-opening, manual-service,
+restart and deduplication wording. This update changes instructions only; it
+does not authorize a controller redesign or alter existing approved behavior.
+Preserve relay-timed openings, accepted failure limits and prior specific
+approvals. Review the resulting instructions for loopholes and consistency;
+no runtime changes or hardware tests are part of this documentation task.
+Both reviewers checked the final instructions and found no remaining actionable
+gaps. Whitespace validation passed; application tests were not rerun for this
+documentation-only change. No valve-control code was changed in this task.
+
+## Approved addition: run appendices and JSON downloads
+
+Approved by the user on 2026-09-22: add exactly one persistent field,
+`IrrigationRun.appendix = JSONField(default=dict, blank=True, editable=False)`,
+and its additive migration. The user explicitly selected this schema change
+and then requested implementation of the complete logging/export plan.
+
+- Preserve the in-memory controller, attempted-only history, and existing
+  restart, hardware, scheduling, and deletion behavior. The appendix is
+  descriptive history and must never drive execution or recovery.
+- Capture versioned rule/site/valve context for new attempts and recovery logs.
+  Smart appendices freeze effective settings, accepted weather samples with
+  provenance, per-valve credit contributions, demand/results/warnings, and
+  pulse metadata from the actual admission calculation. Fixed/manual records
+  retain basic context. Old records receive an empty appendix, without backfill.
+- Hold per-valve evidence in the existing transient group; attach it when an
+  attempted run is inserted, before hardware I/O. Each pulse is self-contained;
+  omit other valves' evidence, full sequences, and prior runs' appendices.
+  Preview stays read-only and does not collect detailed evidence by default.
+- Provide authenticated `/logs/export/` and `?extended=1` JSON downloads for all
+  recorded selected-site history. Use explicit fields and streaming iteration;
+  extended output adds the appendix. Include export metadata and the existing
+  nominal/estimated delivery with uncertainty, using the export time cutoff.
+- Defer appendices on routine UI/history/controller reads and refresh only
+  operational fields during group ticks. No new workers, tables, dependencies,
+  settings, per-tick writes, or decision-time network requests.
+- Test frozen evidence, fallback/zero/DST/uncertainty, failed and recovery runs,
+  legacy rows, site isolation, all-history export, strict JSON, and lightweight
+  routine reads. Run relevant/full Django tests and migration/system checks in
+  the rainwise environment with mocked hardware. Document format and limitations
+  in README. Zero/skipped decisions and abandoned future pulses stay unrecorded.
+
+Safety review requested by the user: keep each export database read bounded and
+fully consumed before yielding to the HTTP client. The original iterator held a
+SQLite read cursor across client waits, demonstrably blocking a second writer in
+the default rollback-journal mode. Use small descending-ID queryset batches;
+preserve streaming and site scope without a new worker or database setting.
+Keep recovery closure before bookkeeping, and catch recovery-context/logging
+errors per valve so optional diagnostics cannot skip later watchdog closures.
+Add failure tests for pre-open capture/INSERT errors, post-open bookkeeping
+errors, continued stop/watchdog phases, and concurrent export/controller writes.
+The independent finite relay timer remains the physical stop mechanism. Shared
+database/disk failures can still delay software actions; this feature does not
+claim complete availability isolation or physical relay commissioning.
+
+The export correction is implemented. The recovery-log exception guard is a
+tested, reviewable working change awaiting specific approval under the protected
+valve-control instructions added during this review; no deployment was changed.
+
+Implemented with migration `0014_irrigationrun_appendix`. Validation: all 265
+Django tests passed in the rainwise environment on isolated SQLite, including
+the populated appendix upgrade and logging-failure/concurrent-export tests;
+model-drift and system checks passed.
+The suite uses mocked relay transport (`RELAY_SIMULATOR=false` allows existing
+frame-level tests to exercise their fake sockets). Test log:
+`/private/tmp/rainwise-logging-safety-full-tests.log`. Independent review found
+no additional actionable defects in the safety corrections. The recovery-log
+guard changes error handling only; commands, durations and restart behavior are
+preserved. No live hardware was used and no existing deployment database was
+migrated.
+
 ## Existing behavior
 
 - Every opening uses the existing relay command with its finite timeout.

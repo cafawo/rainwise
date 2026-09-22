@@ -202,6 +202,31 @@ def validate_schedule(schedule):
         validate_configuration(rule)
 
 
+def run_context(valve, *, rule=None, decision_at=None, action="watering"):
+    """Snapshot descriptive context; never use it to control a valve."""
+    site = rule.schedule.site if rule else valve.relay_device.site
+    decision_at = timezone.now() if decision_at is None else decision_at
+    return {
+        "schema_version": 1,
+        "action": action,
+        "decision_at": decision_at.astimezone(UTC).isoformat(),
+        "site": {"id": site.pk, "name": site.name, "timezone": site.timezone},
+        "valve": {"id": valve.pk, "name": valve.name},
+        "mode": normalize_rule_mode(rule.mode) if rule else None,
+        "rule": {
+            "id": rule.pk,
+            "type": "group" if isinstance(rule, GroupedRule) else "single",
+            "note": rule.note,
+            "start_time": rule.start_time.isoformat(),
+            "days_of_week_mask": rule.days_of_week_mask,
+        } if rule else None,
+        "schedule": {
+            "id": rule.schedule_id, "name": rule.schedule.name,
+        } if rule else None,
+        "simulator": services.SIMULATOR,
+    }
+
+
 def _open_run(run):
     """Use the unchanged timed relay command and record the actual attempt."""
     started = timezone.now()
@@ -226,12 +251,20 @@ def _open_run(run):
         except Exception:
             logger.exception("Could not record opening result for run %s", run.pk)
         raise
-    run.refresh_from_db()
+    run.refresh_from_db(fields=[
+        "status", "actual_start_at", "actual_stop_at", "attempt_finished_at",
+        "closure_confirmed_at", "delivery_uncertain", "stop_reason",
+        "error_message",
+    ])
     return run
 
 
-def _new_run(valve, duration, trigger, *, planned_start_at=None, maximum=None):
+def _new_run(
+    valve, duration, trigger, *, planned_start_at=None, maximum=None,
+    appendix=None,
+):
     rate = valve.application_rate_mm_h if valve.has_valid_application_rate else None
+    context = run_context(valve) if appendix is None else appendix
     return IrrigationRun.objects.create(
         valve=valve, trigger=trigger, requested_start_at=timezone.now(),
         planned_start_at=planned_start_at, status="PLANNED",
@@ -239,6 +272,7 @@ def _new_run(valve, duration, trigger, *, planned_start_at=None, maximum=None):
         max_duration_seconds=maximum or duration,
         application_rate_mm_h=rate, attempt_started_at=timezone.now(),
         delivery_uncertain=True,
+        appendix={**context, "simulator": services.SIMULATOR},
     )
 
 
@@ -253,14 +287,17 @@ def start_single(valve, duration, trigger, planned_start_at=None, rule=None):
     if planned_start_at is not None:
         existing = IrrigationRun.objects.filter(
             valve=valve, planned_start_at=planned_start_at, trigger="SCHEDULED",
-        ).first()
+        ).defer("appendix").first()
         if existing:
             return existing
     if trigger == "MANUAL" and rule is None and IrrigationRun.objects.filter(
         valve=valve, status="RUNNING",
     ).exists():
         raise ValidationError("Valve is already running.")
-    run = _new_run(valve, duration, trigger, planned_start_at=planned_start_at)
+    run = _new_run(
+        valve, duration, trigger, planned_start_at=planned_start_at,
+        appendix=run_context(valve, rule=rule),
+    )
     return _open_run(run)
 
 
@@ -305,7 +342,7 @@ def _finish_group_runs(now):
     runs = IrrigationRun.objects.filter(
         trigger=IrrigationRun.TRIGGER_GROUP,
         attempt_started_at__isnull=False, actual_stop_at=None,
-    )
+    ).defer("appendix")
     for run in runs:
         end = _group_pulse_end(run)
         if now < end:
@@ -339,6 +376,7 @@ class ActiveGroup:
     deadline: dt.datetime
     valves: dict
     pulses: deque
+    appendices: dict = field(default_factory=dict)
     current: IrrigationRun | None = None
     ready_at: dict = field(default_factory=dict)
     stopped: bool = False
@@ -418,13 +456,30 @@ class GroupRunner:
         available = _remaining_day_seconds(site, scheduled)
         peak = reservation_details(rule, members, available_seconds=available)
         deadline = scheduled + dt.timedelta(seconds=peak["total_seconds"])
+        appendices = {
+            member.valve_id: run_context(
+                member.valve, rule=rule, decision_at=now,
+            ) for member in members
+        }
         if rule.mode == "SMART":
             decision = build_smart_decision(
                 site, members, now, available_seconds=_remaining_day_seconds(site, now),
                 controller_interval_seconds=controller_interval(),
                 command_allowance_seconds=command_allowance(),
+                include_evidence=True,
             )
             sequence = decision["sequence"]
+            for member in members:
+                row = decision["valves"][str(member.valve_id)]
+                appendices[member.valve_id]["smart"] = {
+                    **{key: decision[key] for key in (
+                        "calculation_version", "settings", "sequence_options",
+                        "coverage_days", "daily_need_mm", "temperature", "rain",
+                    )},
+                    "valve": {key: value for key, value in row.items()
+                              if key not in ("pulse_seconds", "warnings")},
+                    "warnings": decision["shared_warnings"] + row["warnings"],
+                }
         else:
             sequence = plan_sequence(
                 [{"valve_id": member.valve_id, "order": member.order,
@@ -441,6 +496,7 @@ class GroupRunner:
             rule.pk, rule.schedule_id, site.pk, scheduled, deadline,
             {member.valve_id: member.valve for member in members},
             deque(sequence["pulses"]),
+            appendices=appendices,
         )
         self._active[site.pk] = group
         self._advance(group, now)
@@ -452,7 +508,9 @@ class GroupRunner:
         group.stopped = True
         group.pulses.clear()
         if group.current:
-            current = IrrigationRun.objects.filter(pk=group.current.pk).first()
+            current = IrrigationRun.objects.filter(
+                pk=group.current.pk,
+            ).defer("appendix").first()
             if current is None or current.actual_stop_at is None:
                 try:
                     close_member(group.valves[group.current.valve_id])
@@ -468,7 +526,10 @@ class GroupRunner:
         if group.current:
             run = group.current
             try:
-                run.refresh_from_db()
+                run.refresh_from_db(fields=[
+                    "status", "actual_stop_at", "stop_reason",
+                    "delivery_uncertain", "optimal_duration_seconds",
+                ])
             except IrrigationRun.DoesNotExist:
                 self._stop(group)
                 self._active.pop(group.site_id, None)
@@ -505,5 +566,14 @@ class GroupRunner:
         group.current = _new_run(
             valve, duration, IrrigationRun.TRIGGER_GROUP,
             planned_start_at=group.scheduled_at,
+            appendix={
+                **group.appendices[valve.pk],
+                "pulse": {
+                    "scheduled_at": group.scheduled_at.astimezone(UTC).isoformat(),
+                    "pass_number": pulse["pass_number"],
+                    "member_order": pulse["order"],
+                    "duration_seconds": duration,
+                },
+            },
         )
         _open_run(group.current)

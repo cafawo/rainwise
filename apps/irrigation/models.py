@@ -405,6 +405,7 @@ class IrrigationRun(models.Model):
         (STOP_ERROR, "Error"),
     ]
 
+    appendix = models.JSONField(default=dict, blank=True, editable=False)
     valve = models.ForeignKey(Valve, on_delete=models.CASCADE)
     attempt_started_at = models.DateTimeField(null=True, blank=True)
     attempt_finished_at = models.DateTimeField(null=True, blank=True)

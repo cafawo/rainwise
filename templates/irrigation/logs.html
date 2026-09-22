@@ -5,6 +5,12 @@
 {% block content %}
 <h1 class="h3 mb-3">Logs</h1>
 
+<div class="d-flex flex-wrap gap-2 mb-2">
+  <a class="btn btn-outline-primary" href="{% url 'logs_export' %}">Download logs</a>
+  <a class="btn btn-outline-primary" href="{% url 'logs_export' %}?extended=1">Download extended logs</a>
+</div>
+<p class="text-muted">Downloads include all recorded history for the selected site, beyond the 200 runs shown below. Extended logs include captured calculation inputs.</p>
+
 <div class="card">
   <div class="card-body">
     <p class="text-muted mb-3">Showing the 200 most recent runs.</p>

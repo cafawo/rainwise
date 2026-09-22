@@ -195,7 +195,7 @@ class Command(BaseCommand):
     def _stop_running_runs(self, now: dt.datetime) -> set[int]:
         runs = IrrigationRun.objects.filter(
             status=IrrigationRun.STATUS_RUNNING,
-        ).exclude(trigger=IrrigationRun.TRIGGER_GROUP)
+        ).exclude(trigger=IrrigationRun.TRIGGER_GROUP).defer("appendix")
         recently_closed: set[int] = set()
         for run in runs.select_related("valve"):
             if not run.actual_start_at:
@@ -250,7 +250,9 @@ class Command(BaseCommand):
     def _watchdog_close(self, now: dt.datetime, recently_closed: set[int]) -> None:
         running = {
             run.valve_id: run
-            for run in IrrigationRun.objects.filter(status=IrrigationRun.STATUS_RUNNING)
+            for run in IrrigationRun.objects.filter(
+                status=IrrigationRun.STATUS_RUNNING,
+            ).defer("appendix")
         }
         open_valves = Valve.objects.filter(last_known_is_open=True)
 
@@ -293,19 +295,26 @@ class Command(BaseCommand):
                 stop_reason = IrrigationRun.STOP_ERROR
                 error_message = str(exc)
 
-            IrrigationRun.objects.create(
-                valve=valve,
-                trigger=IrrigationRun.TRIGGER_RECOVERY,
-                requested_start_at=None,
-                planned_start_at=None,
-                actual_start_at=now,
-                optimal_duration_seconds=None,
-                max_duration_seconds=valve.default_max_duration_seconds,
-                actual_stop_at=now,
-                status=status,
-                stop_reason=stop_reason,
-                error_message=error_message,
-            )
+            # Bookkeeping must not skip closure of other unexpected open valves.
+            try:
+                IrrigationRun.objects.create(
+                    valve=valve,
+                    trigger=IrrigationRun.TRIGGER_RECOVERY,
+                    requested_start_at=None,
+                    planned_start_at=None,
+                    actual_start_at=now,
+                    optimal_duration_seconds=None,
+                    max_duration_seconds=valve.default_max_duration_seconds,
+                    actual_stop_at=now,
+                    status=status,
+                    stop_reason=stop_reason,
+                    error_message=error_message,
+                    appendix=group_services.run_context(
+                        valve, decision_at=now, action="recovery_close",
+                    ),
+                )
+            except Exception:
+                logger.exception("Could not record recovery close for valve %s", valve.pk)
 
     def _refresh_weather(self, now: dt.datetime) -> None:
         for site in Site.objects.all():

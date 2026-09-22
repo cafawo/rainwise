@@ -59,7 +59,9 @@ def accounting_windows(site, at: dt.datetime, coverage_days: int) -> dict:
     }
 
 
-def temperature_selection(site, at: dt.datetime, settings=None) -> dict:
+def temperature_selection(
+    site, at: dt.datetime, settings=None, *, include_evidence=False,
+) -> dict:
     at = _utc(at)
     if settings is None:
         settings = get_curve_settings(site)
@@ -72,16 +74,17 @@ def temperature_selection(site, at: dt.datetime, settings=None) -> dict:
         row.retrieved_at >= row.timestamp and _finite(row.temperature_c)
         and _hour_boundary(row.timestamp, site_tz)
     )]
-    latest = valid[-1].timestamp if valid else None
-    if latest is None:
+    latest_row = valid[-1] if valid else None
+    if latest_row is None:
         older = WeatherObservation.objects.filter(
             site=site, timestamp__lte=at - dt.timedelta(hours=24),
             retrieved_at__lte=at, temperature_c__isnull=False,
         ).order_by("-timestamp")
-        latest = next((row.timestamp for row in older.iterator() if (
+        latest_row = next((row for row in older.iterator() if (
             row.retrieved_at >= row.timestamp and _finite(row.temperature_c)
             and _hour_boundary(row.timestamp, site_tz)
         )), None)
+    latest = latest_row.timestamp if latest_row else None
     try:
         refresh_hours = max(1, int(os.environ.get("WEATHER_REFRESH_HOURS", "6")))
     except ValueError:
@@ -101,7 +104,7 @@ def temperature_selection(site, at: dt.datetime, settings=None) -> dict:
     if not _finite(selected):
         selected = None
         reason = (reason + " Configure a finite fallback temperature.").strip()
-    return {
+    result = {
         "temperature_c": selected,
         "source": "fallback" if reason else "weather",
         "fallback": bool(reason),
@@ -109,9 +112,34 @@ def temperature_selection(site, at: dt.datetime, settings=None) -> dict:
         "latest_valid_at": latest.isoformat() if latest else None,
         "valid_hours": len(valid),
     }
+    if include_evidence:
+        result.update({
+            "start_at": (at - dt.timedelta(hours=24)).isoformat(),
+            "cutoff_at": at.isoformat(),
+            "parameters": {
+                "lookback_hours": 24,
+                "percentile": 0.9,
+                "minimum_valid_hours": 18,
+                "freshness_hours": refresh_hours,
+            },
+            "fallback_temperature_c": fallback if _finite(fallback) else None,
+            "samples": [{
+                "timestamp": row.timestamp.isoformat(),
+                "retrieved_at": row.retrieved_at.isoformat(),
+                "temperature_c": row.temperature_c,
+            } for row in valid],
+            "latest_valid_sample": {
+                "timestamp": latest_row.timestamp.isoformat(),
+                "retrieved_at": latest_row.retrieved_at.isoformat(),
+                "temperature_c": latest_row.temperature_c,
+            } if latest_row else None,
+        })
+    return result
 
 
-def rain_credit(site, at: dt.datetime, coverage_days: int) -> dict:
+def rain_credit(
+    site, at: dt.datetime, coverage_days: int, *, include_evidence=False,
+) -> dict:
     windows = accounting_windows(site, at, coverage_days)
     start, end = windows["rain_start"], windows["rain_end"]
     rows = WeatherObservation.objects.filter(
@@ -124,6 +152,7 @@ def rain_credit(site, at: dt.datetime, coverage_days: int) -> dict:
         expected.add(boundary)
         boundary += dt.timedelta(hours=1)
     known = {}
+    samples = []
     for row in rows:
         if (
             row.timestamp in expected
@@ -132,10 +161,16 @@ def rain_credit(site, at: dt.datetime, coverage_days: int) -> dict:
             and row.precipitation_mm >= 0
         ):
             known[row.timestamp] = row.precipitation_mm
+            if include_evidence:
+                samples.append({
+                    "timestamp": row.timestamp.isoformat(),
+                    "retrieved_at": row.retrieved_at.isoformat(),
+                    "precipitation_mm": row.precipitation_mm,
+                })
     credit = math.fsum(known.values())
     if not math.isfinite(credit):
         raise ValueError("Rain credit must be finite.")
-    return {
+    result = {
         "credit_mm": credit,
         "start_at": start.isoformat(),
         "cutoff_at": end.isoformat(),
@@ -144,6 +179,9 @@ def rain_credit(site, at: dt.datetime, coverage_days: int) -> dict:
         "missing_hours": len(expected - known.keys()),
         "warning": bool(expected - known.keys()),
     }
+    if include_evidence:
+        result["samples"] = sorted(samples, key=lambda sample: sample["timestamp"])
+    return result
 
 
 def delivery_estimate(run, cutoff: dt.datetime | None = None) -> dict:
@@ -197,12 +235,14 @@ def delivery_estimate(run, cutoff: dt.datetime | None = None) -> dict:
     return result
 
 
-def irrigation_credit(valve, at: dt.datetime, coverage_days: int) -> dict:
+def irrigation_credit(
+    valve, at: dt.datetime, coverage_days: int, *, include_evidence=False,
+) -> dict:
     site = valve.relay_device.site
     windows = accounting_windows(site, at, coverage_days)
     start, end = windows["irrigation_start"], windows["irrigation_end"]
     # The indexed start bounds also include ambiguous attempts without an actual start.
-    rows = IrrigationRun.objects.filter(valve=valve).filter(
+    rows = IrrigationRun.objects.defer("appendix").filter(valve=valve).filter(
         Q(actual_start_at__lt=end) | Q(attempt_started_at__lt=end)
     ).filter(
         Q(actual_start_at__gte=start - dt.timedelta(days=1))
@@ -214,6 +254,7 @@ def irrigation_credit(valve, at: dt.datetime, coverage_days: int) -> dict:
     nominal_beyond_cutoff = False
     uncalibrated = 0
     known = 0
+    contributions = []
     for run in rows:
         estimate = delivery_estimate(run, cutoff=end)
         if not estimate["start_at"]:
@@ -227,17 +268,34 @@ def irrigation_credit(valve, at: dt.datetime, coverage_days: int) -> dict:
         uncertain |= estimate["uncertain"]
         unknown_extra |= estimate["unknown_extra_delivery"]
         nominal_beyond_cutoff |= estimate["nominal_allowance_beyond_cutoff"]
+        run_credit = (
+            (delivery_end - delivery_start).total_seconds()
+            * run.application_rate_mm_h / 3600
+        ) if estimate["calibrated"] else None
+        if include_evidence:
+            contributions.append({
+                **{
+                    key: None if isinstance(value, float) and not _finite(value)
+                    else value
+                    for key, value in estimate.items()
+                },
+                "run_id": run.pk,
+                "application_rate_mm_h": (
+                    run.application_rate_mm_h
+                    if _finite(run.application_rate_mm_h) else None
+                ),
+                "credited_start_at": delivery_start.isoformat(),
+                "credited_end_at": delivery_end.isoformat(),
+                "credit_mm": run_credit,
+            })
         if not estimate["calibrated"]:
             uncalibrated += 1
             continue
         known += 1
-        credit += (
-            (delivery_end - delivery_start).total_seconds()
-            * run.application_rate_mm_h / 3600
-        )
+        credit += run_credit
     if not math.isfinite(credit):
         raise ValueError("Irrigation credit must be finite.")
-    return {
+    result = {
         "credit_mm": credit,
         "start_at": start.isoformat(),
         "cutoff_at": end.isoformat(),
@@ -248,6 +306,9 @@ def irrigation_credit(valve, at: dt.datetime, coverage_days: int) -> dict:
         "unknown_extra_delivery": unknown_extra,
         "nominal_allowance_beyond_cutoff": nominal_beyond_cutoff,
     }
+    if include_evidence:
+        result["contributions"] = contributions
+    return result
 
 
 def plan_dose(
@@ -295,6 +356,7 @@ def plan_dose(
 def build_smart_decision(
     site, members, decision_at: dt.datetime, *, available_seconds=None,
     controller_interval_seconds=None, command_allowance_seconds=None,
+    include_evidence=False,
 ) -> dict:
     if available_seconds is None:
         local = decision_at.astimezone(ZoneInfo(site.timezone))
@@ -316,14 +378,19 @@ def build_smart_decision(
     }
     settings = get_curve_settings(site)
     settings.full_clean()
-    temperature = temperature_selection(site, decision_at, settings=settings)
+    temperature = temperature_selection(
+        site, decision_at, settings=settings, include_evidence=include_evidence,
+    )
     if temperature["temperature_c"] is None:
         raise ValidationError(temperature["reason"])
     daily_need = daily_water_required(
         temperature["temperature_c"], settings.min_mm, settings.max_mm,
         settings.g, settings.m,
     )
-    rain = rain_credit(site, decision_at, settings.coverage_days)
+    rain = rain_credit(
+        site, decision_at, settings.coverage_days,
+        include_evidence=include_evidence,
+    )
     decisions = {}
     peak_members = []
     actual_members = []
@@ -338,6 +405,7 @@ def build_smart_decision(
             "Rain history is incomplete; unknown rain supplies no credit "
             "and watering may overwater."
         )
+    shared_warnings = warnings.copy()
     for member in members:
         valve = member.valve
         rate = valve.application_rate_mm_h
@@ -368,11 +436,16 @@ def build_smart_decision(
                 "unmet_mm": None,
                 "irrigation": None,
             }
+            if include_evidence:
+                decisions[str(valve.pk)]["warnings"] = [reason]
             warnings.append(reason)
             continue
         peak_mm = settings.coverage_days * settings.max_mm
         peak_seconds = target_seconds(peak_mm, rate, available_seconds)
-        credit = irrigation_credit(valve, decision_at, settings.coverage_days)
+        credit = irrigation_credit(
+            valve, decision_at, settings.coverage_days,
+            include_evidence=include_evidence,
+        )
         dose = plan_dose(
             daily_need, settings.coverage_days, rain["credit_mm"],
             credit["credit_mm"], rate, member.duration_seconds,
@@ -403,30 +476,34 @@ def build_smart_decision(
             **sequence_member, "total_seconds": dose["planned_seconds"],
         })
         peak_members.append({**sequence_member, "total_seconds": peak_seconds})
+        valve_warnings = []
         if credit["incomplete_history"]:
-            warnings.append(
+            valve_warnings.append(
                 f"{valve.name}: incomplete calibrated irrigation history; "
                 "only known delivery is credited."
             )
         if credit["uncertain"]:
-            warnings.append(
+            valve_warnings.append(
                 f"{valve.name}: uncertain delivery is credited conservatively; "
                 "physical volume is unknown."
             )
         if credit["unknown_extra_delivery"]:
-            warnings.append(
+            valve_warnings.append(
                 f"{valve.name}: an interrupted attempt has explicitly "
                 "unknown extra delivery."
             )
         if credit["nominal_allowance_beyond_cutoff"]:
-            warnings.append(
+            valve_warnings.append(
                 f"{valve.name}: the full conservative allowance for an "
                 "uncertain earlier command extends beyond the decision cutoff; "
                 "this is nominal credit, not confirmed physical delivery."
             )
+        warnings.extend(valve_warnings)
+        if include_evidence:
+            dose["warnings"] = valve_warnings
     peak_sequence = plan_sequence(peak_members, **sequence_options)
     sequence = plan_sequence(actual_members, **sequence_options)
-    return {
+    result = {
         "decision_at": _utc(decision_at).isoformat(),
         "coverage_days": settings.coverage_days,
         "daily_need_mm": daily_need,
@@ -437,3 +514,16 @@ def build_smart_decision(
         "peak_sequence": peak_sequence,
         "warnings": warnings,
     }
+    if include_evidence:
+        result.update({
+            "calculation_version": 1,
+            "settings": {
+                field: getattr(settings, field) for field in (
+                    "min_mm", "max_mm", "g", "m", "coverage_days",
+                    "fallback_temperature_c",
+                )
+            },
+            "sequence_options": sequence_options,
+            "shared_warnings": shared_warnings,
+        })
+    return result

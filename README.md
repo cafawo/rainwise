@@ -13,7 +13,7 @@ Rainwise is a Django MVP for monitoring and scheduling an irrigation system back
 - Weather import (Open-Meteo) stored as hourly observations.
 - Charts for accumulated irrigation per valve/day (grouped bars) on the Dashboard.
 - Dashboard chart overlays precipitation and temperature on separate axes.
-- Logs page with recent irrigation runs.
+- Logs page with recent irrigation runs and standard/extended JSON downloads.
 - Curve page to visualize and tune the daily water requirement curve (saved per site).
 
 ## Local Development
@@ -388,6 +388,89 @@ The curve is a practical heuristic, not a soil/ET model or a universal irrigatio
 recommendation. Equal-duration breaks are a product rule and do not guarantee
 soil absorption under every condition. There is no separate soak-duration setting.
 
+## Run History and JSON Downloads
+
+The Logs page shows the 200 most recent runs. **Download logs** exports all
+recorded history for the selected site; **Download extended logs** adds the
+historical input appendix for each run. Both require login and return a JSON
+attachment. The endpoints are `GET /logs/export/` and
+`GET /logs/export/?extended=1`.
+
+The document contains `schema_version` (currently `1`), `exported_at`, `site`
+(`id`, `name`, `timezone`), and `runs`, ordered by newest run ID first. An empty
+history produces an empty array; an installation without a site has `site: null`.
+Each run includes its ID, valve identity, trigger/status, request/planning/attempt/
+start/stop/closure timestamps, intended and maximum durations, stored application
+rate, uncertainty, stop reason, error message, and a `delivery` object.
+
+`delivery` contains `nominal_mm`, `estimated_mm`, the estimated delivery interval,
+and calibration/uncertainty flags. It uses the same conservative estimate as the
+water balance, with the export time as its cutoff. An uncertain command may keep
+its full nominal allowance beyond that cutoff; the corresponding flag identifies
+this. These are estimates, not flow-meter measurements. Do not calculate water
+volume from the difference between bookkeeping start/stop timestamps. Exports
+are read-only and can include runs whose status is still changing.
+
+Extended exports additionally contain each run's stored `appendix`:
+
+| Key | Historical content |
+| --- | --- |
+| `schema_version` | Appendix format version, currently `1` |
+| `action`, `decision_at`, `site`, `valve` | Watering or recovery-close context, UTC decision time, site name/timezone and valve name |
+| `mode`, `rule`, `schedule`, `simulator` | Fixed/Smart mode and saved rule/schedule identity; mode/rule/schedule are null for direct manual and recovery actions |
+| `pulse` | Group scheduled start, pass number, member order, and this pulse's duration |
+| `smart.calculation_version` | Calculation policy version, currently `1` |
+| `smart.settings`, `smart.sequence_options` | Effective curve, coverage/fallback, remaining-day budget, controller cadence and command allowance |
+| `smart.temperature` | Selected value/source, fallback reason, selection parameters, accepted hourly samples and latest valid sample |
+| `smart.rain` | Accounting window, accepted hourly samples, credited rain and completeness counts |
+| `smart.valve` | This valve's rate/run limit, credits, target, total planned watering, pulse count and rounding remainder |
+| `smart.valve.irrigation.contributions` | Prior-run IDs, rates, credited intervals/amounts, calibration and delivery uncertainty as used at decision time |
+| `smart.warnings` | Shared weather warnings and warnings relevant to this valve |
+
+All instants use ISO 8601 UTC timestamps; site timezone identifies the local-day
+accounting context. Durations and allowances are seconds, rates are mm/hour,
+temperatures are °C, and water depths/credits are mm. Curve `min_mm`/`max_mm` and
+`daily_need_mm` describe mm/day; `g` is inverse °C and `m` is °C. Coverage is a
+count of local calendar days. `smart.valve.unmet_mm` is the planned whole-second
+rounding remainder, not a final shortfall caused by cancelled/failed watering.
+JSON `null` means unknown/unavailable, not zero; nonfinite legacy numbers export
+as null. Keep schema versions stable for additive keys and bump them for breaking
+format changes; bump `calculation_version` when calculation semantics change.
+
+Smart inputs are frozen from the calculation used to admit the group. Each
+attempted pulse stores its own valve's evidence before the relay call, so failed
+attempts retain their context. Later weather imports and edits to settings or
+names do not rewrite the appendix. The ordinary exported valve name is current;
+`appendix.valve.name` is historical. Accepted weather samples retain their valid
+and retrieval timestamps. Fixed/manual runs have basic context without Smart
+evidence, and recovery records identify a close action without claiming a new
+watering decision. Preview does not persist evidence.
+
+The additive `0014_irrigationrun_appendix` migration gives existing runs `{}`;
+missing historic inputs cannot be backfilled reliably. Repeated pulses duplicate
+bounded weather evidence to keep each record self-contained. Routine controller
+and history reads omit this data. Downloads fully read at most 200 rows at a
+time before sending them, then continue by descending run ID. A slow client
+therefore does not hold a database read cursor open and block SQLite writes
+between download chunks. The full history is never loaded into memory. There
+is no automatic pruning; existing database backups and deletion behavior apply.
+No extra settings or dependencies are needed.
+
+Appendix capture and the run INSERT happen before the opening command. If they
+fail, that attempt does not open the valve. Once sent, the relay's finite timer
+is independent of subsequent logging/database failures. Recovery closes are
+attempted before recording them; a recovery-context or log-write error is caught
+per valve so it does not abort the remaining closure loop. This preserves the
+physical timer protection but is not complete resource isolation: database locks,
+disk exhaustion or stalled storage can still delay software actions or prevent
+scheduled watering. Those failures must never be handled by sending an unlogged,
+unbounded opening. Hardware timer behavior still requires normal commissioning.
+
+Zero-demand/skipped decisions and unattempted future pulses still have no run
+records. Appendices never restore an interrupted sequence. Lawn/soil observations
+and measured flow are not collected; dated observations can be compared with
+these logs separately when assessing watering outcomes.
+
 ## Calendar, Stops, and Restarts
 
 The calendar shows one group event with ordered members. Smart reservations
@@ -471,11 +554,13 @@ For this upgrade:
 1. Back up the persistent database and stop **all old web and controller
    processes**. Allow active relay timers to finish before applying the upgrade;
    the maximum timer is 3276 seconds from its last opening command.
-2. Apply migrations through `0013_in_memory_group_sequences` using the existing
+2. Apply migrations through `0014_irrigationrun_appendix` using the existing
    database volume. The forward cleanup preserves rule IDs, saved durations,
    calibration and actual attempted watering. It removes obsolete command-queue
    and occurrence state, including unattempted future pulse logs and stored
-   zero/skipped decisions. No migration actuates hardware or replays watering.
+   zero/skipped decisions. The subsequent appendix migration adds an empty JSON
+   field to existing runs without rewriting their history. No migration actuates
+   hardware or replays watering.
 3. Start the upgraded web app and **exactly one** upgraded controller. No separate
    reconciliation command is required; manual controls are immediately available
    through the service layer.

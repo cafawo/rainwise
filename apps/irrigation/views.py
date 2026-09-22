@@ -11,14 +11,16 @@ from django.contrib.auth.views import LoginView
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.db.models.functions import Coalesce
-from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.http import (
+    HttpRequest, HttpResponse, JsonResponse, StreamingHttpResponse,
+)
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_GET, require_POST
 
-from apps.irrigation import balance, group_services
+from apps.irrigation import balance, exports, group_services
 from apps.irrigation.curves import (
     DEFAULT_G,
     DEFAULT_M,
@@ -115,7 +117,10 @@ def _valve_feedback(valves):
             models.Subquery(unresolved_run), models.Subquery(latest_run),
         ),
     ).values("latest_run")
-    runs = {run.valve_id: run for run in IrrigationRun.objects.filter(pk__in=latest_ids)}
+    runs = {
+        run.valve_id: run
+        for run in IrrigationRun.objects.filter(pk__in=latest_ids).defer("appendix")
+    }
     for valve in valves:
         run = runs.get(valve.pk)
         valve.action_status = "—"
@@ -350,6 +355,7 @@ def logs_view(request: HttpRequest) -> HttpResponse:
     runs = list(
         IrrigationRun.objects.filter(valve__relay_device__site=site)
         .select_related("valve")
+        .defer("appendix")
         .order_by("-id")[:200]
         if site
         else []
@@ -365,6 +371,25 @@ def logs_view(request: HttpRequest) -> HttpResponse:
     return render(request, "irrigation/logs.html", {
         "runs": runs,
     })
+
+
+@login_required
+@require_GET
+def logs_export(request: HttpRequest) -> StreamingHttpResponse:
+    site = _get_active_site(request)
+    exported_at = timezone.now()
+    extended = request.GET.get("extended") == "1"
+    response = StreamingHttpResponse(
+        exports.iter_logs(site, exported_at, extended=extended),
+        content_type="application/json",
+    )
+    site_id = site.pk if site else "none"
+    suffix = "-extended" if extended else ""
+    filename = (
+        f"rainwise-logs-{site_id}-{exported_at:%Y%m%dT%H%M%SZ}{suffix}.json"
+    )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
 
 
 def _editor_data(request):
@@ -1036,13 +1061,12 @@ def valve_status(request: HttpRequest) -> JsonResponse:
         if site
         else Valve.objects.none()
     )
-    running = {
-        run.valve_id
-        for run in IrrigationRun.objects.filter(
+    running = set(
+        IrrigationRun.objects.filter(
             status=IrrigationRun.STATUS_RUNNING,
             valve__relay_device__site=site,
-        )
-    }
+        ).values_list("valve_id", flat=True)
+    )
     payload = []
     for valve in _valve_feedback(valves):
         payload.append(
