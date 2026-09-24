@@ -1,9 +1,19 @@
 # Fixed and Smart: minimal implementation
 
-Updated 2026-09-22. This supersedes the persisted occurrence/sequence design.
+Updated 2026-09-24. This supersedes the persisted occurrence/sequence design.
 The user approved removing RuleOccurrence and the admission counter, keeping
 Smart execution in memory, reducing warnings/weather repair, and applying
 configuration edits on the next execution. Preserve v0.1.4 valve controls.
+
+## Unreleased rule-editor cleanup
+
+Requested on 2026-09-24: remove the Run now button from the rule editor for a
+future release. Remove its template markup and unused editor URL context; retain
+Smart Preview, manual dashboard controls and the existing single-valve POST
+endpoint. No controller, hardware, model or migration changes. Leave the
+published v0.1.5 tag unchanged and do not publish this change yet.
+Implemented; all 58 editor tests and whitespace checks passed. Protected valve
+control code is unchanged.
 
 ## Protected valve-control instructions
 
@@ -96,7 +106,7 @@ migrated.
 
 - Every opening uses the existing relay command with its finite timeout.
   No untimed opening, new protocol, command queue, worker or dependency.
-- Keep immediate manual Open/Close and single-valve Fixed Run now through services.
+- Keep immediate manual Open/Close and the existing single-valve Fixed Run now endpoint through services.
   Preserve the original Fixed/manual stop, polling and watchdog behavior.
 - Fixed rules selected as due by a tick remain due even if an earlier relay call
   crosses the minute boundary. Restore v0.1.4 behavior here.
@@ -179,8 +189,8 @@ migrated.
   saving existing enabled=False. No separate Disable rule button is needed.
   The controller stops the sequence on its next tick. Future scheduled
   executions remain disabled until Enabled is selected and saved again.
-- Keep single-valve Fixed Run now. Remove grouped Run now rather than replacing
-  its deleted occurrence handoff with another queue. Groups run on schedule.
+- Remove Run now from the rule editor; keep the existing single-valve endpoint
+  for compatibility. Grouped Run now remains removed. Groups run on schedule.
 - Show one useful fallback-temperature warning. Do not run watering planners
   merely to produce dashboard warnings. Detail belongs in Preview/logs.
 - Remove the unused old editor form and coordination-only Admin restrictions.

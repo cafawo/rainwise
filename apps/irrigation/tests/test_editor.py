@@ -152,8 +152,10 @@ class SharedRuleEditorTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, "RUNNING")
 
-    def test_edit_single_fixed_preserves_id(self):
+    def test_edit_single_fixed_preserves_id_without_run_now_button(self):
         old = self.legacy()
+        response = self.client.get(reverse("schedule_edit", args=[old.pk]))
+        self.assertNotContains(response, ">Run now<")
         response = self.client.post(reverse("schedule_edit", args=[old.pk]), self.payload(note="Updated"))
         self.assertEqual(response.status_code, 302)
         old.refresh_from_db()

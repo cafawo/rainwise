@@ -63,7 +63,7 @@
   <a class="btn btn-secondary" href="{% url 'schedule' %}">Cancel</a>
   {% if rule %}
   <a class="btn btn-outline-primary" href="{{ copy_url }}">Make copy</a>
-  {% if smart %}<a class="btn btn-outline-success" href="{{ preview_url }}">Preview</a>{% elif not is_group %}<form method="post" action="{{ run_url }}">{% csrf_token %}<button class="btn btn-outline-success">Run now</button></form>{% endif %}
+  {% if smart %}<a class="btn btn-outline-success" href="{{ preview_url }}">Preview</a>{% endif %}
   <form method="post" action="{{ delete_url }}">{% csrf_token %}<button class="btn btn-outline-danger">Delete rule</button></form>
   {% endif %}
 </div>

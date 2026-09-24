@@ -411,7 +411,8 @@ def _editor_data(request):
 def _rule_urls(rule):
     prefix = "group" if isinstance(rule, GroupedRule) else "schedule"
     actions = ("edit", "copy", "delete")
-    actions += ("preview",) if prefix == "group" else ("run",)
+    if prefix == "group":
+        actions += ("preview",)
     return {action + "_url": reverse(prefix + "_" + action, args=[rule.pk])
             for action in actions}
 

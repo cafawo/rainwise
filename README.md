@@ -211,9 +211,10 @@ schedule executes automatically.
 
 ## Hardware Access
 
-Hardware I/O is isolated in `apps/irrigation/services.py`. Manual **Open**,
-**Close**, and single-valve Fixed **Run now** execute immediately through that
-service layer, as in the previous release. The single controller handles
+Hardware I/O is isolated in `apps/irrigation/services.py`. Dashboard **Open** and
+**Close** execute immediately through that service layer. The existing
+single-valve Fixed Run now endpoint remains available for compatibility, without
+a button in the rule editor. The single controller handles
 scheduled watering, group progression, normal stops, watchdog recovery and
 weather imports. Use `RELAY_SIMULATOR=true` for local development without hardware.
 
@@ -237,7 +238,7 @@ areas need a separate allocation design.
 
 Fixed runs each member once in order, with a **Runtime** of 60–3276 seconds. It needs
 neither calibration nor weather. Existing single-valve Fixed rules retain their
-IDs, schedule, timing, and manual Run now behavior. A valve's default manual
+IDs, schedule, and timing. A valve's default manual
 duration is not an additional ceiling on a Fixed rule.
 
 Smart runs in rounds, preserving valve order until each finite target is met.
@@ -272,9 +273,8 @@ Edits to a rule, valve rate, run limit, watering order or curve take effect on t
 next execution. A running sequence retains its admitted configuration and rates.
 Clear **Enabled** in the rule editor and click **Save** to stop future scheduled
 executions until the rule is re-enabled; the controller also stops the current
-sequence on its next tick. Groups have no
-**Run now** action. Smart keeps **Preview**, and existing single-valve Fixed rules
-keep their immediate **Run now** action.
+sequence on its next tick. The rule editor has no **Run now** button. Smart keeps
+**Preview**; manual **Open** and **Close** remain on the dashboard.
 
 ## Calibration and the Rolling Water Balance
 
